@@ -1,6 +1,6 @@
 [project]
 name = "policyengine-observability"
-version = "0.2.0"
+version = "0.2.1"
 description = "Shared PolicyEngine observability runtime for logs, timings, metrics, and OpenTelemetry."
 readme = "README.md"
 authors = [{ name = "PolicyEngine", email = "hello@policyengine.org" }]
