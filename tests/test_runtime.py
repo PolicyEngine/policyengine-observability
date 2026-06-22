@@ -46,6 +46,11 @@ class RecordingSpan:
         )()
 
 
+class AttributeFailingSpan(RecordingSpan):
+    def set_attribute(self, key, value) -> None:
+        raise RuntimeError("attribute failed")
+
+
 class RecordingSpanContextManager:
     def __init__(
         self,
@@ -183,6 +188,22 @@ def test_segment_span_exit_failure_does_not_escape() -> None:
             pass
 
     assert "load_ms" in timings
+
+
+def test_span_attribute_failure_does_not_drop_span_lifecycle() -> None:
+    observed = runtime()
+    span = AttributeFailingSpan()
+    observed.tracer = RecordingTracer(span=span)
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+
+    with observed.segment(SegmentName.LOAD, tool="loader"):
+        pass
+
+    assert "otel.span_attributes" in failures
+    assert observed.tracer.last_context_manager.exited
 
 
 def test_collect_timings_records_block_exception_on_scope_span() -> None:

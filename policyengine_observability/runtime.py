@@ -1300,13 +1300,20 @@ class ObservabilityRuntime:
         try:
             span_cm = self.tracer.start_as_current_span(name)
             span = span_cm.__enter__()
-            for key, value in attrs.items():
-                if value is not None:
-                    span.set_attribute(key, value)
-            return span_cm, span
         except BaseException as exc:
             self.log_observability_failure("otel.span_enter", exc, span=name)
             return None
+        try:
+            for key, value in attrs.items():
+                if value is not None:
+                    span.set_attribute(key, value)
+        except BaseException as exc:
+            self.log_observability_failure(
+                "otel.span_attributes",
+                exc,
+                span=name,
+            )
+        return span_cm, span
 
     def _end_span(
         self,
