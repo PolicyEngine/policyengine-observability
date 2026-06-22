@@ -1,0 +1,69 @@
+name: Pull request
+
+on:
+  pull_request:
+    paths:
+      - "policyengine_observability/**"
+      - "tests/**"
+      - ".github/**"
+      - "changelog.d/**"
+      - "pyproject.toml"
+      - "uv.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-changelog:
+    name: Check changelog fragment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check for changelog fragment
+        run: uv run --extra dev bash .github/check-changelog.sh "origin/${{ github.base_ref }}"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run ruff format check
+        run: uv run --extra dev ruff format --check .
+      - name: Run ruff check
+        run: uv run --extra dev ruff check .
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run tests with coverage
+        run: uv run --extra dev --extra all coverage run -m pytest
+      - name: Enforce coverage
+        run: uv run --extra dev --extra all coverage report
+      - name: Write coverage XML
+        run: uv run --extra dev --extra all coverage xml

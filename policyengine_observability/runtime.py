@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager, contextmanager
-from contextvars import ContextVar
-from datetime import datetime, timezone
-from enum import Enum
-from functools import wraps
 import inspect
 import json
 import logging
@@ -12,16 +7,23 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from enum import Enum
+from functools import wraps
+from typing import Any
 
 from .config import ObservabilityConfig
-from .context import ErrorRecord
-from .context import OperationObservabilityContext
-from .context import RequestObservabilityContext
-from .context import _metric_attrs
+from .context import (
+    ErrorRecord,
+    OperationObservabilityContext,
+    RequestObservabilityContext,
+    _metric_attrs,
+)
 from .logging import configure_plain_logger
 from .segments import coerce_segment_name
-
 
 OBSERVABILITY_INTERNAL_DISPATCH_HEADER = "X-PolicyEngine-Internal-Dispatch"
 REQUEST_ID_HEADER = "X-PolicyEngine-Request-Id"
@@ -98,7 +100,7 @@ class ObservabilityRuntime:
         self._httpx_instrumented = False
 
     @classmethod
-    def disabled(cls) -> "ObservabilityRuntime":
+    def disabled(cls) -> ObservabilityRuntime:
         return cls(ObservabilityConfig(enabled=False))
 
     def configure(self) -> None:
@@ -726,7 +728,7 @@ class ObservabilityRuntime:
             base: dict[str, Any] = {
                 "schema_version": "policyengine.observability.event.v1",
                 "event": event,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
             if context is not None:
                 trace_id, span_id = self._trace_ids()
@@ -1017,7 +1019,7 @@ class ObservabilityRuntime:
         payload = {
             "schema_version": "policyengine.observability.internal_error.v1",
             "event": "observability_internal_error",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
             "operation": operation,
             "error": {
                 "type": type(exc).__name__,
@@ -1044,17 +1046,15 @@ class ObservabilityRuntime:
 
     def _configure_otel(self) -> None:
         try:
-            from opentelemetry import metrics
-            from opentelemetry import propagate
-            from opentelemetry import trace
+            from opentelemetry import metrics, propagate, trace
             from opentelemetry.sdk.metrics import MeterProvider
-            from opentelemetry.sdk.resources import DEPLOYMENT_ENVIRONMENT
-            from opentelemetry.sdk.resources import SERVICE_NAME
-            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.resources import (
+                DEPLOYMENT_ENVIRONMENT,
+                SERVICE_NAME,
+                Resource,
+            )
             from opentelemetry.sdk.trace import TracerProvider
-            from opentelemetry.trace import SpanKind
-            from opentelemetry.trace import Status
-            from opentelemetry.trace import StatusCode
+            from opentelemetry.trace import SpanKind, Status, StatusCode
         except BaseException as exc:
             self.log_observability_failure("otel.configure_imports", exc)
             return
@@ -1643,7 +1643,7 @@ class ObservabilityRuntime:
                 {
                     "schema_version": "policyengine.observability.internal_error.v1",
                     "event": "observability_internal_error",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "created_at": datetime.now(UTC).isoformat(),
                     "operation": "observability.failure_json",
                 },
                 sort_keys=True,

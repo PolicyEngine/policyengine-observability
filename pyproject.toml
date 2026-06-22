@@ -26,11 +26,13 @@ fastapi = [
     "opentelemetry-instrumentation-fastapi",
 ]
 httpx = [
+    "httpx",
     "opentelemetry-instrumentation-httpx",
 ]
 all = [
     "fastapi",
     "flask>=2.2",
+    "httpx",
     "opentelemetry-api",
     "opentelemetry-sdk",
     "opentelemetry-exporter-otlp-proto-grpc",
@@ -39,8 +41,11 @@ all = [
     "opentelemetry-instrumentation-httpx",
 ]
 dev = [
+    "build",
+    "coverage",
     "pytest",
     "ruff>=0.9.0",
+    "towncrier>=24.8.0",
 ]
 
 [build-system]
@@ -54,5 +59,64 @@ packages = ["policyengine_observability"]
 line-length = 79
 target-version = "py312"
 
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "W",
+    "UP",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["policyengine_observability"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.towncrier]
+package = "policyengine_observability"
+directory = "changelog.d"
+filename = "CHANGELOG.md"
+title_format = "## [{version}] - {project_date}"
+issue_format = ""
+underlines = ["", "", ""]
+
+[[tool.towncrier.type]]
+directory = "breaking"
+name = "Breaking changes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "added"
+name = "Added"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "changed"
+name = "Changed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "fixed"
+name = "Fixed"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "removed"
+name = "Removed"
+showcontent = true

@@ -5,10 +5,21 @@ from enum import StrEnum
 
 import pytest
 
-from policyengine_observability import ObservabilityConfig
-from policyengine_observability import ObservabilityRuntime
-from policyengine_observability.adapters.fastapi import UNMATCHED_ROUTE
+from policyengine_observability import (
+    ObservabilityConfig,
+    ObservabilityRuntime,
+)
 from policyengine_observability.adapters.fastapi import (
+    UNMATCHED_ROUTE,
+    FastAPIObservabilityAdapter,
+    FastAPIObservabilityMiddleware,
+    _endpoint_from_scope,
+    _headers_from_scope,
+    _int_header,
+    _merge_response_headers,
+    _query_keys,
+    _route_from_scope,
+    _split_forwarded_for,
     init_fastapi_observability,
 )
 
@@ -157,3 +168,167 @@ def test_fastapi_unmatched_route_uses_stable_metric_label() -> None:
     assert response_start["status"] == 404
     _, _, request_attributes = observed.requests.calls[0]
     assert request_attributes["route"] == UNMATCHED_ROUTE
+
+
+def test_fastapi_adapter_disabled_and_idempotent_paths() -> None:
+    fastapi, _responses = _fastapi_modules()
+    app = fastapi.FastAPI()
+    disabled = ObservabilityRuntime.disabled()
+    adapter = FastAPIObservabilityAdapter(disabled)
+
+    adapter.instrument_app(app)
+
+    assert not hasattr(app.state, "policyengine_observability_adapter")
+
+    observed = ObservabilityRuntime(
+        ObservabilityConfig(service_name="svc", instrument_fastapi=True)
+    )
+    adapter = FastAPIObservabilityAdapter(observed)
+    adapter.instrument_app(app)
+    adapter.instrument_app(app)
+
+    assert app.state.policyengine_observability_adapter is adapter
+
+
+def test_fastapi_adapter_logs_middleware_and_start_failures() -> None:
+    class BrokenApp:
+        state = type("State", (), {})()
+
+        def add_middleware(self, *_args, **_kwargs):
+            raise RuntimeError("middleware failed")
+
+    observed = ObservabilityRuntime(ObservabilityConfig(service_name="svc"))
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    adapter = FastAPIObservabilityAdapter(observed)
+    adapter.instrument_app(BrokenApp())
+    observed.begin_request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("begin failed")
+    )
+    adapter.start_request({"headers": [], "path": "/broken"})
+
+    assert failures == [
+        "fastapi.middleware_install",
+        "fastapi.before_request",
+    ]
+
+
+def test_fastapi_init_returns_existing_runtime() -> None:
+    fastapi, _responses = _fastapi_modules()
+    app = fastapi.FastAPI()
+    runtime = ObservabilityRuntime.disabled()
+    app.state.policyengine_observability = runtime
+
+    assert init_fastapi_observability(app, service_name="svc") is runtime
+
+
+def test_fastapi_inbound_metadata_ip_source_variants() -> None:
+    observed = ObservabilityRuntime(
+        ObservabilityConfig(service_name="svc", log_raw_ip=False)
+    )
+    adapter = FastAPIObservabilityAdapter(observed)
+
+    real_ip = adapter._inbound_metadata(
+        {"client": ("10.0.0.1", 123)},
+        {"x-real-ip": "198.51.100.5"},
+    )
+    remote_addr = adapter._inbound_metadata(
+        {"client": ("10.0.0.1", 123)},
+        {},
+    )
+
+    assert real_ip["ip_source"] == "x_real_ip"
+    assert remote_addr["ip_source"] == "remote_addr"
+    assert "client_ip" not in real_ip
+
+
+def test_fastapi_middleware_non_http_scope_passthrough() -> None:
+    calls = []
+
+    async def app(scope, _receive, _send):
+        calls.append(scope["type"])
+
+    adapter = FastAPIObservabilityAdapter(
+        ObservabilityRuntime(ObservabilityConfig(service_name="svc"))
+    )
+    middleware = FastAPIObservabilityMiddleware(app, adapter=adapter)
+
+    async def run():
+        await middleware({"type": "lifespan"}, None, None)
+
+    asyncio.run(run())
+
+    assert calls == ["lifespan"]
+
+
+def test_fastapi_middleware_records_exception_before_reraising() -> None:
+    observed = ObservabilityRuntime(ObservabilityConfig(service_name="svc"))
+    observed.errors = RecordingInstrument()
+    observed.requests = RecordingInstrument()
+    observed.http_duration = RecordingInstrument()
+    observed.active_requests = RecordingInstrument()
+
+    async def app(_scope, _receive, _send):
+        raise RuntimeError("app failed")
+
+    adapter = FastAPIObservabilityAdapter(observed)
+    middleware = FastAPIObservabilityMiddleware(app, adapter=adapter)
+
+    async def run():
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(_message):
+            return None
+
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/boom",
+            "query_string": b"a=1",
+            "headers": [],
+            "client": ("127.0.0.1", 123),
+        }
+        with pytest.raises(RuntimeError, match="app failed"):
+            await middleware(scope, receive, send)
+
+    asyncio.run(run())
+
+    assert observed.errors.calls[0][0] == "add"
+    assert observed.requests.calls[0][0] == "add"
+
+
+def test_fastapi_helpers_handle_edge_inputs() -> None:
+    scope = {
+        "headers": [
+            (b"x-test", b"one"),
+            (b"x-test", b"two"),
+            (object(), object()),
+        ],
+        "query_string": "a=1&b=&a=2",
+    }
+
+    assert _headers_from_scope(scope)["x-test"] == "one,two"
+    assert _query_keys(scope) == ["a", "b"]
+    assert _route_from_scope({"route": object()}) is None
+    assert _endpoint_from_scope({"endpoint": "callable-ish"}) == "callable-ish"
+    assert _int_header("bad") is None
+    assert _int_header("12") == 12
+    assert _split_forwarded_for("1.1.1.1, ,2.2.2.2") == [
+        "1.1.1.1",
+        "2.2.2.2",
+    ]
+    assert _merge_response_headers(
+        [(b"x-policyengine-request-id", b"old"), (b"x-other", b"keep")],
+        {
+            "X-PolicyEngine-Request-Id": "new",
+            "traceparent": "parent",
+            "ignored": "value",
+        },
+    ) == [
+        (b"x-other", b"keep"),
+        (b"X-PolicyEngine-Request-Id", b"new"),
+        (b"traceparent", b"parent"),
+    ]

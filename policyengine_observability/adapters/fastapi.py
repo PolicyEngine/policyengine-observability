@@ -6,11 +6,12 @@ from urllib.parse import parse_qs
 
 from ..config import ObservabilityConfig
 from ..context import RequestObservabilityContext
-from ..runtime import REQUEST_ID_HEADER
-from ..runtime import TRACEPARENT_HEADER
-from ..runtime import ObservabilityRuntime
-from ..runtime import set_observability_runtime
-
+from ..runtime import (
+    REQUEST_ID_HEADER,
+    TRACEPARENT_HEADER,
+    ObservabilityRuntime,
+    set_observability_runtime,
+)
 
 UNMATCHED_ROUTE = "<unmatched>"
 

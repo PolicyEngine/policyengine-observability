@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import time
 from enum import StrEnum
+from types import SimpleNamespace
 
 import pytest
 
+from policyengine_observability import (
+    UNKNOWN_SEGMENT,
+    ObservabilityConfig,
+    ObservabilityRuntime,
+    RequestObservabilityContext,
+    coerce_segment_name,
+)
+from policyengine_observability import runtime as runtime_module
 from policyengine_observability.config import DEFAULT_METRIC_ATTRIBUTE_KEYS
-from policyengine_observability import UNKNOWN_SEGMENT
-from policyengine_observability import ObservabilityConfig
-from policyengine_observability import ObservabilityRuntime
-from policyengine_observability import RequestObservabilityContext
-from policyengine_observability import coerce_segment_name
 
 
 class SegmentName(StrEnum):
@@ -46,9 +51,36 @@ class RecordingSpan:
         )()
 
 
+class NamedRecordingSpan(RecordingSpan):
+    def __init__(self) -> None:
+        super().__init__()
+        self.names = []
+
+    def update_name(self, name: str) -> None:
+        self.names.append(name)
+
+
+class ValidContextSpan(RecordingSpan):
+    def get_span_context(self):
+        return type(
+            "SpanContext",
+            (),
+            {
+                "is_valid": True,
+                "trace_id": 0x4BF92F3577B34DA6A3CE929D0E0E4736,
+                "span_id": 0x00F067AA0BA902B7,
+            },
+        )()
+
+
 class AttributeFailingSpan(RecordingSpan):
     def set_attribute(self, key, value) -> None:
         raise RuntimeError("attribute failed")
+
+
+class ExceptionFailingSpan(RecordingSpan):
+    def record_exception(self, exc) -> None:
+        raise RuntimeError("record exception failed")
 
 
 class RecordingSpanContextManager:
@@ -97,6 +129,23 @@ class RecordingTracer:
         return self.last_context_manager
 
 
+class RecordingMeter:
+    def __init__(self) -> None:
+        self.created = []
+
+    def create_histogram(self, name, **kwargs):
+        self.created.append(("histogram", name, kwargs))
+        return RecordingInstrument()
+
+    def create_counter(self, name, **kwargs):
+        self.created.append(("counter", name, kwargs))
+        return RecordingInstrument()
+
+    def create_up_down_counter(self, name, **kwargs):
+        self.created.append(("up_down_counter", name, kwargs))
+        return RecordingInstrument()
+
+
 class RecordingInstrument:
     def __init__(self) -> None:
         self.calls = []
@@ -106,6 +155,28 @@ class RecordingInstrument:
 
     def record(self, value, attributes=None) -> None:
         self.calls.append(("record", value, attributes))
+
+
+class FailingInstrument:
+    def add(self, *_args, **_kwargs) -> None:
+        raise RuntimeError("metric failed")
+
+    def record(self, *_args, **_kwargs) -> None:
+        raise RuntimeError("metric failed")
+
+
+class RecordingPropagator:
+    def __init__(self) -> None:
+        self.extracted = None
+
+    def inject(self, carrier) -> None:
+        carrier["traceparent"] = (
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        )
+
+    def extract(self, carrier):
+        self.extracted = carrier
+        return {"parent": carrier}
 
 
 def runtime(**kwargs) -> ObservabilityRuntime:
@@ -190,6 +261,43 @@ def test_segment_span_exit_failure_does_not_escape() -> None:
     assert "load_ms" in timings
 
 
+def test_disabled_runtime_noops_across_public_methods() -> None:
+    observed = ObservabilityRuntime.disabled()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/disabled",
+        path="/disabled",
+        endpoint="disabled",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    handle = observed.start_operation("disabled")
+    observed.end_operation(handle)
+    observed.begin_request(context)
+    observed.complete_request(200)
+    observed.update_request_route(route="/other")
+    observed.teardown_request(None)
+    observed.set_attribute("key", "value")
+    observed.record_error(RuntimeError("ignored"), handled=True)
+    observed.record_event("ignored")
+
+    with observed.segment(SegmentName.LOAD) as span:
+        assert span is None
+
+    async def run() -> None:
+        async with observed.asegment(SegmentName.LOAD) as async_span:
+            assert async_span is None
+
+    asyncio.run(run())
+    assert observed.prepare_response(200) == {}
+    assert observed.current_context() is None
+    assert observed.current_operation() is None
+
+
 def test_span_attribute_failure_does_not_drop_span_lifecycle() -> None:
     observed = runtime()
     span = AttributeFailingSpan()
@@ -217,6 +325,104 @@ def test_collect_timings_records_block_exception_on_scope_span() -> None:
 
     assert len(span.exceptions) == 1
     assert isinstance(span.exceptions[0], RuntimeError)
+
+
+def test_operation_context_manager_async_and_exception_paths() -> None:
+    async def run() -> None:
+        observed = runtime()
+        observed.errors = RecordingInstrument()
+
+        with pytest.raises(RuntimeError, match="async failed"):
+            async with observed.operation("async_job", flavor="worker"):
+                raise RuntimeError("async failed")
+
+        assert observed.errors.calls[0][2]["error_type"] == "RuntimeError"
+        assert observed.current_operation() is None
+
+    asyncio.run(run())
+
+
+def test_start_operation_with_parent_context_attaches_and_detaches() -> None:
+    observed = runtime()
+    observed.tracer = RecordingTracer()
+    parent_context = object()
+
+    handle = observed.start_operation(
+        "parented",
+        parent_context=parent_context,
+    )
+    observed.end_operation(handle)
+
+    assert observed.tracer.calls[0][0] == "parented"
+    assert observed.current_operation() is None
+
+
+def test_operation_attach_detach_and_reset_failures_are_logged(
+    monkeypatch,
+) -> None:
+    from opentelemetry import context as otel_context
+
+    observed = runtime()
+    observed.tracer = RecordingTracer()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append((operation, fields.get("token")))
+    )
+    monkeypatch.setattr(
+        otel_context,
+        "attach",
+        lambda _context: (_ for _ in ()).throw(RuntimeError("attach failed")),
+    )
+
+    handle = observed.start_operation("job", parent_context=object())
+    observed.end_operation(handle)
+
+    monkeypatch.setattr(
+        otel_context,
+        "detach",
+        lambda _token: (_ for _ in ()).throw(RuntimeError("detach failed")),
+    )
+    observed.end_operation(
+        {
+            "operation": None,
+            "context_token": object(),
+            "timings_token": object(),
+            "start_token": object(),
+            "operation_token": object(),
+        }
+    )
+
+    assert ("operation.context_attach", None) in failures
+    assert ("operation.context_detach", None) in failures
+    assert ("operation.context_reset", "timings_token") in failures
+    assert ("operation.context_reset", "start_token") in failures
+    assert ("operation.context_reset", "operation_token") in failures
+
+
+def test_operation_end_and_start_failures_are_logged(monkeypatch) -> None:
+    class BrokenVar:
+        def set(self, _value):
+            raise RuntimeError("set failed")
+
+    observed = runtime()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    operation_handle = observed.start_operation("job")
+    operation = operation_handle["operation"]
+    operation.metric_recorded = True
+    observed.complete_operation(operation)
+    observed.complete_operation = lambda _operation: (_ for _ in ()).throw(
+        RuntimeError("complete failed")
+    )
+    observed.end_operation(operation_handle)
+
+    monkeypatch.setattr(runtime_module, "_OPERATION_CONTEXT", BrokenVar())
+    handle = observed.start_operation("job")
+
+    assert handle["operation"] is None
+    assert failures == ["operation.end", "operation.start"]
 
 
 def test_standalone_segment_creates_implicit_operation_metrics() -> None:
@@ -290,6 +496,28 @@ def test_start_scope_outside_request_records_operation_segment_metrics() -> (
     assert attributes["tool"] == "search"
 
 
+def test_nested_scope_annotates_span_context_and_operation() -> None:
+    observed = runtime()
+    observed.tracer = RecordingTracer()
+    parent_context = object()
+    timings: dict[str, float] = {}
+
+    with observed.operation("outer", flavor="chat"):
+        handle = observed.start_scope(
+            timings,
+            name="inner",
+            parent_context=parent_context,
+        )
+        observed.annotate(handle, model="claude")
+        observed.mark("custom_ms", 1.23)
+        observed.mark_ttft()
+        observed.end_scope(handle)
+
+    span = observed.tracer.span
+    assert span.attributes["model"] == "claude"
+    assert "custom_ms" in timings
+
+
 def test_entrypoint_decorator_records_operation_metrics() -> None:
     observed = runtime()
     observed.operation_duration = RecordingInstrument()
@@ -336,6 +564,37 @@ def test_record_error_outside_request_uses_operation_context() -> None:
     assert attributes["error_type"] == "RuntimeError"
 
 
+def test_record_error_on_request_updates_span_status() -> None:
+    observed = runtime()
+    span = RecordingSpan()
+    observed.trace = SimpleNamespace(get_current_span=lambda: span)
+    observed.StatusCode = SimpleNamespace(ERROR="ERROR")
+    observed.Status = lambda code, message: (code, message)
+    observed.errors = RecordingInstrument()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/error",
+        path="/error",
+        endpoint="error",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed.begin_request(context)
+    observed.record_error(
+        RuntimeError("failed"),
+        handled=True,
+        status_code=500,
+    )
+    observed.teardown_request(None)
+
+    assert span.exceptions
+    assert span.status == ("ERROR", "failed")
+
+
 def test_request_lifecycle_records_headers_and_context_metrics() -> None:
     observed = runtime()
     observed.active_requests = RecordingInstrument()
@@ -369,12 +628,252 @@ def test_request_lifecycle_records_headers_and_context_metrics() -> None:
     assert observed.requests.calls[0][1] == 1
 
 
+def test_request_methods_noop_without_current_context() -> None:
+    observed = runtime()
+
+    assert observed.prepare_response(200) == {}
+    observed.complete_request(200)
+    observed.update_request_route(route="/missing")
+    observed.teardown_request(None)
+
+
+def test_request_begin_operation_begin_and_lifecycle_failures_are_logged(
+    monkeypatch,
+) -> None:
+    class BrokenVar:
+        def set(self, _value):
+            raise RuntimeError("set failed")
+
+    observed = runtime()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/broken",
+        path="/broken",
+        endpoint="broken",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    monkeypatch.setattr(runtime_module, "_REQUEST_CONTEXT", BrokenVar())
+    observed.begin_request(context)
+    monkeypatch.setattr(
+        runtime_module,
+        "_REQUEST_CONTEXT",
+        runtime_module.ContextVar("request", default=None),
+    )
+    monkeypatch.setattr(runtime_module, "_OPERATION_CONTEXT", BrokenVar())
+    observed._begin_request_operation(context)
+
+    assert failures == ["request.begin", "request.operation_begin"]
+
+
+def test_request_prepare_complete_update_and_teardown_failures_are_logged() -> (
+    None
+):
+    observed = runtime()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/broken",
+        path="/broken",
+        endpoint="broken",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+    observed.begin_request(context)
+    context.span_attributes = lambda **_extra: (_ for _ in ()).throw(
+        RuntimeError("span attrs failed")
+    )
+    observed.prepare_response(200)
+    observed.complete_request(200)
+    observed.update_request_route(route="/other")
+    observed.emit_request_log = lambda _context: (_ for _ in ()).throw(
+        RuntimeError("emit failed")
+    )
+    observed.teardown_request(None)
+
+    assert "request.prepare_response" in failures
+    assert "request.complete" in failures
+    assert "request.update_route" in failures
+    assert "request.teardown" in failures
+
+
+def test_set_attribute_failure_path_is_logged() -> None:
+    observed = runtime()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    observed.current_context = lambda: SimpleNamespace(
+        set_attribute=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("attribute failed")
+        )
+    )
+
+    observed.set_attribute("tool", "loader")
+
+    assert failures == ["request.set_attribute"]
+
+
+def test_request_route_update_relabels_active_request_and_span() -> None:
+    observed = runtime()
+    observed.active_requests = RecordingInstrument()
+    span = NamedRecordingSpan()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/initial",
+        path="/items/1",
+        endpoint="initial",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+    context.server_span = span
+
+    observed.begin_request(context)
+    observed.update_request_route(route="/items/<id>", endpoint="item")
+    observed.teardown_request(None)
+
+    assert context.route == "/items/<id>"
+    assert context.endpoint == "item"
+    assert span.names == ["/items/<id>"]
+    assert observed.active_requests.calls[1][1] == -1
+    assert observed.active_requests.calls[2][1] == 1
+
+
+def test_prepare_response_includes_traceparent_when_available() -> None:
+    observed = runtime()
+    observed.propagate = RecordingPropagator()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/trace",
+        path="/trace",
+        endpoint="trace",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed.begin_request(context)
+    headers = observed.prepare_response(200)
+    observed.teardown_request(None)
+
+    assert headers["traceparent"].startswith("00-4bf92f")
+
+
+def test_rate_limited_request_records_rate_limit_metric() -> None:
+    observed = runtime()
+    observed.rate_limited = RecordingInstrument()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/limited",
+        path="/limited",
+        endpoint="limited",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed.begin_request(context)
+    headers = observed.finish_request(429)
+    observed.teardown_request(None)
+
+    assert headers["X-PolicyEngine-Request-Id"] == "request-1"
+    assert context.attributes["rate_limited"] is True
+    assert observed.rate_limited.calls[0][0] == "add"
+
+
+def test_teardown_request_records_unhandled_exception() -> None:
+    observed = runtime()
+    observed.errors = RecordingInstrument()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/error",
+        path="/error",
+        endpoint="error",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed.begin_request(context)
+    observed.teardown_request(RuntimeError("failed"))
+
+    assert context.status_code == 500
+    assert context.error is not None
+    assert context.error.handled is False
+    assert observed.errors.calls[0][0] == "add"
+
+
 def test_from_env_invalid_shutdown_timeout_falls_back(monkeypatch) -> None:
     monkeypatch.setenv("OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS", "bad")
 
     config = ObservabilityConfig.from_env(service_name="svc")
 
     assert config.shutdown_timeout_seconds == 3.0
+
+
+def test_from_env_reads_boolean_csv_and_environment(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_SERVICE_NAME", "env-svc")
+    monkeypatch.setenv("DEPLOYMENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("OBSERVABILITY_ENABLED", "off")
+    monkeypatch.setenv("OBSERVABILITY_REQUEST_LOGS_ENABLED", "false")
+    monkeypatch.setenv("OBSERVABILITY_LOG_RAW_IP", "0")
+    monkeypatch.setenv("OBSERVABILITY_LOG_LEVEL", "warning")
+    monkeypatch.setenv("OTEL_ENABLED", "1")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+    monkeypatch.setenv("OBSERVABILITY_TRACER_NAME", "tracer")
+    monkeypatch.setenv("OBSERVABILITY_METER_NAME", "meter")
+    monkeypatch.setenv(
+        "OBSERVABILITY_METRIC_ATTRIBUTE_KEYS",
+        "service.name, custom",
+    )
+    monkeypatch.setenv(
+        "OBSERVABILITY_EXTRA_METRIC_ATTRIBUTE_KEYS",
+        "custom, other",
+    )
+
+    config = ObservabilityConfig.from_env(
+        service_name="svc",
+        instrument_fastapi=True,
+        instrument_httpx=True,
+    )
+
+    assert config.service_name == "env-svc"
+    assert config.environment == "production"
+    assert config.enabled is False
+    assert config.request_logs_enabled is False
+    assert config.log_raw_ip is False
+    assert config.otel_enabled is True
+    assert config.otlp_endpoint == "http://collector"
+    assert config.otlp_protocol == "http/protobuf"
+    assert config.tracer_name == "tracer"
+    assert config.meter_name == "meter"
+    assert config.instrument_fastapi is True
+    assert config.instrument_httpx is True
+    assert config.metric_attribute_keys == ("service.name", "custom", "other")
 
 
 def test_metric_attribute_keys_are_configurable() -> None:
@@ -400,6 +899,29 @@ def test_metric_attribute_keys_are_configurable() -> None:
         "service.name": "svc",
         "tool": "search",
     }
+
+
+def test_context_set_attribute_normalizes_enum_values() -> None:
+    observed = runtime()
+    operation = observed.start_operation("job")["operation"]
+    request = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/",
+        path="/",
+        endpoint="root",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    operation.set_attribute("segment", SegmentName.LOAD)
+    request.set_attribute("segment", SegmentName.SAVE)
+    observed.end_operation({"operation": operation})
+
+    assert operation.attributes["segment"] == "load"
+    assert request.attributes["segment"] == "save"
 
 
 def test_metric_attribute_keys_can_be_extended_from_env(monkeypatch) -> None:
@@ -467,6 +989,204 @@ def test_shutdown_calls_trace_and_metric_providers() -> None:
     assert meter_provider.shutdown_called
 
 
+def test_shutdown_logs_provider_failures_and_timeout() -> None:
+    class FailingProvider:
+        def shutdown(self) -> None:
+            raise RuntimeError("shutdown failed")
+
+    class SlowProvider:
+        def shutdown(self) -> None:
+            time.sleep(0.05)
+
+    observed = runtime(shutdown_timeout_seconds=0.001)
+    observed.tracer_provider = FailingProvider()
+    observed.meter_provider = SlowProvider()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+
+    observed.shutdown()
+
+    assert "otel.trace_shutdown" in failures
+    assert "otel.shutdown_timeout" in failures
+
+
+def test_configure_otel_creates_real_providers_and_instruments() -> None:
+    observed = runtime(otel_enabled=True)
+
+    observed.configure()
+
+    assert observed.tracer is not None
+    assert observed.meter is not None
+    assert observed.trace is not None
+    assert observed.propagate is not None
+
+
+def test_configure_otel_with_exporters_does_not_throw() -> None:
+    observed = runtime(
+        otel_enabled=True,
+        otlp_endpoint="http://localhost:4318",
+        otlp_protocol="http/protobuf",
+    )
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+
+    observed.configure()
+
+    assert observed.tracer_provider is not None
+    assert observed.meter_provider is not None
+
+
+def test_configure_otel_import_failure_is_logged(monkeypatch) -> None:
+    observed = runtime(otel_enabled=True)
+    failures = []
+    original_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "opentelemetry":
+            raise RuntimeError("otel missing")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+
+    observed.configure()
+
+    assert failures == ["otel.configure_imports"]
+
+
+def test_configure_instruments_and_instrument_failures() -> None:
+    observed = runtime()
+    meter = RecordingMeter()
+    observed.meter = meter
+
+    observed._configure_instruments()
+
+    assert len(meter.created) == 11
+
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append((operation, fields.get("instrument")))
+    )
+    noop = observed._instrument(
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("factory failed")
+        ),
+        "broken",
+    )
+
+    noop.add(1)
+    noop.record(1)
+    assert failures == [("metrics.create_instrument", "broken")]
+
+
+def test_request_span_lifecycle_records_enter_and_exit_failures() -> None:
+    observed = runtime()
+    observed.tracer = RecordingTracer(fail_enter=True)
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/span",
+        path="/span",
+        endpoint="span",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed._start_request_span(context)
+    assert context.server_span is None
+
+    observed.tracer = RecordingTracer(fail_exit=True)
+    observed._start_request_span(context)
+    observed._close_request_span(context, RuntimeError("failed"))
+    observed._close_request_span(context, None)
+
+    assert failures == ["otel.request_span_enter", "otel.request_span_exit"]
+
+
+def test_safe_span_records_exception_and_preserves_user_error() -> None:
+    observed = runtime()
+    observed.tracer = RecordingTracer()
+
+    with pytest.raises(RuntimeError, match="business failed"):
+        with observed._safe_span("safe", {}):
+            raise RuntimeError("business failed")
+
+    assert isinstance(observed.tracer.span.exceptions[0], RuntimeError)
+
+
+def test_span_and_segment_failure_helpers_are_logged(monkeypatch) -> None:
+    observed = runtime()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    observed.trace = SimpleNamespace(
+        get_current_span=lambda: AttributeFailingSpan()
+    )
+    observed._set_current_span_attributes({"key": "value"})
+
+    observed.trace = SimpleNamespace(
+        get_current_span=lambda: ExceptionFailingSpan()
+    )
+    observed._record_exception_on_span(
+        ExceptionFailingSpan(),
+        RuntimeError("failed"),
+        handled=False,
+        status_code=500,
+    )
+    observed._add_span_event("event", {"safe": "yes", "unsafe": object()})
+    observed._record_segment_safely("missing_start", None, {})
+    monkeypatch.setattr(
+        observed,
+        "_safe_perf_counter",
+        lambda _operation: None,
+    )
+    observed._record_segment_safely("missing_end", 1.0, {})
+
+    assert "otel.set_span_attributes" in failures
+    assert "otel.record_exception" in failures
+
+
+def test_segment_helpers_cover_operation_attrs_and_span_prefix() -> None:
+    observed = runtime(span_prefix="svc")
+    with observed.operation("job", flavor="cli"):
+        attrs = observed._segment_span_attributes({"tool": "loader"})
+
+    assert attrs["policyengine.operation"] == "job"
+    assert attrs["tool"] == "loader"
+    assert observed._span_name("load") == "svc.load"
+
+
+def test_contextvar_failure_paths_are_logged(monkeypatch) -> None:
+    class BrokenVar:
+        def get(self):
+            raise RuntimeError("get failed")
+
+    observed = runtime()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    monkeypatch.setattr(runtime_module, "_REQUEST_CONTEXT", BrokenVar())
+    monkeypatch.setattr(runtime_module, "_OPERATION_CONTEXT", BrokenVar())
+
+    assert observed.current_context() is None
+    assert observed.current_operation() is None
+    assert failures == ["context.current", "operation.current"]
+
+
 def test_runtime_owned_httpx_instrumentation_failure_does_not_throw(
     monkeypatch,
 ) -> None:
@@ -491,6 +1211,194 @@ def test_runtime_owned_httpx_instrumentation_failure_does_not_throw(
     assert failures == ["httpx.auto_instrument"]
 
 
+def test_runtime_owned_httpx_instrumentation_success_and_wrapper() -> None:
+    from policyengine_observability.integrations.httpx import (
+        instrument_httpx,
+    )
+
+    observed = runtime(otel_enabled=True)
+
+    instrument_httpx(observed)
+    instrument_httpx(observed)
+
+    assert observed._httpx_instrumented is True
+
+
+def test_traceparent_capture_and_valid_trace_ids() -> None:
+    observed = runtime()
+    propagator = RecordingPropagator()
+    observed.propagate = propagator
+    span = ValidContextSpan()
+    observed.trace = SimpleNamespace(get_current_span=lambda: span)
+
+    trace_id, span_id = observed._trace_ids()
+
+    assert observed.traceparent_header().startswith("00-4bf92f")
+    assert observed._extract_context({"traceparent": "parent"}) == {
+        "parent": {"traceparent": "parent"}
+    }
+    assert propagator.extracted == {"traceparent": "parent"}
+    assert trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert span_id == "00f067aa0ba902b7"
+
+
+def test_trace_helpers_log_failures_without_throwing() -> None:
+    observed = runtime()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+    observed.propagate = SimpleNamespace(
+        inject=lambda _carrier: (_ for _ in ()).throw(RuntimeError("inject")),
+        extract=lambda _carrier: (_ for _ in ()).throw(
+            RuntimeError("extract")
+        ),
+    )
+    observed.trace = SimpleNamespace(
+        get_current_span=lambda: (_ for _ in ()).throw(RuntimeError("span"))
+    )
+
+    assert observed.traceparent_header() is None
+    assert observed._extract_context({"traceparent": "parent"}) is None
+    assert observed._current_span() is None
+    assert failures == [
+        "request.traceparent_header",
+        "otel.extract_context",
+        "otel.current_span",
+    ]
+
+
+def test_record_event_covers_operation_context_and_no_context_metrics() -> (
+    None
+):
+    observed = runtime()
+    observed.failover_events = RecordingInstrument()
+
+    with observed.operation("worker", flavor="queue"):
+        observed.record_event("modal_retry", attempt=1, ignored=None)
+
+    observed.record_event("fallback_without_context")
+
+    assert len(observed.failover_events.calls) == 2
+    assert observed.failover_events.calls[0][2]["operation"] == "worker"
+    assert observed.failover_events.calls[1][2]["event"] == (
+        "fallback_without_context"
+    )
+
+
+def test_record_event_request_context_and_emit_log_skip_paths() -> None:
+    observed = runtime()
+    observed.failover_events = RecordingInstrument()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/event",
+        path="/event",
+        endpoint="event",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+        internal_dispatch=True,
+    )
+    observed.begin_request(context)
+    observed.record_event("fallback_request", detail="request")
+    observed.emit_request_log(context)
+    observed.emit_request_log(context)
+    observed.teardown_request(None)
+
+    operation = observed.start_operation("job")["operation"]
+    observed.emit_operation_log(operation)
+    observed.emit_operation_log(operation)
+    observed.end_operation({"operation": operation})
+
+    assert observed.failover_events.calls[0][2]["route"] == "/event"
+    assert context.emitted is True
+    assert operation.emitted is True
+
+
+def test_record_segment_metric_covers_calculation_and_backend() -> None:
+    observed = runtime()
+    observed.segment_duration = RecordingInstrument()
+    observed.calculate_duration = RecordingInstrument()
+    observed.backend_duration = RecordingInstrument()
+
+    observed.record_segment_metric(
+        "calculation",
+        0.1,
+        {"backend": "modal"},
+        backend_segment=True,
+    )
+
+    assert observed.segment_duration.calls
+    assert observed.calculate_duration.calls
+    assert observed.backend_duration.calls
+
+
+def test_metric_recording_failures_are_logged() -> None:
+    observed = runtime()
+    observed.operation_duration = FailingInstrument()
+    observed.http_duration = FailingInstrument()
+    observed.segment_duration = FailingInstrument()
+    observed.errors = FailingInstrument()
+    observed.rate_limited = FailingInstrument()
+    observed.failover_events = FailingInstrument()
+    observed.active_requests = FailingInstrument()
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+
+    observed.record_operation_metric(0.1, {})
+    observed.record_request_metric(0.1, {})
+    observed.record_segment_metric("load", 0.1, {})
+    observed.record_error_metric({})
+    observed.record_rate_limited_metric({})
+    observed.record_failover_event_metric({})
+    observed.record_active_request(1, {})
+
+    assert failures == [
+        "metrics.record_operation",
+        "metrics.record_request",
+        "metrics.record_segment",
+        "metrics.record_error",
+        "metrics.record_rate_limited",
+        "metrics.record_failover_event",
+        "metrics.add_active_request",
+    ]
+
+
+def test_private_safety_helpers_cover_fallback_paths(
+    monkeypatch,
+    capsys,
+) -> None:
+    observed = runtime()
+
+    class Unprintable:
+        def __str__(self) -> str:
+            raise RuntimeError("cannot stringify")
+
+    assert observed._safe_str(Unprintable()) == "<unprintable Unprintable>"
+    assert observed._safe_traceback(Unprintable()) == ""
+
+    original_dumps = __import__("json").dumps
+
+    def failing_dumps(payload, *args, **kwargs):
+        if payload.get("event") == "bad":
+            raise RuntimeError("json failed")
+        return original_dumps(payload, *args, **kwargs)
+
+    monkeypatch.setattr("json.dumps", failing_dumps)
+    assert "observability_internal_error" in observed._json({"event": "bad"})
+
+    monkeypatch.setattr(
+        "policyengine_observability.runtime.INTERNAL_LOGGER.error",
+        lambda _message: (_ for _ in ()).throw(RuntimeError("logger failed")),
+    )
+    observed.log_observability_failure("test", RuntimeError("failed"))
+    assert "observability_internal_error" in capsys.readouterr().err
+
+
 def test_coerce_segment_name_validates_registry() -> None:
     assert coerce_segment_name(SegmentName.LOAD, registry=SegmentName) == (
         "load",
@@ -499,4 +1407,9 @@ def test_coerce_segment_name_validates_registry() -> None:
     assert coerce_segment_name("other", registry=SegmentName) == (
         "other",
         False,
+    )
+    assert coerce_segment_name("load", registry=["load"]) == ("load", True)
+    assert coerce_segment_name(SegmentName.LOAD, registry=None) == (
+        "load",
+        True,
     )

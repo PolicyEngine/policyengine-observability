@@ -3,16 +3,16 @@ from __future__ import annotations
 from typing import Any
 
 from .config import ObservabilityConfig
-from .context import OperationObservabilityContext
-from .context import RequestObservabilityContext
-from .runtime import OBSERVABILITY_INTERNAL_DISPATCH_HEADER
-from .runtime import REQUEST_ID_HEADER
-from .runtime import TRACEPARENT_HEADER
-from .runtime import ObservabilityRuntime
-from .runtime import observability_runtime
-from .runtime import set_observability_runtime
-from .segments import UNKNOWN_SEGMENT
-from .segments import coerce_segment_name
+from .context import OperationObservabilityContext, RequestObservabilityContext
+from .runtime import (
+    OBSERVABILITY_INTERNAL_DISPATCH_HEADER,
+    REQUEST_ID_HEADER,
+    TRACEPARENT_HEADER,
+    ObservabilityRuntime,
+    observability_runtime,
+    set_observability_runtime,
+)
+from .segments import UNKNOWN_SEGMENT, coerce_segment_name
 
 
 def current_context() -> RequestObservabilityContext | None:

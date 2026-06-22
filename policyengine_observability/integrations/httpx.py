@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from ..runtime import ObservabilityRuntime
-from ..runtime import observability_runtime
+from ..runtime import ObservabilityRuntime, observability_runtime
 
 
 def instrument_httpx(runtime: ObservabilityRuntime | None = None) -> None:

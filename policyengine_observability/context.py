@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from .config import ObservabilityConfig
@@ -34,9 +34,7 @@ class OperationObservabilityContext:
     emit_log: bool = True
     record_metric: bool = True
     started_at: float = field(default_factory=time.perf_counter)
-    created_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     error: ErrorRecord | None = None
     emitted: bool = False
     metric_recorded: bool = False
@@ -125,9 +123,7 @@ class RequestObservabilityContext:
     inbound: dict[str, Any]
     internal_dispatch: bool = False
     started_at: float = field(default_factory=time.perf_counter)
-    created_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     attributes: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, float] = field(default_factory=dict)
     status_code: int | None = None

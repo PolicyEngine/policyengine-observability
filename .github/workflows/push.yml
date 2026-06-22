@@ -1,0 +1,158 @@
+name: Push
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: observability-release
+
+env:
+  VERSION_COMMIT_MESSAGE: Update observability package version
+
+jobs:
+  check-changelog:
+    name: Check changelog fragment
+    if: github.event.head_commit.message != 'Update observability package version'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check for changelog fragment
+        env:
+          BASE_REF: ${{ github.event.before }}
+        run: |
+          BASE_REF="${BASE_REF:-HEAD^}"
+          uv run --extra dev bash .github/check-changelog.sh "$BASE_REF"
+
+  lint:
+    name: Lint
+    if: github.event.head_commit.message != 'Update observability package version'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run ruff format check
+        run: uv run --extra dev ruff format --check .
+      - name: Run ruff check
+        run: uv run --extra dev ruff check .
+
+  test:
+    name: Test
+    if: github.event.head_commit.message != 'Update observability package version'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run tests with coverage
+        run: uv run --extra dev --extra all coverage run -m pytest
+      - name: Enforce coverage
+        run: uv run --extra dev --extra all coverage report
+      - name: Write coverage XML
+        run: uv run --extra dev --extra all coverage xml
+
+  versioning:
+    name: Update versioning
+    needs:
+      - check-changelog
+      - lint
+      - test
+    if: github.event.head_commit.message != 'Update observability package version'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+      - name: Fetch tags
+        run: git fetch --tags --force
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build changelog
+        run: |
+          uv run --extra dev python .github/bump_version.py
+          uv run --extra dev towncrier build --yes --version "$(uv run python .github/fetch_version.py)"
+      - name: Preview changelog update
+        run: bash .github/get-changelog-diff.sh
+      - name: Update changelog and package version
+        uses: EndBug/add-and-commit@v10
+        with:
+          add: "."
+          message: ${{ env.VERSION_COMMIT_MESSAGE }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          fetch: false
+
+  publish:
+    name: Publish
+    if: github.event.head_commit.message == 'Update observability package version'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Publish git tag
+        run: bash .github/publish-git-tag.sh
+      - name: Build package
+        run: uv build
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+      - name: Create GitHub release
+        run: |
+          VERSION="$(uv run python .github/fetch_version.py)"
+          gh release create "$VERSION" \
+            --title "v$VERSION" \
+            --notes "See CHANGELOG.md for details." \
+            --latest

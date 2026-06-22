@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
 import logging
 import os
-
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 DEFAULT_METRIC_ATTRIBUTE_KEYS = (
     "service.name",
@@ -99,7 +98,7 @@ class ObservabilityConfig:
         instrument_httpx: bool = False,
         metric_attribute_keys: Sequence[str] | None = None,
         extra_metric_attribute_keys: Sequence[str] = (),
-    ) -> "ObservabilityConfig":
+    ) -> ObservabilityConfig:
         level_name = os.getenv("OBSERVABILITY_LOG_LEVEL", "INFO").upper()
         log_level = getattr(logging, level_name, logging.INFO)
         otlp_protocol = (

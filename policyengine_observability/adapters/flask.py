@@ -5,10 +5,12 @@ from typing import Any
 
 from ..config import ObservabilityConfig
 from ..context import RequestObservabilityContext
-from ..runtime import OBSERVABILITY_INTERNAL_DISPATCH_HEADER
-from ..runtime import REQUEST_ID_HEADER
-from ..runtime import ObservabilityRuntime
-from ..runtime import set_observability_runtime
+from ..runtime import (
+    OBSERVABILITY_INTERNAL_DISPATCH_HEADER,
+    REQUEST_ID_HEADER,
+    ObservabilityRuntime,
+    set_observability_runtime,
+)
 
 
 class FlaskObservabilityAdapter:
