@@ -25,6 +25,94 @@ class ErrorRecord:
 
 
 @dataclass
+class OperationObservabilityContext:
+    config: ObservabilityConfig
+    name: str
+    flavor: str | None = None
+    attributes: dict[str, Any] = field(default_factory=dict)
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    emit_log: bool = True
+    record_metric: bool = True
+    started_at: float = field(default_factory=time.perf_counter)
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    error: ErrorRecord | None = None
+    emitted: bool = False
+    metric_recorded: bool = False
+    span_handle: Any = None
+    context_token: Any = None
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        if value is None:
+            return
+        if hasattr(value, "value"):
+            value = value.value
+        self.attributes[key] = value
+
+    def duration_seconds(self) -> float:
+        return time.perf_counter() - self.started_at
+
+    def metric_attributes(self, **extra: Any) -> dict[str, str]:
+        attrs: dict[str, Any] = {
+            "service.name": self.config.service_name,
+            "service.role": self.config.service_role,
+            "deployment.environment": self.config.environment,
+            "operation": self.name,
+            "flavor": self.flavor,
+        }
+        for key in self.config.metric_attribute_keys:
+            if key in self.attributes:
+                attrs[key] = self.attributes[key]
+        attrs.update(extra)
+        return _metric_attrs(attrs, self.config.metric_attribute_keys)
+
+    def span_attributes(self, **extra: Any) -> dict[str, Any]:
+        attrs: dict[str, Any] = {
+            "service.name": self.config.service_name,
+            "service.role": self.config.service_role,
+            "deployment.environment": self.config.environment,
+            "policyengine.operation": self.name,
+            "policyengine.flavor": self.flavor,
+        }
+        attrs.update(
+            {
+                f"policyengine.{key}": value
+                for key, value in self.attributes.items()
+                if value is not None
+            }
+        )
+        attrs.update(extra)
+        return {
+            key: value for key, value in attrs.items() if value is not None
+        }
+
+    def as_log_record(
+        self,
+        *,
+        trace_id: str | None,
+        span_id: str | None,
+    ) -> dict[str, Any]:
+        event = "operation_failed" if self.error else "operation_completed"
+        return {
+            "schema_version": "policyengine.observability.operation.v1",
+            "event": event,
+            "service_name": self.config.service_name,
+            "service_role": self.config.service_role,
+            "environment": self.config.environment,
+            "created_at": self.created_at.isoformat(),
+            "operation": self.name,
+            "flavor": self.flavor,
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "duration_ms": round(self.duration_seconds() * 1000, 3),
+            "timings_ms": dict(self.timings_ms),
+            **self.attributes,
+            "error": self.error.as_dict() if self.error else None,
+        }
+
+
+@dataclass
 class RequestObservabilityContext:
     config: ObservabilityConfig
     request_id: str
@@ -45,11 +133,14 @@ class RequestObservabilityContext:
     status_code: int | None = None
     error: ErrorRecord | None = None
     emitted: bool = False
+    request_metric_recorded: bool = False
     active_closed: bool = False
     span_closed: bool = False
     server_span_cm: Any = None
     server_span: Any = None
     context_token: Any = None
+    operation_context: OperationObservabilityContext | None = None
+    operation_token: Any = None
 
     def set_attribute(self, key: str, value: Any) -> None:
         if value is None:
@@ -72,17 +163,11 @@ class RequestObservabilityContext:
         }
         if self.status_code is not None:
             attrs["status_code"] = str(self.status_code)
-        for key in (
-            "country_id",
-            "backend",
-            "requested_version",
-            "resolved_channel",
-            "auth_result",
-        ):
+        for key in self.config.metric_attribute_keys:
             if key in self.attributes:
                 attrs[key] = self.attributes[key]
         attrs.update(extra)
-        return _metric_attrs(attrs)
+        return _metric_attrs(attrs, self.config.metric_attribute_keys)
 
     def span_attributes(self, **extra: Any) -> dict[str, Any]:
         attrs: dict[str, Any] = {
@@ -145,28 +230,12 @@ class RequestObservabilityContext:
         }
 
 
-METRIC_ATTRIBUTE_KEYS = (
-    "service.name",
-    "service.role",
-    "deployment.environment",
-    "route",
-    "method",
-    "endpoint",
-    "status_code",
-    "country_id",
-    "backend",
-    "requested_version",
-    "resolved_channel",
-    "auth_result",
-    "segment",
-    "event",
-    "error_type",
-)
-
-
-def _metric_attrs(attrs: dict[str, Any]) -> dict[str, str]:
+def _metric_attrs(
+    attrs: dict[str, Any],
+    metric_attribute_keys: tuple[str, ...],
+) -> dict[str, str]:
     result: dict[str, str] = {}
-    for key in METRIC_ATTRIBUTE_KEYS:
+    for key in metric_attribute_keys:
         value = attrs.get(key)
         if value is not None:
             result[key] = str(value)

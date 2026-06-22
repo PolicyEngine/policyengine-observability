@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 from enum import StrEnum
 
 import pytest
 
+from policyengine_observability.config import DEFAULT_METRIC_ATTRIBUTE_KEYS
 from policyengine_observability import UNKNOWN_SEGMENT
 from policyengine_observability import ObservabilityConfig
 from policyengine_observability import ObservabilityRuntime
@@ -196,6 +198,96 @@ def test_collect_timings_records_block_exception_on_scope_span() -> None:
     assert isinstance(span.exceptions[0], RuntimeError)
 
 
+def test_standalone_segment_creates_implicit_operation_metrics() -> None:
+    observed = runtime()
+    observed.segment_duration = RecordingInstrument()
+    observed.operation_duration = RecordingInstrument()
+    observed.operations = RecordingInstrument()
+
+    with observed.segment(SegmentName.LOAD, flavor="cli", tool="loader"):
+        pass
+
+    _, _, segment_attributes = observed.segment_duration.calls[0]
+    _, _, operation_attributes = observed.operation_duration.calls[0]
+    assert segment_attributes["operation"] == "load"
+    assert segment_attributes["flavor"] == "cli"
+    assert segment_attributes["tool"] == "loader"
+    assert operation_attributes["operation"] == "load"
+    assert operation_attributes["flavor"] == "cli"
+    assert observed.current_operation() is None
+
+
+def test_start_scope_outside_request_records_operation_segment_metrics() -> (
+    None
+):
+    observed = runtime()
+    observed.segment_duration = RecordingInstrument()
+    timings: dict[str, float] = {}
+
+    handle = observed.start_scope(
+        timings,
+        name="chat_turn",
+        flavor="chat",
+        model="claude",
+    )
+    with observed.segment(SegmentName.LOAD, tool="search"):
+        pass
+    observed.end_scope(handle)
+
+    _, _, attributes = observed.segment_duration.calls[0]
+    assert "load_ms" in timings
+    assert attributes["operation"] == "chat_turn"
+    assert attributes["flavor"] == "chat"
+    assert attributes["model"] == "claude"
+    assert attributes["tool"] == "search"
+
+
+def test_entrypoint_decorator_records_operation_metrics() -> None:
+    observed = runtime()
+    observed.operation_duration = RecordingInstrument()
+    observed.operations = RecordingInstrument()
+
+    @observed.entrypoint("import_data", flavor="cli")
+    def run_import() -> str:
+        return "done"
+
+    assert run_import() == "done"
+    _, _, attributes = observed.operation_duration.calls[0]
+    assert attributes["operation"] == "import_data"
+    assert attributes["flavor"] == "cli"
+
+
+def test_async_segment_decorator_records_segment_metrics() -> None:
+    observed = runtime()
+    observed.segment_duration = RecordingInstrument()
+
+    @observed.segment(SegmentName.SAVE, flavor="worker")
+    async def save() -> str:
+        return "saved"
+
+    assert asyncio.run(save()) == "saved"
+    _, _, attributes = observed.segment_duration.calls[0]
+    assert attributes["operation"] == "save"
+    assert attributes["flavor"] == "worker"
+
+
+def test_record_error_outside_request_uses_operation_context() -> None:
+    observed = runtime()
+    observed.errors = RecordingInstrument()
+
+    with observed.operation("worker", flavor="queue"):
+        observed.record_error(
+            RuntimeError("failed"),
+            handled=True,
+            include_stack=False,
+        )
+
+    _, _, attributes = observed.errors.calls[0]
+    assert attributes["operation"] == "worker"
+    assert attributes["flavor"] == "queue"
+    assert attributes["error_type"] == "RuntimeError"
+
+
 def test_request_lifecycle_records_headers_and_context_metrics() -> None:
     observed = runtime()
     observed.active_requests = RecordingInstrument()
@@ -223,9 +315,132 @@ def test_request_lifecycle_records_headers_and_context_metrics() -> None:
     assert context.status_code == 200
     assert "load" in context.timings_ms
     assert observed.current_context() is None
+    assert observed.current_operation() is None
     assert observed.active_requests.calls[0][1] == 1
     assert observed.active_requests.calls[-1][1] == -1
     assert observed.requests.calls[0][1] == 1
+
+
+def test_from_env_invalid_shutdown_timeout_falls_back(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS", "bad")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.shutdown_timeout_seconds == 3.0
+
+
+def test_metric_attribute_keys_are_configurable() -> None:
+    config = ObservabilityConfig(
+        service_name="svc",
+        metric_attribute_keys=("service.name", "tool"),
+    )
+    context = RequestObservabilityContext(
+        config=config,
+        request_id="request-1",
+        method="POST",
+        route="/chat",
+        path="/chat",
+        endpoint="chat",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+    context.set_attribute("tool", "search")
+    context.set_attribute("model", "claude")
+
+    assert context.metric_attributes() == {
+        "service.name": "svc",
+        "tool": "search",
+    }
+
+
+def test_metric_attribute_keys_can_be_extended_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_EXTRA_METRIC_ATTRIBUTE_KEYS", "custom")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.metric_attribute_keys == (
+        *DEFAULT_METRIC_ATTRIBUTE_KEYS,
+        "custom",
+    )
+
+
+def test_segment_metric_uses_configured_metric_attribute_keys() -> None:
+    observed = runtime(
+        metric_attribute_keys=(
+            "service.name",
+            "route",
+            "method",
+            "segment",
+            "tool",
+        )
+    )
+    observed.segment_duration = RecordingInstrument()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="POST",
+        route="/chat",
+        path="/chat",
+        endpoint="chat",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed.begin_request(context)
+    with observed.segment(SegmentName.LOAD, tool="search", model="claude"):
+        pass
+    observed.finish_request(200)
+    observed.teardown_request(None)
+
+    _, _, attributes = observed.segment_duration.calls[0]
+    assert attributes["tool"] == "search"
+    assert "model" not in attributes
+
+
+def test_shutdown_calls_trace_and_metric_providers() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    observed = runtime(shutdown_timeout_seconds=1)
+    trace_provider = Provider()
+    meter_provider = Provider()
+    observed.tracer_provider = trace_provider
+    observed.meter_provider = meter_provider
+
+    observed.shutdown()
+
+    assert trace_provider.shutdown_called
+    assert meter_provider.shutdown_called
+
+
+def test_runtime_owned_httpx_instrumentation_failure_does_not_throw(
+    monkeypatch,
+) -> None:
+    observed = runtime(otel_enabled=True)
+    failures = []
+    original_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "opentelemetry.instrumentation.httpx":
+            raise RuntimeError("instrumentation failed")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    monkeypatch.setattr(
+        observed,
+        "log_observability_failure",
+        lambda operation, exc, **fields: failures.append(operation),
+    )
+
+    observed.instrument_httpx()
+
+    assert failures == ["httpx.auto_instrument"]
 
 
 def test_coerce_segment_name_validates_registry() -> None:

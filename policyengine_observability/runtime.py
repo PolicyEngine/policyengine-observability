@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from enum import Enum
+from functools import wraps
+import inspect
 import json
 import logging
 import sys
@@ -14,7 +16,7 @@ from typing import Any, AsyncIterator, Iterator
 
 from .config import ObservabilityConfig
 from .context import ErrorRecord
-from .context import METRIC_ATTRIBUTE_KEYS
+from .context import OperationObservabilityContext
 from .context import RequestObservabilityContext
 from .context import _metric_attrs
 from .logging import configure_plain_logger
@@ -26,16 +28,24 @@ REQUEST_ID_HEADER = "X-PolicyEngine-Request-Id"
 TRACEPARENT_HEADER = "traceparent"
 
 REQUEST_LOGGER_NAME = "policyengine_observability.requests"
+OPERATION_LOGGER_NAME = "policyengine_observability.operations"
 EVENT_LOGGER_NAME = "policyengine_observability.events"
 INTERNAL_LOGGER_NAME = "policyengine_observability.internal"
 
 REQUEST_LOGGER = logging.getLogger(REQUEST_LOGGER_NAME)
+OPERATION_LOGGER = logging.getLogger(OPERATION_LOGGER_NAME)
 EVENT_LOGGER = logging.getLogger(EVENT_LOGGER_NAME)
 INTERNAL_LOGGER = logging.getLogger(INTERNAL_LOGGER_NAME)
 
 _REQUEST_CONTEXT: ContextVar[RequestObservabilityContext | None] = ContextVar(
     "policyengine_request_observability_context",
     default=None,
+)
+_OPERATION_CONTEXT: ContextVar[OperationObservabilityContext | None] = (
+    ContextVar(
+        "policyengine_operation_observability_context",
+        default=None,
+    )
 )
 _TIMINGS: ContextVar[dict[str, float] | None] = ContextVar(
     "policyengine_observability_timings",
@@ -74,15 +84,18 @@ class ObservabilityRuntime:
         self.meter_provider = None
         self.tracer = None
         self.meter = None
+        self.operation_duration = _NoOpInstrument()
         self.http_duration = _NoOpInstrument()
         self.segment_duration = _NoOpInstrument()
         self.calculate_duration = _NoOpInstrument()
         self.backend_duration = _NoOpInstrument()
+        self.operations = _NoOpInstrument()
         self.requests = _NoOpInstrument()
         self.errors = _NoOpInstrument()
         self.rate_limited = _NoOpInstrument()
         self.failover_events = _NoOpInstrument()
         self.active_requests = _NoOpInstrument()
+        self._httpx_instrumented = False
 
     @classmethod
     def disabled(cls) -> "ObservabilityRuntime":
@@ -93,6 +106,8 @@ class ObservabilityRuntime:
         if not self.enabled or not self.config.otel_enabled:
             return
         self._configure_otel()
+        if self.config.instrument_httpx:
+            self.instrument_httpx()
 
     def current_context(self) -> RequestObservabilityContext | None:
         try:
@@ -100,6 +115,172 @@ class ObservabilityRuntime:
         except BaseException as exc:
             self.log_observability_failure("context.current", exc)
             return None
+
+    def current_operation(
+        self,
+    ) -> OperationObservabilityContext | None:
+        try:
+            return _OPERATION_CONTEXT.get()
+        except BaseException as exc:
+            self.log_observability_failure("operation.current", exc)
+            return None
+
+    def operation(
+        self,
+        name: str,
+        *,
+        flavor: str | None = None,
+        **attrs: Any,
+    ):
+        return _OperationManager(self, name, flavor=flavor, attrs=attrs)
+
+    def entrypoint(
+        self,
+        name: str | None = None,
+        *,
+        flavor: str | None = None,
+        **attrs: Any,
+    ):
+        def decorator(func):
+            operation_name = name or getattr(func, "__name__", "operation")
+            return self.operation(
+                operation_name,
+                flavor=flavor,
+                **attrs,
+            )(func)
+
+        return decorator
+
+    def start_operation(
+        self,
+        name: str,
+        *,
+        flavor: str | None = None,
+        parent_context: Any = None,
+        timings: dict[str, float] | None = None,
+        emit_log: bool = True,
+        record_metric: bool = True,
+        **attrs: Any,
+    ) -> dict[str, Any]:
+        handle = {
+            "operation": None,
+            "operation_token": None,
+            "timings_token": None,
+            "start_token": None,
+            "context_token": None,
+        }
+        if not self.enabled:
+            return handle
+        try:
+            operation = OperationObservabilityContext(
+                config=self.config,
+                name=self._safe_str(name),
+                flavor=flavor,
+                attributes={
+                    key: value
+                    for key, value in attrs.items()
+                    if value is not None
+                },
+                timings_ms={},
+                emit_log=emit_log,
+                record_metric=record_metric,
+            )
+            operation.context_token = _OPERATION_CONTEXT.set(operation)
+            handle["operation"] = operation
+            handle["operation_token"] = operation.context_token
+            if timings is not None:
+                handle["timings_token"] = _TIMINGS.set(timings)
+            handle["start_token"] = _TURN_START.set(time.perf_counter())
+            if parent_context is not None and self.tracer is not None:
+                try:
+                    from opentelemetry import context as otel_context
+
+                    handle["context_token"] = otel_context.attach(
+                        parent_context
+                    )
+                except BaseException as exc:
+                    self.log_observability_failure(
+                        "operation.context_attach",
+                        exc,
+                    )
+            if self.tracer is not None:
+                operation.span_handle = self._start_span(
+                    self._span_name(operation.name),
+                    operation.span_attributes(),
+                )
+        except BaseException as exc:
+            self.log_observability_failure("operation.start", exc, name=name)
+        return handle
+
+    def end_operation(
+        self,
+        handle: dict[str, Any] | None,
+        error: BaseException | None = None,
+    ) -> None:
+        if not handle:
+            return
+        operation = handle.get("operation")
+        try:
+            if operation is not None and error is not None:
+                operation.error = ErrorRecord(
+                    type=type(error).__name__,
+                    message=self._safe_str(error),
+                    handled=False,
+                    stack=self._safe_traceback(error),
+                )
+                self.record_error_metric(
+                    operation.metric_attributes(
+                        error_type=type(error).__name__
+                    )
+                )
+            if operation is not None:
+                self.complete_operation(operation)
+            if operation is not None:
+                self._end_span(operation.span_handle, error)
+        except BaseException as exc:
+            self.log_observability_failure("operation.end", exc)
+        finally:
+            context_token = handle.get("context_token")
+            if context_token is not None:
+                try:
+                    from opentelemetry import context as otel_context
+
+                    otel_context.detach(context_token)
+                except BaseException as exc:
+                    self.log_observability_failure(
+                        "operation.context_detach",
+                        exc,
+                    )
+            for var, key in (
+                (_TIMINGS, "timings_token"),
+                (_TURN_START, "start_token"),
+                (_OPERATION_CONTEXT, "operation_token"),
+            ):
+                token = handle.get(key)
+                if token is not None:
+                    try:
+                        var.reset(token)
+                    except BaseException as exc:
+                        self.log_observability_failure(
+                            "operation.context_reset",
+                            exc,
+                            token=key,
+                        )
+
+    def complete_operation(
+        self,
+        operation: OperationObservabilityContext,
+    ) -> None:
+        if operation.metric_recorded:
+            return
+        operation.metric_recorded = True
+        if operation.record_metric:
+            self.record_operation_metric(
+                operation.duration_seconds(),
+                operation.metric_attributes(),
+            )
+        if operation.emit_log:
+            self.emit_operation_log(operation)
 
     def begin_request(
         self,
@@ -112,12 +293,47 @@ class ObservabilityRuntime:
         try:
             context.context_token = _REQUEST_CONTEXT.set(context)
             context.set_attribute("endpoint", context.endpoint)
+            self._begin_request_operation(context)
             self._start_request_span(context, carrier=carrier)
             self.record_active_request(1, context.metric_attributes())
         except BaseException as exc:
             self.log_observability_failure("request.begin", exc)
 
+    def _begin_request_operation(
+        self,
+        context: RequestObservabilityContext,
+    ) -> None:
+        try:
+            operation = OperationObservabilityContext(
+                config=context.config,
+                name=context.route,
+                flavor="http",
+                attributes={
+                    "route": context.route,
+                    "method": context.method,
+                    "endpoint": context.endpoint,
+                    "path": context.path,
+                },
+                timings_ms=context.timings_ms,
+                emit_log=False,
+                record_metric=False,
+            )
+            operation.context_token = _OPERATION_CONTEXT.set(operation)
+            context.operation_context = operation
+            context.operation_token = operation.context_token
+        except BaseException as exc:
+            self.log_observability_failure(
+                "request.operation_begin",
+                exc,
+                request_id=getattr(context, "request_id", None),
+            )
+
     def finish_request(self, status_code: int) -> dict[str, str]:
+        headers = self.prepare_response(status_code)
+        self.complete_request(status_code)
+        return headers
+
+    def prepare_response(self, status_code: int) -> dict[str, str]:
         if not self.enabled:
             return {}
         headers: dict[str, str] = {}
@@ -127,12 +343,36 @@ class ObservabilityRuntime:
                 return headers
             context.status_code = status_code
             self._set_current_span_attributes(context.span_attributes())
+            if context.operation_context is not None:
+                context.operation_context.set_attribute(
+                    "status_code",
+                    str(status_code),
+                )
             headers[REQUEST_ID_HEADER] = context.request_id
             traceparent = self.traceparent_header()
             if traceparent:
                 headers[TRACEPARENT_HEADER] = traceparent
             if status_code == 429:
                 context.set_attribute("rate_limited", True)
+            return headers
+        except BaseException as exc:
+            self.log_observability_failure("request.prepare_response", exc)
+        return headers
+
+    def complete_request(self, status_code: int | None = None) -> None:
+        if not self.enabled:
+            return
+        try:
+            context = self.current_context()
+            if context is None:
+                return
+            if status_code is not None:
+                context.status_code = status_code
+                self._set_current_span_attributes(context.span_attributes())
+            if context.request_metric_recorded:
+                return
+            context.request_metric_recorded = True
+            if context.status_code == 429:
                 self.record_rate_limited_metric(context.metric_attributes())
             self.record_request_metric(
                 context.duration_seconds(),
@@ -140,8 +380,49 @@ class ObservabilityRuntime:
             )
             self._close_active_request(context)
         except BaseException as exc:
-            self.log_observability_failure("request.finish", exc)
-        return headers
+            self.log_observability_failure("request.complete", exc)
+
+    def update_request_route(
+        self,
+        *,
+        route: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        try:
+            context = self.current_context()
+            if context is None:
+                return
+            route_changed = bool(route and route != context.route)
+            old_active_attributes = (
+                context.metric_attributes()
+                if route_changed and not context.active_closed
+                else None
+            )
+            if route:
+                context.route = route
+                if context.operation_context is not None:
+                    context.operation_context.name = route
+                    context.operation_context.set_attribute("route", route)
+            if endpoint:
+                context.endpoint = endpoint
+                context.set_attribute("endpoint", endpoint)
+                if context.operation_context is not None:
+                    context.operation_context.set_attribute(
+                        "endpoint",
+                        endpoint,
+                    )
+            self._set_current_span_attributes(context.span_attributes())
+            span = context.server_span
+            update_name = getattr(span, "update_name", None)
+            if route and update_name is not None:
+                update_name(route)
+            if old_active_attributes is not None:
+                self.record_active_request(-1, old_active_attributes)
+                self.record_active_request(1, context.metric_attributes())
+        except BaseException as exc:
+            self.log_observability_failure("request.update_route", exc)
 
     def teardown_request(self, exc: BaseException | None = None) -> None:
         if not self.enabled:
@@ -151,7 +432,11 @@ class ObservabilityRuntime:
             return
         try:
             if exc is not None:
-                self.record_error(exc, handled=False, status_code=500)
+                self.record_error(
+                    exc,
+                    handled=False,
+                    status_code=context.status_code or 500,
+                )
             self._close_active_request(context)
             self.emit_request_log(context)
         except BaseException as observability_exc:
@@ -161,6 +446,7 @@ class ObservabilityRuntime:
             )
         finally:
             self._close_request_span(context, exc)
+            self._reset_request_operation_context(context)
             self._reset_request_context(context)
 
     def set_attribute(self, key: str, value: Any) -> None:
@@ -170,8 +456,17 @@ class ObservabilityRuntime:
             context = self.current_context()
             if context is not None:
                 context.set_attribute(key, value)
+                if context.operation_context is not None:
+                    context.operation_context.set_attribute(key, value)
                 self._set_current_span_attributes(
                     context.span_attributes(**{f"policyengine.{key}": value})
+                )
+                return
+            operation = self.current_operation()
+            if operation is not None:
+                operation.set_attribute(key, value)
+                self._set_current_span_attributes(
+                    operation.span_attributes(**{f"policyengine.{key}": value})
                 )
         except BaseException as exc:
             self.log_observability_failure(
@@ -180,23 +475,34 @@ class ObservabilityRuntime:
                 attribute=key,
             )
 
-    @contextmanager
     def segment(self, name: Any, **attrs: Any) -> Iterator[Any]:
+        return _SegmentManager(self, name, attrs)
+
+    @contextmanager
+    def _segment_context(self, name: Any, **attrs: Any) -> Iterator[Any]:
         if not self.enabled:
             yield None
             return
         segment_name = self._coerce_segment(name)
+        implicit_operation = self._start_implicit_operation(
+            segment_name,
+            attrs,
+        )
         start = self._safe_perf_counter(f"segment.{segment_name}.start")
         span_attrs = self._segment_span_attributes(attrs)
         span_name = self._span_name(segment_name)
+        error: BaseException | None = None
         with self._safe_span(span_name, span_attrs) as span:
             try:
                 yield span
-            except BaseException:
+            except BaseException as exc:
+                error = exc
                 self._record_segment_safely(segment_name, start, attrs)
                 raise
             else:
                 self._record_segment_safely(segment_name, start, attrs)
+            finally:
+                self.end_operation(implicit_operation, error)
 
     @asynccontextmanager
     async def asegment(self, name: Any, **attrs: Any) -> AsyncIterator[Any]:
@@ -204,17 +510,25 @@ class ObservabilityRuntime:
             yield None
             return
         segment_name = self._coerce_segment(name)
+        implicit_operation = self._start_implicit_operation(
+            segment_name,
+            attrs,
+        )
         start = self._safe_perf_counter(f"segment.{segment_name}.start")
         span_attrs = self._segment_span_attributes(attrs)
         span_name = self._span_name(segment_name)
+        error: BaseException | None = None
         with self._safe_span(span_name, span_attrs) as span:
             try:
                 yield span
-            except BaseException:
+            except BaseException as exc:
+                error = exc
                 self._record_segment_safely(segment_name, start, attrs)
                 raise
             else:
                 self._record_segment_safely(segment_name, start, attrs)
+            finally:
+                self.end_operation(implicit_operation, error)
 
     @contextmanager
     def collect_timings(self, name: str = "operation", **attrs: Any):
@@ -237,7 +551,17 @@ class ObservabilityRuntime:
         parent_context: Any = None,
         **attrs: Any,
     ) -> dict[str, Any]:
+        if self.current_operation() is None:
+            return {
+                "operation_handle": self.start_operation(
+                    name,
+                    parent_context=parent_context,
+                    timings=timings,
+                    **attrs,
+                )
+            }
         handle = {
+            "operation_handle": None,
             "timings_token": None,
             "start_token": None,
             "context_token": None,
@@ -266,17 +590,28 @@ class ObservabilityRuntime:
             handle["span"] = None
         return handle
 
-    def annotate(self, handle: dict[str, Any] | None, **attrs: Any) -> None:
-        if not handle:
-            return
-        span_handle = handle.get("span")
-        if span_handle is None:
-            return
+    def annotate(
+        self,
+        handle: dict[str, Any] | None = None,
+        **attrs: Any,
+    ) -> None:
         try:
-            _cm, span = span_handle
-            for key, value in attrs.items():
-                if value is not None:
-                    span.set_attribute(key, value)
+            if handle:
+                span_handle = handle.get("span")
+                if span_handle is not None:
+                    _cm, span = span_handle
+                    for key, value in attrs.items():
+                        if value is not None:
+                            span.set_attribute(key, value)
+            context = self.current_context()
+            if context is not None:
+                for key, value in attrs.items():
+                    context.set_attribute(key, value)
+            operation = self.current_operation()
+            if operation is not None:
+                for key, value in attrs.items():
+                    operation.set_attribute(key, value)
+                self._set_current_span_attributes(operation.span_attributes())
         except BaseException as exc:
             self.log_observability_failure("scope.annotate", exc)
 
@@ -286,6 +621,10 @@ class ObservabilityRuntime:
         error: BaseException | None = None,
     ) -> None:
         if not handle:
+            return
+        operation_handle = handle.get("operation_handle")
+        if operation_handle is not None:
+            self.end_operation(operation_handle, error)
             return
         try:
             self._end_span(handle.get("span"), error)
@@ -342,19 +681,27 @@ class ObservabilityRuntime:
             return
         try:
             context = self.current_context()
-            if context is None:
-                return
-            if status_code is not None:
-                context.status_code = status_code
-            context.error = ErrorRecord(
+            operation = self.current_operation()
+            error_record = ErrorRecord(
                 type=type(exc).__name__,
                 message=self._safe_str(exc),
                 handled=handled,
                 stack=(self._safe_traceback(exc) if include_stack else None),
             )
-            self.record_error_metric(
-                context.metric_attributes(error_type=type(exc).__name__)
-            )
+            if context is not None:
+                if status_code is not None:
+                    context.status_code = status_code
+                context.error = error_record
+                self.record_error_metric(
+                    context.metric_attributes(error_type=type(exc).__name__)
+                )
+            elif operation is not None:
+                operation.error = error_record
+                self.record_error_metric(
+                    operation.metric_attributes(error_type=type(exc).__name__)
+                )
+            else:
+                return
             span = self._current_span()
             if span is not None:
                 self._record_exception_on_span(
@@ -375,6 +722,7 @@ class ObservabilityRuntime:
             return
         try:
             context = self.current_context()
+            operation = self.current_operation()
             base: dict[str, Any] = {
                 "schema_version": "policyengine.observability.event.v1",
                 "event": event,
@@ -394,6 +742,19 @@ class ObservabilityRuntime:
                         "path": context.path,
                     }
                 )
+            elif operation is not None:
+                trace_id, span_id = self._trace_ids()
+                base.update(
+                    {
+                        "service_name": operation.config.service_name,
+                        "service_role": operation.config.service_role,
+                        "environment": operation.config.environment,
+                        "operation": operation.name,
+                        "flavor": operation.flavor,
+                        "trace_id": trace_id,
+                        "span_id": span_id,
+                    }
+                )
             clean_fields = {
                 key: value
                 for key, value in fields.items()
@@ -406,7 +767,12 @@ class ObservabilityRuntime:
                 attrs = (
                     context.metric_attributes(event=event)
                     if context
-                    else _metric_attrs({"event": event})
+                    else operation.metric_attributes(event=event)
+                    if operation
+                    else _metric_attrs(
+                        {"event": event},
+                        self.config.metric_attribute_keys,
+                    )
                 )
                 self.record_failover_event_metric(attrs)
         except BaseException as exc:
@@ -465,6 +831,43 @@ class ObservabilityRuntime:
                 exc,
                 request_id=getattr(context, "request_id", None),
             )
+
+    def emit_operation_log(
+        self,
+        operation: OperationObservabilityContext,
+    ) -> None:
+        if not self.enabled:
+            return
+        try:
+            if operation.emitted:
+                return
+            operation.emitted = True
+            trace_id, span_id = self._trace_ids()
+            OPERATION_LOGGER.info(
+                self._json(
+                    operation.as_log_record(
+                        trace_id=trace_id,
+                        span_id=span_id,
+                    )
+                )
+            )
+        except BaseException as exc:
+            self.log_observability_failure(
+                "operation.emit_log",
+                exc,
+                operation=getattr(operation, "name", None),
+            )
+
+    def record_operation_metric(
+        self,
+        duration_seconds: float,
+        attributes: dict[str, str],
+    ) -> None:
+        try:
+            self.operation_duration.record(duration_seconds, attributes)
+            self.operations.add(1, attributes)
+        except BaseException as exc:
+            self.log_observability_failure("metrics.record_operation", exc)
 
     def record_request_metric(
         self,
@@ -533,15 +936,60 @@ class ObservabilityRuntime:
         except BaseException as exc:
             self.log_observability_failure("metrics.add_active_request", exc)
 
-    def shutdown_tracing(self) -> None:
-        if self.tracer_provider is None:
+    def instrument_fastapi(self, app: Any) -> None:
+        if not self.enabled or not self.config.otel_enabled:
+            return
+        try:
+            from opentelemetry.instrumentation.fastapi import (
+                FastAPIInstrumentor,
+            )
+
+            FastAPIInstrumentor.instrument_app(app)
+        except BaseException as exc:
+            self.log_observability_failure(
+                "fastapi.auto_instrument",
+                exc,
+            )
+
+    def instrument_httpx(self) -> None:
+        if (
+            not self.enabled
+            or not self.config.otel_enabled
+            or self._httpx_instrumented
+        ):
+            return
+        try:
+            from opentelemetry.instrumentation.httpx import (
+                HTTPXClientInstrumentor,
+            )
+
+            HTTPXClientInstrumentor().instrument()
+            self._httpx_instrumented = True
+        except BaseException as exc:
+            self.log_observability_failure("httpx.auto_instrument", exc)
+
+    def shutdown(self) -> None:
+        providers = [
+            ("trace", self.tracer_provider),
+            ("metrics", self.meter_provider),
+        ]
+        providers = [
+            (name, provider)
+            for name, provider in providers
+            if provider is not None
+        ]
+        if not providers:
             return
 
         def flush() -> None:
-            try:
-                self.tracer_provider.shutdown()
-            except BaseException as exc:
-                self.log_observability_failure("otel.shutdown", exc)
+            for name, provider in providers:
+                try:
+                    provider.shutdown()
+                except BaseException as exc:
+                    self.log_observability_failure(
+                        f"otel.{name}_shutdown",
+                        exc,
+                    )
 
         thread = threading.Thread(
             target=flush,
@@ -556,6 +1004,9 @@ class ObservabilityRuntime:
                 TimeoutError("OpenTelemetry shutdown timed out."),
                 timeout_seconds=self.config.shutdown_timeout_seconds,
             )
+
+    def shutdown_tracing(self) -> None:
+        self.shutdown()
 
     def log_observability_failure(
         self,
@@ -583,7 +1034,12 @@ class ObservabilityRuntime:
             self._write_stderr(payload)
 
     def _configure_loggers(self) -> None:
-        for logger in (REQUEST_LOGGER, EVENT_LOGGER, INTERNAL_LOGGER):
+        for logger in (
+            REQUEST_LOGGER,
+            OPERATION_LOGGER,
+            EVENT_LOGGER,
+            INTERNAL_LOGGER,
+        ):
             configure_plain_logger(logger, self.config.log_level)
 
     def _configure_otel(self) -> None:
@@ -688,6 +1144,12 @@ class ObservabilityRuntime:
             return None
 
     def _configure_instruments(self) -> None:
+        self.operation_duration = self._instrument(
+            getattr(self.meter, "create_histogram", None),
+            "policyengine.operation.duration",
+            unit="s",
+            description="PolicyEngine operation duration.",
+        )
         self.http_duration = self._instrument(
             getattr(self.meter, "create_histogram", None),
             "http.server.request.duration",
@@ -711,6 +1173,11 @@ class ObservabilityRuntime:
             "policyengine.backend.duration",
             unit="s",
             description="PolicyEngine backend call duration.",
+        )
+        self.operations = self._instrument(
+            getattr(self.meter, "create_counter", None),
+            "policyengine.operations",
+            description="PolicyEngine operation count.",
         )
         self.requests = self._instrument(
             getattr(self.meter, "create_counter", None),
@@ -879,22 +1346,45 @@ class ObservabilityRuntime:
             duration = end - start
             self._record_timing(name, duration)
             context = self.current_context()
+            operation = self.current_operation()
+            metric_extra = {
+                key: value
+                for key, value in attrs.items()
+                if (
+                    key in self.config.metric_attribute_keys
+                    and value is not None
+                )
+            }
             if context is not None:
                 context.timings_ms[name] = round(duration * 1000, 3)
-                metric_extra = {
-                    key: value
-                    for key, value in attrs.items()
-                    if key in METRIC_ATTRIBUTE_KEYS and value is not None
-                }
-                self.record_segment_metric(
-                    name,
-                    duration,
-                    context.metric_attributes(
-                        segment=name,
-                        **metric_extra,
-                    ),
-                    backend_segment="backend" in metric_extra,
+            if operation is not None:
+                operation.timings_ms[name] = round(duration * 1000, 3)
+                metric_attributes = operation.metric_attributes(
+                    segment=name,
+                    **metric_extra,
                 )
+            elif context is not None:
+                metric_attributes = context.metric_attributes(
+                    segment=name,
+                    **metric_extra,
+                )
+            else:
+                metric_attributes = _metric_attrs(
+                    {
+                        "service.name": self.config.service_name,
+                        "service.role": self.config.service_role,
+                        "deployment.environment": self.config.environment,
+                        "segment": name,
+                        **metric_extra,
+                    },
+                    self.config.metric_attribute_keys,
+                )
+            self.record_segment_metric(
+                name,
+                duration,
+                metric_attributes,
+                backend_segment="backend" in metric_extra,
+            )
         except BaseException as exc:
             self.log_observability_failure(
                 "request.record_segment",
@@ -922,17 +1412,40 @@ class ObservabilityRuntime:
         attrs: dict[str, Any],
     ) -> dict[str, Any]:
         context = self.current_context()
+        operation = self.current_operation()
         span_attrs = {
             key: value for key, value in attrs.items() if value is not None
         }
         if context is not None:
             span_attrs = {**context.span_attributes(), **span_attrs}
+        elif operation is not None:
+            span_attrs = {**operation.span_attributes(), **span_attrs}
         return span_attrs
 
     def _span_name(self, segment_name: str) -> str:
         if not self.config.span_prefix:
             return segment_name
         return f"{self.config.span_prefix}.{segment_name}"
+
+    def _start_implicit_operation(
+        self,
+        segment_name: str,
+        attrs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self.current_operation() is not None:
+            return None
+        operation_name = attrs.get("operation") or segment_name
+        flavor = attrs.get("flavor")
+        operation_attrs = {
+            key: value
+            for key, value in attrs.items()
+            if key not in {"operation", "flavor"} and value is not None
+        }
+        return self.start_operation(
+            self._safe_str(operation_name),
+            flavor=self._safe_str(flavor) if flavor is not None else None,
+            **operation_attrs,
+        )
 
     def _coerce_segment(self, name: Any) -> str:
         segment, is_registered = coerce_segment_name(
@@ -1059,6 +1572,22 @@ class ObservabilityRuntime:
                 request_id=getattr(context, "request_id", None),
             )
 
+    def _reset_request_operation_context(
+        self,
+        context: RequestObservabilityContext,
+    ) -> None:
+        token = context.operation_token
+        if token is None:
+            return
+        try:
+            _OPERATION_CONTEXT.reset(token)
+        except BaseException as exc:
+            self.log_observability_failure(
+                "request.operation_context_reset",
+                exc,
+                request_id=getattr(context, "request_id", None),
+            )
+
     def _reset_request_context(
         self,
         context: RequestObservabilityContext,
@@ -1119,6 +1648,118 @@ class ObservabilityRuntime:
 
 def _is_safe_span_value(value: Any) -> bool:
     return isinstance(value, str | bool | int | float)
+
+
+class _OperationManager:
+    def __init__(
+        self,
+        runtime: ObservabilityRuntime,
+        name: str,
+        *,
+        flavor: str | None,
+        attrs: dict[str, Any],
+    ) -> None:
+        self.runtime = runtime
+        self.name = name
+        self.flavor = flavor
+        self.attrs = attrs
+        self.handle: dict[str, Any] | None = None
+
+    def __enter__(self):
+        self.handle = self.runtime.start_operation(
+            self.name,
+            flavor=self.flavor,
+            **self.attrs,
+        )
+        return self.runtime.current_operation()
+
+    def __exit__(self, exc_type, exc, _traceback) -> bool:
+        self.runtime.end_operation(self.handle, exc)
+        return False
+
+    async def __aenter__(self):
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        return self.__exit__(exc_type, exc, traceback)
+
+    def __call__(self, func):
+        if inspect.iscoroutinefunction(func):
+
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                async with self.runtime.operation(
+                    self.name,
+                    flavor=self.flavor,
+                    **self.attrs,
+                ):
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self.runtime.operation(
+                self.name,
+                flavor=self.flavor,
+                **self.attrs,
+            ):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+
+class _SegmentManager:
+    def __init__(
+        self,
+        runtime: ObservabilityRuntime,
+        name: Any,
+        attrs: dict[str, Any],
+    ) -> None:
+        self.runtime = runtime
+        self.name = name
+        self.attrs = attrs
+        self.context_manager = None
+
+    def __enter__(self):
+        self.context_manager = self.runtime._segment_context(
+            self.name,
+            **self.attrs,
+        )
+        return self.context_manager.__enter__()
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        if self.context_manager is None:
+            return False
+        return bool(self.context_manager.__exit__(exc_type, exc, traceback))
+
+    async def __aenter__(self):
+        self.context_manager = self.runtime.asegment(self.name, **self.attrs)
+        return await self.context_manager.__aenter__()
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        if self.context_manager is None:
+            return False
+        return bool(
+            await self.context_manager.__aexit__(exc_type, exc, traceback)
+        )
+
+    def __call__(self, func):
+        if inspect.iscoroutinefunction(func):
+
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                async with self.runtime.segment(self.name, **self.attrs):
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self.runtime.segment(self.name, **self.attrs):
+                return func(*args, **kwargs)
+
+        return wrapper
 
 
 _RUNTIME = ObservabilityRuntime(ObservabilityConfig())

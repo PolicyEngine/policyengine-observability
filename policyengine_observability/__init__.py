@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager, contextmanager
-from typing import Any, AsyncIterator, Iterator
+from typing import Any
 
 from .config import ObservabilityConfig
+from .context import OperationObservabilityContext
 from .context import RequestObservabilityContext
 from .runtime import OBSERVABILITY_INTERNAL_DISPATCH_HEADER
 from .runtime import REQUEST_ID_HEADER
@@ -17,6 +17,10 @@ from .segments import coerce_segment_name
 
 def current_context() -> RequestObservabilityContext | None:
     return observability_runtime().current_context()
+
+
+def current_operation() -> OperationObservabilityContext | None:
+    return observability_runtime().current_operation()
 
 
 def set_attribute(key: str, value: Any) -> None:
@@ -73,7 +77,7 @@ def start_scope(
     )
 
 
-def annotate(handle, **attrs: Any) -> None:
+def annotate(handle=None, **attrs: Any) -> None:
     observability_runtime().annotate(handle, **attrs)
 
 
@@ -81,26 +85,49 @@ def end_scope(handle, error: BaseException | None = None) -> None:
     observability_runtime().end_scope(handle, error)
 
 
+def instrument_fastapi(app: Any) -> None:
+    observability_runtime().instrument_fastapi(app)
+
+
+def instrument_httpx() -> None:
+    observability_runtime().instrument_httpx()
+
+
+def shutdown_observability() -> None:
+    observability_runtime().shutdown()
+
+
 def shutdown_tracing() -> None:
-    observability_runtime().shutdown_tracing()
+    shutdown_observability()
 
 
-@contextmanager
-def segment(name: Any, **attrs: Any) -> Iterator[Any]:
-    with observability_runtime().segment(name, **attrs) as span:
-        yield span
+def operation(name: str, *, flavor: str | None = None, **attrs: Any):
+    return observability_runtime().operation(name, flavor=flavor, **attrs)
 
 
-@asynccontextmanager
-async def asegment(name: Any, **attrs: Any) -> AsyncIterator[Any]:
-    async with observability_runtime().asegment(name, **attrs) as span:
-        yield span
+def entrypoint(
+    name: str | None = None,
+    *,
+    flavor: str | None = None,
+    **attrs: Any,
+):
+    return observability_runtime().entrypoint(
+        name,
+        flavor=flavor,
+        **attrs,
+    )
 
 
-@contextmanager
+def segment(name: Any, **attrs: Any):
+    return observability_runtime().segment(name, **attrs)
+
+
+def asegment(name: Any, **attrs: Any):
+    return observability_runtime().asegment(name, **attrs)
+
+
 def collect_timings(name: str = "operation", **attrs: Any):
-    with observability_runtime().collect_timings(name, **attrs) as timings:
-        yield timings
+    return observability_runtime().collect_timings(name, **attrs)
 
 
 __all__ = [
@@ -108,6 +135,7 @@ __all__ = [
     "REQUEST_ID_HEADER",
     "TRACEPARENT_HEADER",
     "UNKNOWN_SEGMENT",
+    "OperationObservabilityContext",
     "ObservabilityConfig",
     "ObservabilityRuntime",
     "RequestObservabilityContext",
@@ -117,15 +145,21 @@ __all__ = [
     "coerce_segment_name",
     "collect_timings",
     "current_context",
+    "current_operation",
     "end_scope",
+    "entrypoint",
+    "instrument_fastapi",
+    "instrument_httpx",
     "mark",
     "mark_ttft",
     "observability_runtime",
+    "operation",
     "record_error",
     "record_event",
     "segment",
     "set_attribute",
     "set_observability_runtime",
+    "shutdown_observability",
     "shutdown_tracing",
     "start_scope",
     "traceparent_header",
