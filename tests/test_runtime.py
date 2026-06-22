@@ -217,6 +217,33 @@ def test_standalone_segment_creates_implicit_operation_metrics() -> None:
     assert observed.current_operation() is None
 
 
+def test_segment_with_request_context_does_not_create_implicit_operation(
+    monkeypatch,
+) -> None:
+    observed = runtime()
+    observed.segment_duration = RecordingInstrument()
+    observed.operation_duration = RecordingInstrument()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/calculate",
+        path="/calculate",
+        endpoint="calculate",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+    monkeypatch.setattr(observed, "current_context", lambda: context)
+
+    with observed.segment(SegmentName.LOAD):
+        pass
+
+    _, _, attributes = observed.segment_duration.calls[0]
+    assert attributes["route"] == "/calculate"
+    assert observed.operation_duration.calls == []
+
+
 def test_start_scope_outside_request_records_operation_segment_metrics() -> (
     None
 ):

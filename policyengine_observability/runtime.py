@@ -1432,7 +1432,10 @@ class ObservabilityRuntime:
         segment_name: str,
         attrs: dict[str, Any],
     ) -> dict[str, Any] | None:
-        if self.current_operation() is not None:
+        if (
+            self.current_operation() is not None
+            or self.current_context() is not None
+        ):
             return None
         operation_name = attrs.get("operation") or segment_name
         flavor = attrs.get("flavor")
