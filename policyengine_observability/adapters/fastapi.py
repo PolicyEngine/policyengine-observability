@@ -17,8 +17,18 @@ UNMATCHED_ROUTE = "<unmatched>"
 
 
 class FastAPIObservabilityAdapter:
-    def __init__(self, runtime: ObservabilityRuntime) -> None:
+    def __init__(
+        self,
+        runtime: ObservabilityRuntime,
+        *,
+        static_attributes: dict[str, Any] | None = None,
+    ) -> None:
         self.runtime = runtime
+        self.static_attributes = {
+            key: value
+            for key, value in (static_attributes or {}).items()
+            if value is not None
+        }
 
     def instrument_app(self, app: Any) -> None:
         if not self.runtime.enabled:
@@ -62,6 +72,8 @@ class FastAPIObservabilityAdapter:
                 inbound=self._inbound_metadata(scope, headers),
             )
             self.runtime.begin_request(context, carrier=headers)
+            if self.static_attributes:
+                self.runtime.annotate(**self.static_attributes)
         except BaseException as exc:
             self.runtime.log_observability_failure(
                 "fastapi.before_request",
@@ -190,6 +202,7 @@ def init_fastapi_observability(
     service_role: str = "api",
     span_prefix: str | None = None,
     segment_registry=None,
+    static_attributes: dict[str, Any] | None = None,
 ) -> ObservabilityRuntime:
     existing = getattr(app.state, "policyengine_observability", None)
     if existing:
@@ -206,7 +219,10 @@ def init_fastapi_observability(
     runtime.configure()
     app.state.policyengine_observability = runtime
     set_observability_runtime(runtime)
-    FastAPIObservabilityAdapter(runtime).instrument_app(app)
+    FastAPIObservabilityAdapter(
+        runtime,
+        static_attributes=static_attributes,
+    ).instrument_app(app)
     return runtime
 
 

@@ -170,6 +170,48 @@ def test_fastapi_unmatched_route_uses_stable_metric_label() -> None:
     assert request_attributes["route"] == UNMATCHED_ROUTE
 
 
+def test_fastapi_static_attributes_are_recorded() -> None:
+    fastapi, _responses = _fastapi_modules()
+    app = fastapi.FastAPI()
+    observed = ObservabilityRuntime(
+        ObservabilityConfig(
+            service_name="svc",
+            metric_attribute_keys=(
+                "service.name",
+                "route",
+                "method",
+                "platform",
+                "runtime_role",
+            ),
+        )
+    )
+    observed.requests = RecordingInstrument()
+    observed.http_duration = RecordingInstrument()
+    observed.active_requests = RecordingInstrument()
+
+    @app.get("/ok")
+    async def ok():
+        return {"ok": True}
+
+    init_fastapi_observability(
+        app,
+        runtime=observed,
+        service_name="svc",
+        static_attributes={
+            "platform": "modal",
+            "runtime_role": "modal_web",
+            "ignored": None,
+        },
+    )
+
+    _call_asgi(app, "/ok")
+
+    _, _, request_attributes = observed.requests.calls[0]
+    assert request_attributes["platform"] == "modal"
+    assert request_attributes["runtime_role"] == "modal_web"
+    assert "ignored" not in request_attributes
+
+
 def test_fastapi_adapter_disabled_and_idempotent_paths() -> None:
     fastapi, _responses = _fastapi_modules()
     app = fastapi.FastAPI()

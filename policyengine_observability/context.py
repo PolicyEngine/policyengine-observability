@@ -31,6 +31,7 @@ class OperationObservabilityContext:
     flavor: str | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, float] = field(default_factory=dict)
+    timing_counts: dict[str, int] = field(default_factory=dict)
     emit_log: bool = True
     record_metric: bool = True
     started_at: float = field(default_factory=time.perf_counter)
@@ -105,6 +106,7 @@ class OperationObservabilityContext:
             "span_id": span_id,
             "duration_ms": round(self.duration_seconds() * 1000, 3),
             "timings_ms": dict(self.timings_ms),
+            "timing_counts": dict(self.timing_counts),
             **self.attributes,
             "error": self.error.as_dict() if self.error else None,
         }
@@ -126,6 +128,7 @@ class RequestObservabilityContext:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     attributes: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, float] = field(default_factory=dict)
+    timing_counts: dict[str, int] = field(default_factory=dict)
     status_code: int | None = None
     error: ErrorRecord | None = None
     emitted: bool = False
@@ -221,6 +224,7 @@ class RequestObservabilityContext:
             "duration_ms": round(self.duration_seconds() * 1000, 3),
             **self.inbound,
             "timings_ms": dict(self.timings_ms),
+            "timing_counts": dict(self.timing_counts),
             **self.attributes,
             "error": self.error.as_dict() if self.error else None,
         }
