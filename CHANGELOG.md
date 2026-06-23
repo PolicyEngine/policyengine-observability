@@ -1,3 +1,11 @@
+## [1.0.0] - 2026-06-23
+
+### Breaking changes
+
+- Simplified OpenTelemetry enablement so `OTEL_ENABLED` is the only environment
+  switch used by `ObservabilityConfig.from_env`.
+
+
 ## [0.4.1] - 2026-06-23
 
 ### Changed
