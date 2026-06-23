@@ -92,7 +92,6 @@ class ObservabilityConfig:
         service_name: str,
         service_role: str = "api",
         enabled_default: bool = True,
-        otel_enabled_default: bool = True,
         span_prefix: str | None = None,
         instrument_fastapi: bool = False,
         instrument_httpx: bool = False,
@@ -129,13 +128,7 @@ class ObservabilityConfig:
             ),
             log_raw_ip=bool_from_env("OBSERVABILITY_LOG_RAW_IP", True),
             log_level=log_level,
-            otel_enabled=bool_from_env(
-                "OTEL_ENABLED",
-                bool_from_env(
-                    "OBSERVABILITY_OTEL_ENABLED",
-                    otel_enabled_default,
-                ),
-            ),
+            otel_enabled=bool_from_env("OTEL_ENABLED", cls.otel_enabled),
             otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
             otlp_protocol=otlp_protocol,
             span_prefix=span_prefix,

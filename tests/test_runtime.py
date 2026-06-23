@@ -1010,6 +1010,16 @@ def test_from_env_allows_otel_opt_out(monkeypatch) -> None:
     assert config.otel_enabled is False
 
 
+def test_from_env_ignores_legacy_observability_otel_switch(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OBSERVABILITY_OTEL_ENABLED", "false")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.otel_enabled is True
+
+
 def test_from_env_reads_boolean_csv_and_environment(monkeypatch) -> None:
     monkeypatch.setenv("OBSERVABILITY_SERVICE_NAME", "env-svc")
     monkeypatch.setenv("DEPLOYMENT_ENVIRONMENT", "production")
