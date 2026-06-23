@@ -996,6 +996,20 @@ def test_from_env_invalid_shutdown_timeout_falls_back(monkeypatch) -> None:
     assert config.shutdown_timeout_seconds == 3.0
 
 
+def test_from_env_enables_otel_by_default() -> None:
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.otel_enabled is True
+
+
+def test_from_env_allows_otel_opt_out(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_ENABLED", "false")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.otel_enabled is False
+
+
 def test_from_env_reads_boolean_csv_and_environment(monkeypatch) -> None:
     monkeypatch.setenv("OBSERVABILITY_SERVICE_NAME", "env-svc")
     monkeypatch.setenv("DEPLOYMENT_ENVIRONMENT", "production")

@@ -74,7 +74,7 @@ class ObservabilityConfig:
     request_logs_enabled: bool = True
     log_raw_ip: bool = True
     log_level: int = logging.INFO
-    otel_enabled: bool = False
+    otel_enabled: bool = True
     otlp_endpoint: str | None = None
     otlp_protocol: str = "grpc"
     span_prefix: str | None = None
@@ -92,7 +92,7 @@ class ObservabilityConfig:
         service_name: str,
         service_role: str = "api",
         enabled_default: bool = True,
-        otel_enabled_default: bool = False,
+        otel_enabled_default: bool = True,
         span_prefix: str | None = None,
         instrument_fastapi: bool = False,
         instrument_httpx: bool = False,

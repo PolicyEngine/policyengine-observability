@@ -91,6 +91,7 @@ def test_fastapi_streaming_request_finishes_after_final_body() -> None:
     observed = ObservabilityRuntime(
         ObservabilityConfig(
             service_name="svc",
+            otel_enabled=False,
             metric_attribute_keys=(
                 "service.name",
                 "route",
@@ -147,7 +148,9 @@ def test_fastapi_streaming_request_finishes_after_final_body() -> None:
 def test_fastapi_unmatched_route_uses_stable_metric_label() -> None:
     fastapi, _responses = _fastapi_modules()
     app = fastapi.FastAPI()
-    observed = ObservabilityRuntime(ObservabilityConfig(service_name="svc"))
+    observed = ObservabilityRuntime(
+        ObservabilityConfig(service_name="svc", otel_enabled=False)
+    )
     observed.requests = RecordingInstrument()
     observed.http_duration = RecordingInstrument()
     observed.active_requests = RecordingInstrument()
@@ -176,6 +179,7 @@ def test_fastapi_static_attributes_are_recorded() -> None:
     observed = ObservabilityRuntime(
         ObservabilityConfig(
             service_name="svc",
+            otel_enabled=False,
             metric_attribute_keys=(
                 "service.name",
                 "route",

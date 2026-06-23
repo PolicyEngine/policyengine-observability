@@ -34,6 +34,7 @@ def test_flask_adapter_records_request_metadata_and_headers() -> None:
     runtime = ObservabilityRuntime(
         ObservabilityConfig(
             service_name="svc",
+            otel_enabled=False,
             metric_attribute_keys=(
                 "service.name",
                 "route",

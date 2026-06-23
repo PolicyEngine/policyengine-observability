@@ -660,18 +660,20 @@ wheels = [
 name = "policyengine-observability"
 version = "0.4.0"
 source = { editable = "." }
-
-[package.optional-dependencies]
-all = [
-    { name = "fastapi" },
-    { name = "flask" },
-    { name = "httpx" },
+dependencies = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-grpc" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-sdk" },
+]
+
+[package.optional-dependencies]
+all = [
+    { name = "fastapi" },
+    { name = "flask" },
+    { name = "httpx" },
 ]
 dev = [
     { name = "build" },
@@ -682,24 +684,12 @@ dev = [
 ]
 fastapi = [
     { name = "fastapi" },
-    { name = "opentelemetry-instrumentation-fastapi" },
 ]
 flask = [
     { name = "flask" },
 ]
 httpx = [
     { name = "httpx" },
-    { name = "opentelemetry-instrumentation-httpx" },
-]
-otel = [
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-sdk" },
-]
-otlp-grpc = [
-    { name = "opentelemetry-exporter-otlp-proto-grpc" },
-]
-otlp-http = [
-    { name = "opentelemetry-exporter-otlp-proto-http" },
 ]
 
 [package.metadata]
@@ -712,18 +702,12 @@ requires-dist = [
     { name = "flask", marker = "extra == 'flask'", specifier = ">=2.2" },
     { name = "httpx", marker = "extra == 'all'" },
     { name = "httpx", marker = "extra == 'httpx'" },
-    { name = "opentelemetry-api", marker = "extra == 'all'" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'" },
-    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'all'" },
-    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'otlp-grpc'" },
-    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'all'" },
-    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otlp-http'" },
-    { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'all'" },
-    { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'fastapi'" },
-    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'all'" },
-    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'httpx'" },
-    { name = "opentelemetry-sdk", marker = "extra == 'all'" },
-    { name = "opentelemetry-sdk", marker = "extra == 'otel'" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-instrumentation-fastapi" },
+    { name = "opentelemetry-instrumentation-httpx" },
+    { name = "opentelemetry-sdk" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9.0" },
     { name = "towncrier", marker = "extra == 'dev'", specifier = ">=24.8.0" },

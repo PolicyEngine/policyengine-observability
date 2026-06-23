@@ -5,40 +5,32 @@ description = "Shared PolicyEngine observability runtime for logs, timings, metr
 readme = "README.md"
 authors = [{ name = "PolicyEngine", email = "hello@policyengine.org" }]
 requires-python = ">=3.12"
-dependencies = []
-
-[project.optional-dependencies]
-otel = [
+dependencies = [
     "opentelemetry-api",
     "opentelemetry-sdk",
-]
-otlp-grpc = [
     "opentelemetry-exporter-otlp-proto-grpc",
-]
-otlp-http = [
     "opentelemetry-exporter-otlp-proto-http",
+    "opentelemetry-instrumentation-fastapi",
+    "opentelemetry-instrumentation-httpx",
 ]
+
+[project.optional-dependencies]
+otel = []
+otlp-grpc = []
+otlp-http = []
 flask = [
     "flask>=2.2",
 ]
 fastapi = [
     "fastapi",
-    "opentelemetry-instrumentation-fastapi",
 ]
 httpx = [
     "httpx",
-    "opentelemetry-instrumentation-httpx",
 ]
 all = [
     "fastapi",
     "flask>=2.2",
     "httpx",
-    "opentelemetry-api",
-    "opentelemetry-sdk",
-    "opentelemetry-exporter-otlp-proto-grpc",
-    "opentelemetry-exporter-otlp-proto-http",
-    "opentelemetry-instrumentation-fastapi",
-    "opentelemetry-instrumentation-httpx",
 ]
 dev = [
     "build",
