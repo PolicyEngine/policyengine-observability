@@ -1,3 +1,10 @@
+## [0.4.0] - 2026-06-23
+
+### Added
+
+- Added accumulated segment timing counts, TTFT attribute marking, and FastAPI static request attributes.
+
+
 ## [0.3.0] - 2026-06-23
 
 ### Added
