@@ -1,3 +1,10 @@
+## [0.4.1] - 2026-06-23
+
+### Changed
+
+- Install and enable OpenTelemetry dependencies by default, while preserving env-based opt-out.
+
+
 ## [0.4.0] - 2026-06-23
 
 ### Added
