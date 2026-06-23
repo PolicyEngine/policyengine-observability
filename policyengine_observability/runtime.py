@@ -306,6 +306,11 @@ class ObservabilityRuntime:
         context: RequestObservabilityContext,
     ) -> None:
         try:
+            parent_operation = _OPERATION_CONTEXT.get()
+            timings = context.timings_ms
+            if context.internal_dispatch and parent_operation is not None:
+                timings = parent_operation.timings_ms
+                context.timings_ms = timings
             operation = OperationObservabilityContext(
                 config=context.config,
                 name=context.route,
@@ -316,7 +321,7 @@ class ObservabilityRuntime:
                     "endpoint": context.endpoint,
                     "path": context.path,
                 },
-                timings_ms=context.timings_ms,
+                timings_ms=timings,
                 emit_log=False,
                 record_metric=False,
             )

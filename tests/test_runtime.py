@@ -628,6 +628,76 @@ def test_request_lifecycle_records_headers_and_context_metrics() -> None:
     assert observed.requests.calls[0][1] == 1
 
 
+def test_internal_dispatch_segments_merge_into_parent_operation() -> None:
+    observed = runtime()
+    handle = observed.start_operation(
+        "modal_worker_dispatch",
+        flavor="modal_worker",
+    )
+    parent_operation = handle["operation"]
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="POST",
+        route="/calculate",
+        path="/calculate",
+        endpoint="calculate",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+        internal_dispatch=True,
+    )
+
+    try:
+        observed.begin_request(context)
+        with observed.segment(SegmentName.LOAD):
+            pass
+        observed.finish_request(200)
+        observed.teardown_request(None)
+
+        assert context.timings_ms is parent_operation.timings_ms
+        assert "load" in parent_operation.timings_ms
+        assert observed.current_operation() is parent_operation
+    finally:
+        observed.end_operation(handle)
+
+    assert observed.current_context() is None
+    assert observed.current_operation() is None
+
+
+def test_non_internal_request_timings_do_not_leak_to_parent_operation() -> None:
+    observed = runtime()
+    handle = observed.start_operation("job", flavor="worker")
+    parent_operation = handle["operation"]
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="POST",
+        route="/calculate",
+        path="/calculate",
+        endpoint="calculate",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    try:
+        observed.begin_request(context)
+        with observed.segment(SegmentName.LOAD):
+            pass
+        observed.finish_request(200)
+        observed.teardown_request(None)
+
+        assert context.timings_ms is not parent_operation.timings_ms
+        assert "load" not in parent_operation.timings_ms
+        assert observed.current_operation() is parent_operation
+    finally:
+        observed.end_operation(handle)
+
+    assert observed.current_context() is None
+    assert observed.current_operation() is None
+
+
 def test_request_methods_noop_without_current_context() -> None:
     observed = runtime()
 
