@@ -665,7 +665,9 @@ def test_internal_dispatch_segments_merge_into_parent_operation() -> None:
     assert observed.current_operation() is None
 
 
-def test_non_internal_request_timings_do_not_leak_to_parent_operation() -> None:
+def test_non_internal_request_timings_do_not_leak_to_parent_operation() -> (
+    None
+):
     observed = runtime()
     handle = observed.start_operation("job", flavor="worker")
     parent_operation = handle["operation"]
