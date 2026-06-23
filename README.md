@@ -9,8 +9,11 @@ The package intentionally keeps framework support in adapters:
 - `policyengine_observability.adapters.fastapi`
 - `policyengine_observability.integrations.httpx`
 
-OpenTelemetry imports are lazy. Timing and structured logging can run without
-an OTel backend; exporting traces/metrics is opt-in through configuration.
+OpenTelemetry support is installed and enabled by default. Timing and
+structured logging run even without an OTLP collector; when no endpoint is
+configured, spans and metrics stay in-process while logs still receive trace
+context. Set `OTEL_ENABLED=false` or `OBSERVABILITY_OTEL_ENABLED=false` to opt
+out. Configure `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces and metrics.
 
 ## Release workflow
 

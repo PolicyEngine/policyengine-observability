@@ -14,9 +14,11 @@ Before creating or sharing a PR:
 1. Confirm the canonical repository is reachable:
    `gh repo view PolicyEngine/policyengine-observability --json nameWithOwner`.
 2. Open a GitHub issue for the work, or verify that an appropriate issue
-   already exists.
-3. Put `Fixes #ISSUE_NUMBER` as the first line of the PR description, using the
-   issue number from the issue created or found in the previous step.
+   already exists. Every PR must have an accompanying issue.
+3. Put exactly `Fixes #ISSUE_NUMBER` as the first line of the PR description,
+   using the issue number from the issue created or found in the previous step.
+   This line must be the first content in the description so GitHub auto-closes
+   the issue when the PR merges.
 4. Add a Towncrier changelog fragment under `changelog.d/` using the issue
    number or a clear slug and the appropriate configured type, for example
    `changelog.d/ISSUE_NUMBER.fixed.md`.
