@@ -199,6 +199,25 @@ def test_segment_records_aggregated_timing() -> None:
     assert timings["load_ms"] >= 0
 
 
+def test_operation_log_accumulates_repeated_segment_timings() -> None:
+    observed = runtime()
+    handle = observed.start_operation("job")
+    operation = handle["operation"]
+
+    try:
+        with observed.segment(SegmentName.LOAD):
+            pass
+        with observed.segment(SegmentName.LOAD):
+            pass
+    finally:
+        observed.end_operation(handle)
+
+    assert operation.timings_ms["load"] >= 0
+    assert operation.timing_counts["load"] == 2
+    payload = operation.as_log_record(trace_id=None, span_id=None)
+    assert payload["timing_counts"]["load"] == 2
+
+
 def test_async_segment_records_timing() -> None:
     async def run() -> dict[str, float]:
         observed = runtime()
@@ -628,6 +647,34 @@ def test_request_lifecycle_records_headers_and_context_metrics() -> None:
     assert observed.requests.calls[0][1] == 1
 
 
+def test_request_log_accumulates_repeated_segment_timings() -> None:
+    observed = runtime()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/calculate",
+        path="/calculate",
+        endpoint="calculate",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed.begin_request(context)
+    with observed.segment(SegmentName.LOAD):
+        pass
+    with observed.segment(SegmentName.LOAD):
+        pass
+    observed.finish_request(200)
+    observed.teardown_request(None)
+
+    assert context.timings_ms["load"] >= 0
+    assert context.timing_counts["load"] == 2
+    payload = context.as_log_record(trace_id=None, span_id=None)
+    assert payload["timing_counts"]["load"] == 2
+
+
 def test_internal_dispatch_segments_merge_into_parent_operation() -> None:
     observed = runtime()
     handle = observed.start_operation(
@@ -698,6 +745,49 @@ def test_non_internal_request_timings_do_not_leak_to_parent_operation() -> (
 
     assert observed.current_context() is None
     assert observed.current_operation() is None
+
+
+def test_set_attribute_updates_explicit_operation_inside_request() -> None:
+    observed = runtime()
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/chat",
+        path="/chat",
+        endpoint="chat",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={},
+    )
+
+    observed.begin_request(context)
+    handle = observed.start_operation("chat.turn", flavor="chat")
+    operation = handle["operation"]
+    try:
+        observed.set_attribute("model", "claude")
+    finally:
+        observed.end_operation(handle)
+        observed.teardown_request(None)
+
+    assert context.attributes["model"] == "claude"
+    assert context.operation_context.attributes["model"] == "claude"
+    assert operation.attributes["model"] == "claude"
+    assert observed.current_context() is None
+    assert observed.current_operation() is None
+
+
+def test_mark_ttft_attribute_updates_current_operation() -> None:
+    observed = runtime()
+    handle = observed.start_operation("chat.turn", flavor="chat")
+    operation = handle["operation"]
+
+    try:
+        observed.mark_ttft_attribute()
+    finally:
+        observed.end_operation(handle)
+
+    assert operation.attributes["ttft_ms"] >= 0
 
 
 def test_request_methods_noop_without_current_context() -> None:

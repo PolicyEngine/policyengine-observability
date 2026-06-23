@@ -48,6 +48,7 @@ def test_public_wrappers_delegate_to_configured_runtime() -> None:
         with observability.segment(SegmentName.LOAD, tool="loader"):
             observability.mark("custom_ms", 12.3)
             observability.mark_ttft()
+            observability.mark_ttft_attribute()
         handle = observability.start_scope({}, name="nested")
         observability.annotate(handle, model="claude")
         observability.end_scope(handle)
@@ -86,6 +87,23 @@ def test_public_decorators_support_sync_and_async_functions() -> None:
 
     assert runtime.operation_duration.calls
     assert runtime.segment_duration.calls
+
+
+def test_setting_public_runtime_clears_stale_context() -> None:
+    old_runtime = ObservabilityRuntime(ObservabilityConfig(service_name="old"))
+    observability.set_observability_runtime(old_runtime)
+    handle = old_runtime.start_operation("old_job")
+
+    try:
+        new_runtime = ObservabilityRuntime(
+            ObservabilityConfig(service_name="new")
+        )
+        observability.set_observability_runtime(new_runtime)
+
+        assert observability.current_operation() is None
+        assert observability.current_context() is None
+    finally:
+        old_runtime.end_operation(handle)
 
 
 def test_public_async_segment_and_collect_timings_wrappers() -> None:

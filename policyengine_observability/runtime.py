@@ -468,9 +468,10 @@ class ObservabilityRuntime:
                 self._set_current_span_attributes(
                     context.span_attributes(**{f"policyengine.{key}": value})
                 )
-                return
             operation = self.current_operation()
-            if operation is not None:
+            if operation is not None and operation is not getattr(
+                context, "operation_context", None
+            ):
                 operation.set_attribute(key, value)
                 self._set_current_span_attributes(
                     operation.span_attributes(**{f"policyengine.{key}": value})
@@ -675,6 +676,17 @@ class ObservabilityRuntime:
                 self.mark(key, (time.perf_counter() - start) * 1000.0)
         except BaseException as exc:
             self.log_observability_failure("scope.mark_ttft", exc)
+
+    def mark_ttft_attribute(self, key: str = "ttft_ms") -> None:
+        try:
+            start = _TURN_START.get()
+            if start is None:
+                return
+            self.annotate(
+                **{key: round((time.perf_counter() - start) * 1000.0, 1)}
+            )
+        except BaseException as exc:
+            self.log_observability_failure("scope.mark_ttft_attribute", exc)
 
     def record_error(
         self,
@@ -1367,10 +1379,23 @@ class ObservabilityRuntime:
                     and value is not None
                 )
             }
+            duration_ms = duration * 1000
             if context is not None:
-                context.timings_ms[name] = round(duration * 1000, 3)
+                context.timings_ms[name] = round(
+                    context.timings_ms.get(name, 0.0) + duration_ms,
+                    3,
+                )
+                context.timing_counts[name] = (
+                    context.timing_counts.get(name, 0) + 1
+                )
             if operation is not None:
-                operation.timings_ms[name] = round(duration * 1000, 3)
+                operation.timings_ms[name] = round(
+                    operation.timings_ms.get(name, 0.0) + duration_ms,
+                    3,
+                )
+                operation.timing_counts[name] = (
+                    operation.timing_counts.get(name, 0) + 1
+                )
                 metric_attributes = operation.metric_attributes(
                     segment=name,
                     **metric_extra,
@@ -1783,6 +1808,16 @@ _RUNTIME = ObservabilityRuntime(ObservabilityConfig())
 def set_observability_runtime(runtime: ObservabilityRuntime) -> None:
     global _RUNTIME
     _RUNTIME = runtime
+    for context_var in (
+        _REQUEST_CONTEXT,
+        _OPERATION_CONTEXT,
+        _TIMINGS,
+        _TURN_START,
+    ):
+        try:
+            context_var.set(None)
+        except BaseException:
+            continue
 
 
 def observability_runtime() -> ObservabilityRuntime:

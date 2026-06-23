@@ -62,6 +62,10 @@ def mark_ttft(key: str = "ttft_ms") -> None:
     observability_runtime().mark_ttft(key)
 
 
+def mark_ttft_attribute(key: str = "ttft_ms") -> None:
+    observability_runtime().mark_ttft_attribute(key)
+
+
 def start_scope(
     timings: dict[str, float],
     *,
@@ -152,6 +156,7 @@ __all__ = [
     "instrument_httpx",
     "mark",
     "mark_ttft",
+    "mark_ttft_attribute",
     "observability_runtime",
     "operation",
     "record_error",
