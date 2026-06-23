@@ -1,3 +1,14 @@
+## [0.3.0] - 2026-06-23
+
+### Added
+
+- Add model-agnostic AI harness instructions and canonical engineering skills.
+
+### Fixed
+
+- Preserve internal dispatch segment timings on the parent worker operation log.
+
+
 ## [0.2.1] - 2026-06-22
 
 ### Changed
