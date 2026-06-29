@@ -27,9 +27,13 @@ fastapi = [
 httpx = [
     "httpx",
 ]
+google = [
+    "google-cloud-logging>=3.15.0",
+]
 all = [
     "fastapi",
     "flask>=2.2",
+    "google-cloud-logging>=3.15.0",
     "httpx",
 ]
 dev = [

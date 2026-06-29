@@ -5,6 +5,7 @@ import builtins
 import time
 from enum import StrEnum
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -17,6 +18,9 @@ from policyengine_observability import (
 )
 from policyengine_observability import runtime as runtime_module
 from policyengine_observability.config import DEFAULT_METRIC_ATTRIBUTE_KEYS
+from policyengine_observability.destinations import (
+    manager as destination_manager_module,
+)
 
 
 class SegmentName(StrEnum):
@@ -163,6 +167,28 @@ class FailingInstrument:
 
     def record(self, *_args, **_kwargs) -> None:
         raise RuntimeError("metric failed")
+
+
+class RecordingLogDestination:
+    def __init__(self, name: str = "recording") -> None:
+        self.name = name
+        self.calls = []
+
+    def emit(
+        self,
+        payload: dict[str, Any],
+        *,
+        log_type: str,
+        severity: str,
+    ) -> None:
+        self.calls.append((payload, log_type, severity))
+
+
+class FailingLogDestination:
+    name = "failing"
+
+    def emit(self, *_args, **_kwargs) -> None:
+        raise RuntimeError("destination failed")
 
 
 class RecordingPropagator:
@@ -1062,6 +1088,23 @@ def test_from_env_reads_boolean_csv_and_environment(monkeypatch) -> None:
     assert config.metric_attribute_keys == ("service.name", "custom", "other")
 
 
+def test_from_env_reads_log_destinations_and_google_config(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "OBSERVABILITY_LOG_DESTINATIONS",
+        "stdout, google-cloud-logging, stdout",
+    )
+    monkeypatch.setenv("GCP_PROJECT", "fallback-project")
+    monkeypatch.setenv("OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME", "custom-log")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.log_destinations == ("stdout", "google-cloud-logging")
+    assert config.google_cloud_project == "fallback-project"
+    assert config.google_cloud_log_name == "custom-log"
+
+
 def test_metric_attribute_keys_are_configurable() -> None:
     config = ObservabilityConfig(
         service_name="svc",
@@ -1501,6 +1544,197 @@ def test_record_event_request_context_and_emit_log_skip_paths() -> None:
     assert observed.failover_events.calls[0][2]["route"] == "/event"
     assert context.emitted is True
     assert operation.emitted is True
+
+
+def test_operation_log_emits_to_configured_destinations_once() -> None:
+    observed = runtime()
+    destination = RecordingLogDestination()
+    observed.log_destination_manager.destinations = [destination]
+    observed.log_destination_manager.configured = True
+
+    handle = observed.start_operation("job")
+    operation = handle["operation"]
+    observed.end_operation(handle)
+    observed.emit_operation_log(operation)
+
+    assert len(destination.calls) == 1
+    payload, log_type, severity = destination.calls[0]
+    assert payload["operation"] == "job"
+    assert payload["severity"] == "INFO"
+    assert log_type == "operation"
+    assert severity == "INFO"
+
+
+def test_request_log_emits_to_configured_destination_once() -> None:
+    observed = runtime()
+    destination = RecordingLogDestination()
+    observed.log_destination_manager.destinations = [destination]
+    observed.log_destination_manager.configured = True
+    context = RequestObservabilityContext(
+        config=observed.config,
+        request_id="request-1",
+        method="GET",
+        route="/calculate",
+        path="/calculate",
+        endpoint="calculate",
+        query_keys=[],
+        content_length_bytes=None,
+        inbound={"client_ip": "203.0.113.1"},
+        status_code=200,
+    )
+
+    observed.emit_request_log(context)
+    observed.emit_request_log(context)
+
+    assert len(destination.calls) == 1
+    payload, log_type, severity = destination.calls[0]
+    assert payload["request_id"] == "request-1"
+    assert payload["client_ip"] == "203.0.113.1"
+    assert payload["severity"] == "INFO"
+    assert log_type == "request"
+    assert severity == "INFO"
+
+
+def test_event_log_emits_to_configured_destination() -> None:
+    observed = runtime()
+    destination = RecordingLogDestination()
+    observed.log_destination_manager.destinations = [destination]
+    observed.log_destination_manager.configured = True
+
+    observed.record_event("custom_event", detail="value")
+
+    assert len(destination.calls) == 1
+    payload, log_type, severity = destination.calls[0]
+    assert payload["event"] == "custom_event"
+    assert payload["detail"] == "value"
+    assert payload["service_name"] == "svc"
+    assert payload["severity"] == "INFO"
+    assert log_type == "event"
+    assert severity == "INFO"
+
+
+def test_log_severity_maps_status_codes_and_errors() -> None:
+    observed = runtime()
+
+    assert observed._severity_for_log_record({"status_code": 200}) == "INFO"
+    assert observed._severity_for_log_record({"status_code": 404}) == (
+        "WARNING"
+    )
+    assert observed._severity_for_log_record({"status_code": "500"}) == (
+        "ERROR"
+    )
+    assert (
+        observed._severity_for_log_record({"error": {"handled": False}})
+        == "ERROR"
+    )
+    assert observed._severity_for_log_record({"error": {"handled": True}}) == (
+        "WARNING"
+    )
+
+
+def test_destination_failure_logs_internal_error_without_throwing() -> None:
+    observed = runtime()
+    recording = RecordingLogDestination()
+    observed.log_destination_manager.destinations = [
+        FailingLogDestination(),
+        recording,
+    ]
+    observed.log_destination_manager.configured = True
+
+    with observed.operation("job"):
+        pass
+
+    assert any(
+        payload["event"] == "observability_internal_error"
+        and payload["operation"] == "logging.destination_emit"
+        for payload, _log_type, _severity in recording.calls
+    )
+    assert any(
+        payload.get("operation") == "job"
+        for payload, _log_type, _severity in recording.calls
+    )
+
+
+def test_all_destination_failures_fall_back_to_stderr(capsys) -> None:
+    observed = runtime()
+    observed.log_destination_manager.destinations = [FailingLogDestination()]
+    observed.log_destination_manager.configured = True
+
+    with observed.operation("job"):
+        pass
+
+    stderr = capsys.readouterr().err
+    assert "observability_internal_error" in stderr
+    assert "logging.destination_emit" in stderr
+
+
+def test_unknown_destination_falls_back_to_stdout() -> None:
+    observed = ObservabilityRuntime(
+        ObservabilityConfig(
+            service_name="svc",
+            otel_enabled=False,
+            log_destinations=("missing",),
+        )
+    )
+
+    observed.configure()
+
+    assert [
+        destination.name
+        for destination in observed.log_destination_manager.destinations
+    ] == ["stdout"]
+
+
+def test_google_destination_init_failure_falls_back_to_stdout(
+    monkeypatch,
+) -> None:
+    def fail_google_destination(**_kwargs):
+        raise ImportError("google-cloud-logging missing")
+
+    monkeypatch.setattr(
+        destination_manager_module,
+        "GoogleCloudLoggingDestination",
+        fail_google_destination,
+    )
+    observed = ObservabilityRuntime(
+        ObservabilityConfig(
+            service_name="svc",
+            otel_enabled=False,
+            log_destinations=("google_cloud_logging",),
+        )
+    )
+
+    observed.configure()
+
+    assert [
+        destination.name
+        for destination in observed.log_destination_manager.destinations
+    ] == ["stdout"]
+
+
+def test_disabled_configure_does_not_initialize_log_destinations(
+    monkeypatch,
+) -> None:
+    def fail_google_destination(**_kwargs):
+        raise AssertionError("google destination should not initialize")
+
+    monkeypatch.setattr(
+        destination_manager_module,
+        "GoogleCloudLoggingDestination",
+        fail_google_destination,
+    )
+    observed = ObservabilityRuntime(
+        ObservabilityConfig(
+            service_name="svc",
+            enabled=False,
+            log_destinations=("google_cloud_logging",),
+        )
+    )
+
+    observed.configure()
+
+    assert observed.log_destination_manager.destinations == []
+    assert observed.log_destination_manager.configured is False
 
 
 def test_record_segment_metric_covers_calculation_and_backend() -> None:

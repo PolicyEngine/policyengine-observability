@@ -84,6 +84,9 @@ class ObservabilityConfig:
     instrument_fastapi: bool = False
     instrument_httpx: bool = False
     metric_attribute_keys: tuple[str, ...] = DEFAULT_METRIC_ATTRIBUTE_KEYS
+    log_destinations: tuple[str, ...] = ("stdout",)
+    google_cloud_project: str | None = None
+    google_cloud_log_name: str = "policyengine-observability"
 
     @classmethod
     def from_env(
@@ -109,6 +112,7 @@ class ObservabilityConfig:
         env_extra_metric_keys = csv_from_env(
             "OBSERVABILITY_EXTRA_METRIC_ATTRIBUTE_KEYS"
         )
+        env_log_destinations = csv_from_env("OBSERVABILITY_LOG_DESTINATIONS")
         resolved_metric_keys = _dedupe(
             env_metric_keys
             or metric_attribute_keys
@@ -147,6 +151,18 @@ class ObservabilityConfig:
                 instrument_httpx,
             ),
             metric_attribute_keys=resolved_metric_keys,
+            log_destinations=_dedupe(env_log_destinations or ("stdout",)),
+            google_cloud_project=(
+                os.getenv("OBSERVABILITY_GOOGLE_CLOUD_PROJECT")
+                or os.getenv("GOOGLE_CLOUD_PROJECT")
+                or os.getenv("GCP_PROJECT")
+                or os.getenv("GCLOUD_PROJECT")
+                or None
+            ),
+            google_cloud_log_name=(
+                os.getenv("OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME")
+                or cls.google_cloud_log_name
+            ),
         )
 
 
