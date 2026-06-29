@@ -1,3 +1,10 @@
+## [1.1.0] - 2026-06-29
+
+### Added
+
+- Add optional Google Cloud Logging log destinations for structured observability records.
+
+
 ## [1.0.0] - 2026-06-23
 
 ### Breaking changes
