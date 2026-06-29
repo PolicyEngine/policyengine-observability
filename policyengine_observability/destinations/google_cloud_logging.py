@@ -1,9 +1,34 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
+
+from policyengine_observability.google_credentials import (
+    configure_google_application_credentials,
+    load_google_credentials,
+)
 
 from .base import normalize_payload
+
+
+class GoogleCloudLogger(Protocol):
+    def log_struct(
+        self,
+        payload: dict[str, Any],
+        **kwargs: Any,
+    ) -> None: ...
+
+
+class GoogleCloudLoggingClient(Protocol):
+    project: str | None
+
+    def logger(self, log_name: str) -> GoogleCloudLogger: ...
+
+
+GoogleCloudLoggingClientFactory = Callable[
+    [str | None, object | None],
+    GoogleCloudLoggingClient,
+]
 
 
 class GoogleCloudLoggingDestination:
@@ -14,17 +39,26 @@ class GoogleCloudLoggingDestination:
         *,
         project: str | None,
         log_name: str,
-        client_factory: Callable[[str | None], Any] | None = None,
+        client_factory: GoogleCloudLoggingClientFactory | None = None,
     ) -> None:
         self.project = project
         self.log_name = log_name
+        credentials = load_google_credentials(prefer_workload_identity=True)
+        if credentials is None:
+            configure_google_application_credentials()
         if client_factory is None:
             from google.cloud import logging as cloud_logging
 
-            def client_factory(project_id: str | None):
-                return cloud_logging.Client(project=project_id)
+            def client_factory(
+                project_id: str | None,
+                credentials: object | None,
+            ) -> GoogleCloudLoggingClient:
+                return cloud_logging.Client(
+                    project=project_id,
+                    credentials=credentials,
+                )
 
-        self.client = client_factory(project)
+        self.client = client_factory(project, credentials)
         self.project = project or getattr(self.client, "project", None)
         self.logger = self.client.logger(log_name)
 

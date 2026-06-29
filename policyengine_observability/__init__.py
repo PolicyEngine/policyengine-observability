@@ -4,6 +4,10 @@ from typing import Any
 
 from .config import ObservabilityConfig
 from .context import OperationObservabilityContext, RequestObservabilityContext
+from .google_credentials import (
+    configure_google_application_credentials,
+    load_google_credentials,
+)
 from .runtime import (
     OBSERVABILITY_INTERNAL_DISPATCH_HEADER,
     REQUEST_ID_HEADER,
@@ -148,6 +152,8 @@ __all__ = [
     "capture_context",
     "coerce_segment_name",
     "collect_timings",
+    "configure_google_application_credentials",
+    "load_google_credentials",
     "current_context",
     "current_operation",
     "end_scope",
