@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
 
 from policyengine_observability.google_credentials import (
     configure_google_application_credentials,
@@ -9,6 +9,26 @@ from policyengine_observability.google_credentials import (
 )
 
 from .base import normalize_payload
+
+
+class GoogleCloudLogger(Protocol):
+    def log_struct(
+        self,
+        payload: dict[str, Any],
+        **kwargs: Any,
+    ) -> None: ...
+
+
+class GoogleCloudLoggingClient(Protocol):
+    project: str | None
+
+    def logger(self, log_name: str) -> GoogleCloudLogger: ...
+
+
+GoogleCloudLoggingClientFactory = Callable[
+    [str | None, object | None],
+    GoogleCloudLoggingClient,
+]
 
 
 class GoogleCloudLoggingDestination:
@@ -19,7 +39,7 @@ class GoogleCloudLoggingDestination:
         *,
         project: str | None,
         log_name: str,
-        client_factory: Callable[[str | None, Any | None], Any] | None = None,
+        client_factory: GoogleCloudLoggingClientFactory | None = None,
     ) -> None:
         self.project = project
         self.log_name = log_name
@@ -30,8 +50,9 @@ class GoogleCloudLoggingDestination:
             from google.cloud import logging as cloud_logging
 
             def client_factory(
-                project_id: str | None, credentials: Any | None
-            ):
+                project_id: str | None,
+                credentials: object | None,
+            ) -> GoogleCloudLoggingClient:
                 return cloud_logging.Client(
                     project=project_id,
                     credentials=credentials,
