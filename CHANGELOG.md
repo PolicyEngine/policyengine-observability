@@ -1,3 +1,10 @@
+## [1.2.0] - 2026-06-29
+
+### Added
+
+- Add shared Google Cloud Logging credential bootstrap and consumer-configurable default log destinations.
+
+
 ## [1.1.0] - 2026-06-29
 
 ### Added
