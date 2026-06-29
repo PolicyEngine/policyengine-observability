@@ -15,9 +15,7 @@ SERVICE_ACCOUNT_EMAIL_ENV = "OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL"
 STS_TOKEN_URL_ENV = "OBSERVABILITY_GOOGLE_STS_TOKEN_URL"
 DEFAULT_STS_TOKEN_URL = "https://sts.googleapis.com/v1/token"
 JWT_SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
-GOOGLE_CREDENTIAL_SCOPES = (
-    "https://www.googleapis.com/auth/cloud-platform",
-)
+GOOGLE_CREDENTIAL_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
 
 
 def configure_google_application_credentials(

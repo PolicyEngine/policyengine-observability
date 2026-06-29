@@ -29,7 +29,9 @@ class GoogleCloudLoggingDestination:
         if client_factory is None:
             from google.cloud import logging as cloud_logging
 
-            def client_factory(project_id: str | None, credentials: Any | None):
+            def client_factory(
+                project_id: str | None, credentials: Any | None
+            ):
                 return cloud_logging.Client(
                     project=project_id,
                     credentials=credentials,

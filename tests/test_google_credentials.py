@@ -312,10 +312,9 @@ def test_google_destination_passes_loaded_credentials(monkeypatch) -> None:
     destination = google_cloud_logging.GoogleCloudLoggingDestination(
         project="central-project",
         log_name="policyengine-observability",
-        client_factory=lambda project, credentials: calls.append(
-            (project, credentials)
-        )
-        or FakeClient(),
+        client_factory=lambda project, credentials: (
+            calls.append((project, credentials)) or FakeClient()
+        ),
     )
 
     assert calls == [("central-project", "wif-credentials")]
