@@ -100,6 +100,7 @@ class ObservabilityConfig:
         instrument_httpx: bool = False,
         metric_attribute_keys: Sequence[str] | None = None,
         extra_metric_attribute_keys: Sequence[str] = (),
+        default_log_destinations: Sequence[str] = ("stdout",),
     ) -> ObservabilityConfig:
         level_name = os.getenv("OBSERVABILITY_LOG_LEVEL", "INFO").upper()
         log_level = getattr(logging, level_name, logging.INFO)
@@ -151,7 +152,9 @@ class ObservabilityConfig:
                 instrument_httpx,
             ),
             metric_attribute_keys=resolved_metric_keys,
-            log_destinations=_dedupe(env_log_destinations or ("stdout",)),
+            log_destinations=_dedupe(
+                env_log_destinations or default_log_destinations
+            ),
             google_cloud_project=(
                 os.getenv("OBSERVABILITY_GOOGLE_CLOUD_PROJECT")
                 or os.getenv("GOOGLE_CLOUD_PROJECT")

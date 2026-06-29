@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from policyengine_observability.destinations import (
     GoogleCloudLoggingDestination,
+    google_cloud_logging,
     normalize_payload,
 )
 
@@ -48,14 +49,24 @@ def test_normalize_payload_recursively_stringifies_unsafe_values() -> None:
     assert normalized["nested"]["object"].startswith("<object object at ")
 
 
-def test_google_destination_writes_structured_log_with_bounded_labels() -> (
-    None
-):
+def test_google_destination_writes_structured_log_with_bounded_labels(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "load_google_credentials",
+        lambda *, prefer_workload_identity: None,
+    )
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "configure_google_application_credentials",
+        lambda: None,
+    )
     client = FakeClient()
     destination = GoogleCloudLoggingDestination(
         project=None,
         log_name="policyengine-observability",
-        client_factory=lambda _project: client,
+        client_factory=lambda _project, _credentials: client,
     )
 
     destination.emit(

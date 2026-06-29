@@ -21,14 +21,25 @@ Structured logs write to stdout by default:
 OBSERVABILITY_LOG_DESTINATIONS=stdout
 ```
 
-Cloud Run captures stdout and stderr into Google Cloud Logging, so stdout is
-usually the right destination for Cloud Run services. Non-GCP runtimes such as
-Modal can write directly to Google Cloud Logging by installing the `google`
-extra and enabling the Google destination:
+Applications can override that default in code when constructing
+`ObservabilityConfig`:
+
+```python
+ObservabilityConfig.from_env(
+    service_name="policyengine-api",
+    default_log_destinations=("google_cloud_logging",),
+)
+```
+
+`OBSERVABILITY_LOG_DESTINATIONS` still has precedence over application
+defaults. Cloud Run captures stdout and stderr into Google Cloud Logging
+automatically, but applications that need one consistent destination across
+Cloud Run and non-GCP runtimes can write directly to Google Cloud Logging by
+installing the `google` extra and enabling the Google destination:
 
 ```bash
 OBSERVABILITY_LOG_DESTINATIONS=google_cloud_logging
-OBSERVABILITY_GOOGLE_CLOUD_PROJECT=policyengine-observability
+OBSERVABILITY_GOOGLE_CLOUD_PROJECT=policyengine-api
 OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME=policyengine-observability
 ```
 
@@ -36,6 +47,45 @@ Multiple destinations can be enabled with a comma-separated list, for example
 `OBSERVABILITY_LOG_DESTINATIONS=stdout,google_cloud_logging`. Google Cloud
 Logging uses Application Default Credentials and requires permission to create
 log entries, typically through `roles/logging.logWriter`.
+
+On runtimes that do not provide Application Default Credentials, set
+`GCP_CREDENTIALS_JSON` to a service account JSON document. The Google Cloud
+Logging destination will materialize it into a temporary credentials file and
+set `GOOGLE_APPLICATION_CREDENTIALS` before initializing the Google client. If
+the credential bootstrap fails, observability fails open and continues without
+raising into application code.
+
+Prefer OIDC-based Workload Identity Federation over long-lived service account
+keys when the runtime can provide an OIDC subject token. Modal injects
+generated identity tokens into Function containers through
+`MODAL_IDENTITY_TOKEN`; other runtimes can provide
+`OBSERVABILITY_GOOGLE_OIDC_TOKEN`. The runtime needs these values:
+
+```bash
+OBSERVABILITY_GOOGLE_OIDC_TOKEN=OIDC_TOKEN_FROM_RUNTIME
+OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER=projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID
+OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL=observability-writer@PROJECT_ID.iam.gserviceaccount.com
+OBSERVABILITY_GOOGLE_CLOUD_PROJECT=PROJECT_ID
+```
+
+When `MODAL_IDENTITY_TOKEN` or `OBSERVABILITY_GOOGLE_OIDC_TOKEN` is present
+alongside `OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER`, the Google Cloud
+Logging destination writes a temporary external-account credential
+configuration and passes those credentials directly to the Cloud Logging
+client. If `OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL` is present, the
+configuration uses service account impersonation. This keeps observability
+credentials separate from any application-level `GOOGLE_APPLICATION_CREDENTIALS`
+or `GCP_CREDENTIALS_JSON` used by the service for other Google clients.
+
+The Google Cloud setup needs:
+
+- A Workload Identity Pool and OIDC provider whose issuer matches Modal's OIDC
+  issuer, `https://oidc.modal.com`.
+- Attribute mapping for the Modal token claims you want to authorize, such as
+  `google.subject=assertion.sub`.
+- A service account with `roles/logging.logWriter` on the log project.
+- An IAM binding granting the workload identity principal
+  `roles/iam.workloadIdentityUser` on that service account.
 
 ## Release workflow
 

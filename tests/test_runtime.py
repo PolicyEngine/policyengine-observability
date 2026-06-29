@@ -1105,6 +1105,32 @@ def test_from_env_reads_log_destinations_and_google_config(
     assert config.google_cloud_log_name == "custom-log"
 
 
+def test_from_env_uses_default_log_destinations_without_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OBSERVABILITY_LOG_DESTINATIONS", raising=False)
+
+    config = ObservabilityConfig.from_env(
+        service_name="svc",
+        default_log_destinations=("google_cloud_logging",),
+    )
+
+    assert config.log_destinations == ("google_cloud_logging",)
+
+
+def test_from_env_log_destinations_env_overrides_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OBSERVABILITY_LOG_DESTINATIONS", "stdout")
+
+    config = ObservabilityConfig.from_env(
+        service_name="svc",
+        default_log_destinations=("google_cloud_logging",),
+    )
+
+    assert config.log_destinations == ("stdout",)
+
+
 def test_metric_attribute_keys_are_configurable() -> None:
     config = ObservabilityConfig(
         service_name="svc",
