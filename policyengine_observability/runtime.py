@@ -22,6 +22,7 @@ from .context import (
     RequestObservabilityContext,
     _metric_attrs,
 )
+from .destinations import LogDestinationManager
 from .logging import configure_plain_logger
 from .segments import coerce_segment_name
 
@@ -98,6 +99,18 @@ class ObservabilityRuntime:
         self.failover_events = _NoOpInstrument()
         self.active_requests = _NoOpInstrument()
         self._httpx_instrumented = False
+        self._emitting_internal_error = False
+        self.log_destination_manager = LogDestinationManager(
+            config=config,
+            loggers={
+                "request": REQUEST_LOGGER,
+                "operation": OPERATION_LOGGER,
+                "event": EVENT_LOGGER,
+                "internal": INTERNAL_LOGGER,
+            },
+            serializer=self._json,
+            on_failure=self._handle_destination_failure,
+        )
 
     @classmethod
     def disabled(cls) -> ObservabilityRuntime:
@@ -105,7 +118,10 @@ class ObservabilityRuntime:
 
     def configure(self) -> None:
         self._configure_loggers()
-        if not self.enabled or not self.config.otel_enabled:
+        if not self.enabled:
+            return
+        self.log_destination_manager.configure()
+        if not self.config.otel_enabled:
             return
         self._configure_otel()
         if self.config.instrument_httpx:
@@ -745,6 +761,9 @@ class ObservabilityRuntime:
             base: dict[str, Any] = {
                 "schema_version": "policyengine.observability.event.v1",
                 "event": event,
+                "service_name": self.config.service_name,
+                "service_role": self.config.service_role,
+                "environment": self.config.environment,
                 "created_at": datetime.now(UTC).isoformat(),
             }
             if context is not None:
@@ -780,7 +799,11 @@ class ObservabilityRuntime:
                 if value is not None
             }
             base.update(clean_fields)
-            EVENT_LOGGER.info(self._json(base))
+            self._emit_structured_log(
+                base,
+                log_type="event",
+                severity="INFO",
+            )
             self._add_span_event(event, clean_fields)
             if event.startswith("modal_") or "fallback" in event:
                 attrs = (
@@ -836,13 +859,14 @@ class ObservabilityRuntime:
             ):
                 return
             trace_id, span_id = self._trace_ids()
-            REQUEST_LOGGER.info(
-                self._json(
-                    context.as_log_record(
-                        trace_id=trace_id,
-                        span_id=span_id,
-                    )
-                )
+            payload = context.as_log_record(
+                trace_id=trace_id,
+                span_id=span_id,
+            )
+            self._emit_structured_log(
+                payload,
+                log_type="request",
+                severity=self._severity_for_log_record(payload),
             )
         except BaseException as exc:
             self.log_observability_failure(
@@ -862,13 +886,14 @@ class ObservabilityRuntime:
                 return
             operation.emitted = True
             trace_id, span_id = self._trace_ids()
-            OPERATION_LOGGER.info(
-                self._json(
-                    operation.as_log_record(
-                        trace_id=trace_id,
-                        span_id=span_id,
-                    )
-                )
+            payload = operation.as_log_record(
+                trace_id=trace_id,
+                span_id=span_id,
+            )
+            self._emit_structured_log(
+                payload,
+                log_type="operation",
+                severity=self._severity_for_log_record(payload),
             )
         except BaseException as exc:
             self.log_observability_failure(
@@ -1033,9 +1058,101 @@ class ObservabilityRuntime:
         exc: BaseException,
         **fields: Any,
     ) -> None:
+        payload = self._internal_error_payload(operation, exc, **fields)
+        if self._emitting_internal_error:
+            self._write_stderr(payload)
+            return
+        self._emitting_internal_error = True
+        try:
+            self._emit_structured_log(
+                payload,
+                log_type="internal",
+                severity="ERROR",
+            )
+        except BaseException:
+            self._write_stderr(payload)
+        finally:
+            self._emitting_internal_error = False
+
+    def _configure_loggers(self) -> None:
+        for logger in (
+            REQUEST_LOGGER,
+            OPERATION_LOGGER,
+            EVENT_LOGGER,
+            INTERNAL_LOGGER,
+        ):
+            configure_plain_logger(logger, self.config.log_level)
+
+    def _emit_structured_log(
+        self,
+        payload: dict[str, Any],
+        *,
+        log_type: str,
+        severity: str,
+    ) -> None:
+        try:
+            if not self.log_destination_manager.configured:
+                self._configure_loggers()
+            self.log_destination_manager.emit(
+                payload,
+                log_type=log_type,
+                severity=severity,
+            )
+        except BaseException as exc:
+            if self._emitting_internal_error:
+                self._write_stderr(payload)
+            else:
+                self.log_observability_failure(
+                    "logging.emit",
+                    exc,
+                    log_type=log_type,
+                )
+
+    def _handle_destination_failure(
+        self,
+        operation: str,
+        exc: BaseException,
+        **fields: Any,
+    ) -> None:
+        if self._emitting_internal_error:
+            self._write_stderr(
+                self._internal_error_payload(operation, exc, **fields)
+            )
+            return
+        self.log_observability_failure(operation, exc, **fields)
+
+    def _severity_for_log_record(self, payload: dict[str, Any]) -> str:
+        status_code = self._int_or_none(payload.get("status_code"))
+        error = payload.get("error")
+        handled = error.get("handled") if isinstance(error, dict) else None
+        if status_code is not None and status_code >= 500:
+            return "ERROR"
+        if error is not None and handled is False:
+            return "ERROR"
+        if error is not None or (
+            status_code is not None and status_code >= 400
+        ):
+            return "WARNING"
+        return "INFO"
+
+    def _int_or_none(self, value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _internal_error_payload(
+        self,
+        operation: str,
+        exc: BaseException,
+        **fields: Any,
+    ) -> dict[str, Any]:
         payload = {
             "schema_version": "policyengine.observability.internal_error.v1",
             "event": "observability_internal_error",
+            "service_name": self.config.service_name,
+            "service_role": self.config.service_role,
+            "environment": self.config.environment,
             "created_at": datetime.now(UTC).isoformat(),
             "operation": operation,
             "error": {
@@ -1047,19 +1164,7 @@ class ObservabilityRuntime:
         payload.update(
             {key: value for key, value in fields.items() if value is not None}
         )
-        try:
-            INTERNAL_LOGGER.error(self._json(payload))
-        except BaseException:
-            self._write_stderr(payload)
-
-    def _configure_loggers(self) -> None:
-        for logger in (
-            REQUEST_LOGGER,
-            OPERATION_LOGGER,
-            EVENT_LOGGER,
-            INTERNAL_LOGGER,
-        ):
-            configure_plain_logger(logger, self.config.log_level)
+        return payload
 
     def _configure_otel(self) -> None:
         try:
