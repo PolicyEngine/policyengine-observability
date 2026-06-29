@@ -51,9 +51,9 @@ log entries, typically through `roles/logging.logWriter`.
 On runtimes that do not provide Application Default Credentials, set
 `GCP_CREDENTIALS_JSON` to a service account JSON document. The Google Cloud
 Logging destination will materialize it into a temporary credentials file and
-set `GOOGLE_APPLICATION_CREDENTIALS` before initializing the Google client. If
-the credential bootstrap fails, observability fails open and continues without
-raising into application code.
+pass those credentials directly to the Google client. If the credential
+bootstrap fails, observability fails open and continues without raising into
+application code.
 
 Prefer OIDC-based Workload Identity Federation over long-lived service account
 keys when the runtime can provide an OIDC subject token. Modal injects

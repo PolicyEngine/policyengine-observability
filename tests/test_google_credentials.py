@@ -5,12 +5,28 @@ import os
 import stat
 import tempfile
 
+import pytest
+
 from policyengine_observability import google_credentials
 from policyengine_observability.destinations import google_cloud_logging
 from policyengine_observability.google_credentials import (
     configure_google_application_credentials,
     load_google_credentials,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_google_credential_env(monkeypatch) -> None:
+    for key in (
+        "GCP_CREDENTIALS_JSON",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "MODAL_IDENTITY_TOKEN",
+        "OBSERVABILITY_GOOGLE_OIDC_TOKEN",
+        "OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL",
+        "OBSERVABILITY_GOOGLE_STS_TOKEN_URL",
+        "OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_configure_google_application_credentials_preserves_existing_env(
