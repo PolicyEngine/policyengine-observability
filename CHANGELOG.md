@@ -1,3 +1,10 @@
+## [1.2.1] - 2026-07-01
+
+### Changed
+
+- Document the fixed Google Cloud Stage 3 observability destination, including Cloud Run routing, Modal WIF, and smoke-test queries.
+
+
 ## [1.2.0] - 2026-06-29
 
 ### Added
