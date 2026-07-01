@@ -20,6 +20,7 @@ from .context import (
     ErrorRecord,
     OperationObservabilityContext,
     RequestObservabilityContext,
+    SegmentTimingNode,
     _metric_attrs,
 )
 from .destinations import LogDestinationManager
@@ -57,6 +58,21 @@ _TIMINGS: ContextVar[dict[str, float] | None] = ContextVar(
 _TURN_START: ContextVar[float | None] = ContextVar(
     "policyengine_observability_turn_start",
     default=None,
+)
+_SEGMENT_STACK: ContextVar[tuple[tuple[int, SegmentTimingNode], ...]] = (
+    ContextVar(
+        "policyengine_observability_segment_stack",
+        default=(),
+    )
+)
+
+MAX_SEGMENT_ATTR_LENGTH = 200
+SENSITIVE_SEGMENT_ATTR_PARTS = (
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
 )
 
 
@@ -324,9 +340,18 @@ class ObservabilityRuntime:
         try:
             parent_operation = _OPERATION_CONTEXT.get()
             timings = context.timings_ms
+            timing_counts = context.timing_counts
+            segment_tree = context.segment_tree
+            segment_sequence = context.segment_sequence
             if context.internal_dispatch and parent_operation is not None:
                 timings = parent_operation.timings_ms
+                timing_counts = parent_operation.timing_counts
+                segment_tree = parent_operation.segment_tree
+                segment_sequence = parent_operation.segment_sequence
                 context.timings_ms = timings
+                context.timing_counts = timing_counts
+                context.segment_tree = segment_tree
+                context.segment_sequence = segment_sequence
             operation = OperationObservabilityContext(
                 config=context.config,
                 name=context.route,
@@ -338,6 +363,9 @@ class ObservabilityRuntime:
                     "path": context.path,
                 },
                 timings_ms=timings,
+                timing_counts=timing_counts,
+                segment_tree=segment_tree,
+                segment_sequence=segment_sequence,
                 emit_log=False,
                 record_metric=False,
             )
@@ -513,6 +541,10 @@ class ObservabilityRuntime:
             attrs,
         )
         start = self._safe_perf_counter(f"segment.{segment_name}.start")
+        segment_tree_handle = self._start_segment_tree_node(
+            segment_name,
+            attrs,
+        )
         span_attrs = self._segment_span_attributes(attrs)
         span_name = self._span_name(segment_name)
         error: BaseException | None = None
@@ -521,11 +553,22 @@ class ObservabilityRuntime:
                 yield span
             except BaseException as exc:
                 error = exc
-                self._record_segment_safely(segment_name, start, attrs)
+                self._record_segment_safely(
+                    segment_name,
+                    start,
+                    attrs,
+                    segment_tree_handle=segment_tree_handle,
+                )
                 raise
             else:
-                self._record_segment_safely(segment_name, start, attrs)
+                self._record_segment_safely(
+                    segment_name,
+                    start,
+                    attrs,
+                    segment_tree_handle=segment_tree_handle,
+                )
             finally:
+                self._reset_segment_tree_stack(segment_tree_handle)
                 self.end_operation(implicit_operation, error)
 
     @asynccontextmanager
@@ -539,6 +582,10 @@ class ObservabilityRuntime:
             attrs,
         )
         start = self._safe_perf_counter(f"segment.{segment_name}.start")
+        segment_tree_handle = self._start_segment_tree_node(
+            segment_name,
+            attrs,
+        )
         span_attrs = self._segment_span_attributes(attrs)
         span_name = self._span_name(segment_name)
         error: BaseException | None = None
@@ -547,11 +594,22 @@ class ObservabilityRuntime:
                 yield span
             except BaseException as exc:
                 error = exc
-                self._record_segment_safely(segment_name, start, attrs)
+                self._record_segment_safely(
+                    segment_name,
+                    start,
+                    attrs,
+                    segment_tree_handle=segment_tree_handle,
+                )
                 raise
             else:
-                self._record_segment_safely(segment_name, start, attrs)
+                self._record_segment_safely(
+                    segment_name,
+                    start,
+                    attrs,
+                    segment_tree_handle=segment_tree_handle,
+                )
             finally:
+                self._reset_segment_tree_stack(segment_tree_handle)
                 self.end_operation(implicit_operation, error)
 
     @contextmanager
@@ -1460,11 +1518,130 @@ class ObservabilityRuntime:
         except BaseException as exc:
             self.log_observability_failure("otel.span_exit", exc)
 
+    def _start_segment_tree_node(
+        self,
+        name: str,
+        attrs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            owner = self._segment_tree_owner()
+            if owner is None:
+                return None
+            owner.segment_sequence[0] += 1
+            node = SegmentTimingNode(
+                sequence=owner.segment_sequence[0],
+                name=name,
+                attrs=self._safe_segment_tree_attrs(attrs),
+            )
+            owner_id = id(owner.segment_tree)
+            stack = _SEGMENT_STACK.get()
+            if stack and stack[-1][0] == owner_id:
+                stack[-1][1].children.append(node)
+            else:
+                owner.segment_tree.append(node)
+            token = _SEGMENT_STACK.set((*stack, (owner_id, node)))
+            return {"node": node, "token": token}
+        except BaseException as exc:
+            self.log_observability_failure(
+                "segment.tree_start",
+                exc,
+                segment=name,
+            )
+            return None
+
+    def _finish_segment_tree_node(
+        self,
+        handle: dict[str, Any] | None,
+        duration_seconds: float,
+    ) -> None:
+        if not handle:
+            return
+        try:
+            node = handle.get("node")
+            if not isinstance(node, SegmentTimingNode):
+                return
+            node.duration_ms = duration_seconds * 1000
+        except BaseException as exc:
+            self.log_observability_failure(
+                "segment.tree_finish",
+                exc,
+            )
+
+    def _reset_segment_tree_stack(
+        self,
+        handle: dict[str, Any] | None,
+    ) -> None:
+        if not handle:
+            return
+        token = handle.get("token")
+        if token is None:
+            return
+        try:
+            _SEGMENT_STACK.reset(token)
+        except BaseException as exc:
+            self.log_observability_failure("segment.tree_reset", exc)
+
+    def _segment_tree_owner(
+        self,
+    ) -> RequestObservabilityContext | OperationObservabilityContext | None:
+        context = self.current_context()
+        if context is not None:
+            return context
+        return self.current_operation()
+
+    def _safe_segment_tree_attrs(
+        self,
+        attrs: dict[str, Any],
+    ) -> dict[str, Any]:
+        safe_attrs: dict[str, Any] = {}
+        for key, value in attrs.items():
+            key_text = self._safe_str(key)
+            key_lower = key_text.lower()
+            if any(part in key_lower for part in SENSITIVE_SEGMENT_ATTR_PARTS):
+                continue
+            if value is None:
+                continue
+            if hasattr(value, "value"):
+                value = value.value
+            if isinstance(value, bool | int | float):
+                safe_attrs[key_text] = value
+            elif isinstance(value, str):
+                safe_attrs[key_text] = value[:MAX_SEGMENT_ATTR_LENGTH]
+        return safe_attrs
+
+    def _record_segment_flat_timing(
+        self,
+        context: RequestObservabilityContext | None,
+        operation: OperationObservabilityContext | None,
+        name: str,
+        duration_ms: float,
+    ) -> None:
+        seen_timing_ids: set[int] = set()
+        seen_count_ids: set[int] = set()
+        for target in (context, operation):
+            if target is None:
+                continue
+            timings_id = id(target.timings_ms)
+            if timings_id not in seen_timing_ids:
+                target.timings_ms[name] = round(
+                    target.timings_ms.get(name, 0.0) + duration_ms,
+                    3,
+                )
+                seen_timing_ids.add(timings_id)
+            counts_id = id(target.timing_counts)
+            if counts_id not in seen_count_ids:
+                target.timing_counts[name] = (
+                    target.timing_counts.get(name, 0) + 1
+                )
+                seen_count_ids.add(counts_id)
+
     def _record_segment_safely(
         self,
         name: str,
         start: float | None,
         attrs: dict[str, Any],
+        *,
+        segment_tree_handle: dict[str, Any] | None = None,
     ) -> None:
         if start is None:
             return
@@ -1473,6 +1650,7 @@ class ObservabilityRuntime:
             return
         try:
             duration = end - start
+            self._finish_segment_tree_node(segment_tree_handle, duration)
             self._record_timing(name, duration)
             context = self.current_context()
             operation = self.current_operation()
@@ -1485,22 +1663,13 @@ class ObservabilityRuntime:
                 )
             }
             duration_ms = duration * 1000
-            if context is not None:
-                context.timings_ms[name] = round(
-                    context.timings_ms.get(name, 0.0) + duration_ms,
-                    3,
-                )
-                context.timing_counts[name] = (
-                    context.timing_counts.get(name, 0) + 1
-                )
+            self._record_segment_flat_timing(
+                context,
+                operation,
+                name,
+                duration_ms,
+            )
             if operation is not None:
-                operation.timings_ms[name] = round(
-                    operation.timings_ms.get(name, 0.0) + duration_ms,
-                    3,
-                )
-                operation.timing_counts[name] = (
-                    operation.timing_counts.get(name, 0) + 1
-                )
                 metric_attributes = operation.metric_attributes(
                     segment=name,
                     **metric_extra,

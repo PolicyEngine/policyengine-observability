@@ -48,6 +48,19 @@ Multiple destinations can be enabled with a comma-separated list, for example
 Logging uses Application Default Credentials and requires permission to create
 log entries, typically through `roles/logging.logWriter`.
 
+Request and operation logs include two timing views:
+
+- `timings_ms` and `timing_counts` are flat inclusive aggregates by segment
+  name, intended for quick scanning and compatibility with existing log
+  queries.
+- `segment_tree` is an ordered nested view of segment occurrences. Repeated
+  sibling segments are preserved as separate entries, and safe scalar segment
+  attributes are included so callers can distinguish settings such as
+  `simulation_kind=baseline` versus `simulation_kind=reform`.
+
+Core structured log fields take precedence over caller-provided attributes with
+the same keys.
+
 On runtimes that do not provide Application Default Credentials, set
 `GCP_CREDENTIALS_JSON` to a service account JSON document. The Google Cloud
 Logging destination will materialize it into a temporary credentials file and

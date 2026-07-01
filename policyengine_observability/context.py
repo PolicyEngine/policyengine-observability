@@ -25,6 +25,28 @@ class ErrorRecord:
 
 
 @dataclass
+class SegmentTimingNode:
+    sequence: int
+    name: str
+    attrs: dict[str, Any] = field(default_factory=dict)
+    duration_ms: float | None = None
+    children: list[SegmentTimingNode] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "sequence": self.sequence,
+            "name": self.name,
+        }
+        if self.attrs:
+            record["attrs"] = dict(self.attrs)
+        if self.duration_ms is not None:
+            record["duration_ms"] = round(self.duration_ms, 3)
+        if self.children:
+            record["children"] = [child.as_dict() for child in self.children]
+        return record
+
+
+@dataclass
 class OperationObservabilityContext:
     config: ObservabilityConfig
     name: str
@@ -32,6 +54,8 @@ class OperationObservabilityContext:
     attributes: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, float] = field(default_factory=dict)
     timing_counts: dict[str, int] = field(default_factory=dict)
+    segment_tree: list[SegmentTimingNode] = field(default_factory=list)
+    segment_sequence: list[int] = field(default_factory=lambda: [0])
     emit_log: bool = True
     record_metric: bool = True
     started_at: float = field(default_factory=time.perf_counter)
@@ -94,6 +118,7 @@ class OperationObservabilityContext:
     ) -> dict[str, Any]:
         event = "operation_failed" if self.error else "operation_completed"
         return {
+            **self.attributes,
             "schema_version": "policyengine.observability.operation.v1",
             "event": event,
             "service_name": self.config.service_name,
@@ -107,7 +132,7 @@ class OperationObservabilityContext:
             "duration_ms": round(self.duration_seconds() * 1000, 3),
             "timings_ms": dict(self.timings_ms),
             "timing_counts": dict(self.timing_counts),
-            **self.attributes,
+            "segment_tree": [node.as_dict() for node in self.segment_tree],
             "error": self.error.as_dict() if self.error else None,
         }
 
@@ -129,6 +154,8 @@ class RequestObservabilityContext:
     attributes: dict[str, Any] = field(default_factory=dict)
     timings_ms: dict[str, float] = field(default_factory=dict)
     timing_counts: dict[str, int] = field(default_factory=dict)
+    segment_tree: list[SegmentTimingNode] = field(default_factory=list)
+    segment_sequence: list[int] = field(default_factory=lambda: [0])
     status_code: int | None = None
     error: ErrorRecord | None = None
     emitted: bool = False
@@ -206,6 +233,8 @@ class RequestObservabilityContext:
         )
         status_code = self.status_code or (500 if self.error else None)
         return {
+            **self.inbound,
+            **self.attributes,
             "schema_version": "policyengine.observability.request.v1",
             "event": event,
             "service_name": self.config.service_name,
@@ -222,10 +251,9 @@ class RequestObservabilityContext:
             "endpoint": self.endpoint,
             "status_code": status_code,
             "duration_ms": round(self.duration_seconds() * 1000, 3),
-            **self.inbound,
             "timings_ms": dict(self.timings_ms),
             "timing_counts": dict(self.timing_counts),
-            **self.attributes,
+            "segment_tree": [node.as_dict() for node in self.segment_tree],
             "error": self.error.as_dict() if self.error else None,
         }
 
