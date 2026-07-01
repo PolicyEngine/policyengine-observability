@@ -28,6 +28,20 @@ gcloud services enable \
   --project=<observability-project-id>
 ```
 
+Direct app writes to `<observability-project-id>` are routed into the custom
+observability bucket with a project-level sink:
+
+```text
+sink: <observability-app-log-sink-name>
+destination: logging.googleapis.com/projects/<observability-project-id>/locations/<bucket-location>/buckets/<observability-log-bucket>
+filter: LOG_ID("<observability-log-name>")
+```
+
+This sink is needed when deployed services write directly to
+`projects/<observability-project-id>/logs/<observability-log-name>`. Without
+it, direct writes can remain in the destination project's `_Default` bucket
+instead of the analytics-enabled observability bucket.
+
 ## Cloud Run Logging
 
 Cloud Run has two log paths.
@@ -83,6 +97,19 @@ provider: projects/<observability-project-number>/locations/global/workloadIdent
 issuer: https://oidc.modal.com
 audience: oidc.modal.com
 ```
+
+Use a short, stable Modal claim for the Google subject mapping:
+
+```text
+google.subject=assertion.app_name
+attribute.app_name=assertion.app_name
+attribute.environment_name=assertion.environment_name
+attribute.function_name=assertion.function_name
+attribute.workspace_id=assertion.workspace_id
+```
+
+Do not map `google.subject` to a long assertion claim. Google rejects mapped
+subjects longer than 127 bytes, and Modal's `sub` claim can exceed that limit.
 
 The writer service account grants `roles/iam.workloadIdentityUser` to:
 
