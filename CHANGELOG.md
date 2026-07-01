@@ -1,3 +1,11 @@
+## [1.3.0] - 2026-07-01
+
+### Added
+
+- Add ordered nested segment trees to request and operation structured logs.
+  Core structured log fields now take precedence over caller-provided attributes.
+
+
 ## [1.2.1] - 2026-07-01
 
 ### Changed
