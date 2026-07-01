@@ -87,6 +87,9 @@ The Google Cloud setup needs:
 - An IAM binding granting the workload identity principal
   `roles/iam.workloadIdentityUser` on that service account.
 
+For the fixed PolicyEngine Google Cloud destination, see
+[`docs/operations/google-cloud-stage3-runbook.md`](docs/operations/google-cloud-stage3-runbook.md).
+
 ## Release workflow
 
 Changes should include a Towncrier fragment in `changelog.d/`. Pull requests
