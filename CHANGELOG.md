@@ -1,3 +1,10 @@
+## [1.3.1] - 2026-07-02
+
+### Fixed
+
+- Set coherent minimum versions across the OpenTelemetry dependency stack: `opentelemetry-api`, `-sdk`, `-exporter-otlp-proto-grpc`, and `-exporter-otlp-proto-http` to `>=1.43.0`, and `opentelemetry-instrumentation-fastapi` and `-httpx` to `>=0.64b0`. These forward-pin the whole stack to the coordinated OpenTelemetry release that fixes `AttributeError: '_IncludedRouter' object has no attribute 'path'` — which earlier `opentelemetry-instrumentation-fastapi` raised on FastAPI >= 0.137 `include_router` routing, turning every CORS preflight `OPTIONS` request into a 500 for consumers that enable FastAPI instrumentation.
+
+
 ## [1.3.0] - 2026-07-01
 
 ### Added
