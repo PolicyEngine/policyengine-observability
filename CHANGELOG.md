@@ -1,3 +1,10 @@
+## [1.3.2] - 2026-07-03
+
+### Fixed
+
+- Disable a log destination after repeated consecutive emit failures, restoring stdout if none remain — an observability sink can no longer degrade its host service's request path.
+
+
 ## [1.3.1] - 2026-07-02
 
 ### Fixed
