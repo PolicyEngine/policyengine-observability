@@ -80,7 +80,9 @@ class LogDestinationManager:
                 )
                 self._consecutive_failures.pop(id(destination), None)
             except BaseException as exc:
-                failures = self._consecutive_failures.get(id(destination), 0) + 1
+                failures = (
+                    self._consecutive_failures.get(id(destination), 0) + 1
+                )
                 self._consecutive_failures[id(destination)] = failures
                 if failures >= DESTINATION_FAILURE_LIMIT:
                     tripped.append(destination)
@@ -106,7 +108,9 @@ class LogDestinationManager:
 
     def _disable_destination(self, destination: LogDestination) -> None:
         self.destinations = [
-            existing for existing in self.destinations if existing is not destination
+            existing
+            for existing in self.destinations
+            if existing is not destination
         ]
         self._consecutive_failures.pop(id(destination), None)
         self.on_failure(
