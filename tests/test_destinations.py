@@ -100,3 +100,111 @@ def test_google_destination_writes_structured_log_with_bounded_labels(
     }
     assert "request_id" not in kwargs["labels"]
     assert "path" not in kwargs["labels"]
+
+
+# ── Destination circuit breaker ──────────────────────────────────────────
+
+
+class FlakyDestination:
+    name = "flaky"
+
+    def __init__(self, fail_first: int | None = None) -> None:
+        self.calls = 0
+        self.fail_first = fail_first
+
+    def emit(self, payload, *, log_type, severity) -> None:
+        self.calls += 1
+        if self.fail_first is None or self.calls <= self.fail_first:
+            raise RuntimeError("emit failed")
+
+
+class RecordingDestination:
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.payloads = []
+
+    def emit(self, payload, *, log_type, severity) -> None:
+        self.payloads.append(payload)
+
+
+def _manager(destinations):
+    import json
+    import logging
+
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations.manager import (
+        LogDestinationManager,
+    )
+
+    failures = []
+    manager = LogDestinationManager(
+        config=ObservabilityConfig(),
+        loggers={"event": logging.getLogger("test-destinations")},
+        serializer=json.dumps,
+        on_failure=lambda operation, exc, **fields: failures.append(
+            (operation, fields)
+        ),
+    )
+    manager.destinations = list(destinations)
+    manager.configured = True
+    return manager, failures
+
+
+def test_destination_disabled_after_consecutive_emit_failures() -> None:
+    from policyengine_observability.destinations.manager import (
+        DESTINATION_FAILURE_LIMIT,
+    )
+
+    flaky = FlakyDestination()
+    healthy = RecordingDestination()
+    manager, failures = _manager([flaky, healthy])
+
+    for _ in range(DESTINATION_FAILURE_LIMIT + 2):
+        manager.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert flaky.calls == DESTINATION_FAILURE_LIMIT
+    assert flaky not in manager.destinations
+    assert len(healthy.payloads) == DESTINATION_FAILURE_LIMIT + 2
+    assert any(op == "logging.destination_disabled" for op, _ in failures)
+
+
+def test_emit_success_resets_the_failure_counter() -> None:
+    from policyengine_observability.destinations.manager import (
+        DESTINATION_FAILURE_LIMIT,
+    )
+
+    flaky = FlakyDestination(fail_first=DESTINATION_FAILURE_LIMIT - 1)
+    manager, failures = _manager([flaky])
+
+    for _ in range(DESTINATION_FAILURE_LIMIT + 2):
+        manager.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert flaky in manager.destinations
+    counts = [
+        fields["consecutive_failures"]
+        for op, fields in failures
+        if op == "logging.destination_emit"
+    ]
+    assert max(counts) == DESTINATION_FAILURE_LIMIT - 1
+
+
+def test_sole_disabled_destination_falls_back_to_stdout() -> None:
+    from policyengine_observability.destinations.manager import (
+        DESTINATION_FAILURE_LIMIT,
+    )
+    from policyengine_observability.destinations.stdout import (
+        StdoutJsonDestination,
+    )
+
+    flaky = FlakyDestination()
+    manager, failures = _manager([flaky])
+
+    for _ in range(DESTINATION_FAILURE_LIMIT + 1):
+        manager.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert flaky not in manager.destinations
+    assert any(
+        isinstance(destination, StdoutJsonDestination)
+        for destination in manager.destinations
+    )
