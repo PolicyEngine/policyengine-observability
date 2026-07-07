@@ -12,23 +12,64 @@ class Unprintable:
         raise RuntimeError("cannot stringify")
 
 
+class FakeResource:
+    def _to_dict(self) -> dict:
+        return {"type": "global", "labels": {}}
+
+
 class FakeLogger:
+    def __init__(self) -> None:
+        self.full_name = "projects/resolved-project/logs/test-log"
+        self.default_resource = FakeResource()
+
+
+class FakeGapicApi:
     def __init__(self) -> None:
         self.calls = []
 
-    def log_struct(self, payload, **kwargs) -> None:
-        self.calls.append((payload, kwargs))
+    def write_log_entries(self, *, request, retry, timeout) -> None:
+        self.calls.append((request, retry, timeout))
+
+
+class FakeLoggingApi:
+    def __init__(self, *, gapic: bool) -> None:
+        self.calls = []
+        if gapic:
+            self._gapic_api = FakeGapicApi()
+
+    def write_entries(self, entries, *, partial_success) -> None:
+        self.calls.append((entries, partial_success))
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, *, gapic: bool = True) -> None:
         self.project = "resolved-project"
         self.fake_logger = FakeLogger()
         self.log_names = []
+        self.logging_api = FakeLoggingApi(gapic=gapic)
 
     def logger(self, log_name: str) -> FakeLogger:
         self.log_names.append(log_name)
         return self.fake_logger
+
+
+def _destination(monkeypatch, client, **kwargs):
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "load_google_credentials",
+        lambda *, prefer_workload_identity: None,
+    )
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "configure_google_application_credentials",
+        lambda: None,
+    )
+    return GoogleCloudLoggingDestination(
+        project=None,
+        log_name="policyengine-observability",
+        client_factory=lambda _project, _credentials: client,
+        **kwargs,
+    )
 
 
 def test_normalize_payload_recursively_stringifies_unsafe_values() -> None:
@@ -49,25 +90,9 @@ def test_normalize_payload_recursively_stringifies_unsafe_values() -> None:
     assert normalized["nested"]["object"].startswith("<object object at ")
 
 
-def test_google_destination_writes_structured_log_with_bounded_labels(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        google_cloud_logging,
-        "load_google_credentials",
-        lambda *, prefer_workload_identity: None,
-    )
-    monkeypatch.setattr(
-        google_cloud_logging,
-        "configure_google_application_credentials",
-        lambda: None,
-    )
+def test_google_destination_writes_bounded_gapic_entry(monkeypatch) -> None:
     client = FakeClient()
-    destination = GoogleCloudLoggingDestination(
-        project=None,
-        log_name="policyengine-observability",
-        client_factory=lambda _project, _credentials: client,
-    )
+    destination = _destination(monkeypatch, client)
 
     destination.emit(
         {
@@ -85,21 +110,97 @@ def test_google_destination_writes_structured_log_with_bounded_labels(
         severity="ERROR",
     )
 
-    payload, kwargs = client.fake_logger.calls[0]
     assert client.log_names == ["policyengine-observability"]
-    assert payload["object"].startswith("<object object at ")
-    assert kwargs["severity"] == "ERROR"
-    assert kwargs["trace"] == "projects/resolved-project/traces/abc123"
-    assert kwargs["span_id"] == "def456"
-    assert kwargs["labels"] == {
+    assert client.logging_api.calls == []
+    request, retry, timeout = client.logging_api._gapic_api.calls[0]
+    assert retry is None
+    assert timeout == 2.0
+    assert request.partial_success is True
+    (entry,) = request.entries
+    from google.logging.type.log_severity_pb2 import LogSeverity
+
+    assert entry.log_name == "projects/resolved-project/logs/test-log"
+    assert entry.resource.type == "global"
+    assert LogSeverity.Name(entry.severity) == "ERROR"
+    assert entry.trace == "projects/resolved-project/traces/abc123"
+    assert entry.span_id == "def456"
+    assert dict(entry.labels) == {
         "log_type": "request",
         "service_name": "svc",
         "service_role": "api",
         "environment": "production",
         "schema_version": "policyengine.observability.request.v1",
     }
-    assert "request_id" not in kwargs["labels"]
-    assert "path" not in kwargs["labels"]
+    payload = dict(entry.json_payload)
+    assert payload["path"] == "/calculate"
+    assert payload["object"].startswith("<object object at ")
+
+
+def test_google_destination_falls_back_to_unbounded_write_entries(
+    monkeypatch,
+) -> None:
+    client = FakeClient(gapic=False)
+    destination = _destination(monkeypatch, client)
+
+    destination.emit(
+        {"trace_id": None, "event": "x"},
+        log_type="event",
+        severity="info",
+    )
+
+    entries, partial_success = client.logging_api.calls[0]
+    assert partial_success is True
+    (entry,) = entries
+    assert entry["severity"] == "INFO"
+    assert entry["resource"] == {"type": "global", "labels": {}}
+    assert "trace" not in entry
+    assert "spanId" not in entry
+
+
+def test_google_destination_respects_configured_timeout(monkeypatch) -> None:
+    client = FakeClient()
+    destination = _destination(monkeypatch, client, timeout_seconds=0.5)
+
+    destination.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    _request, _retry, timeout = client.logging_api._gapic_api.calls[0]
+    assert timeout == 0.5
+
+
+def test_google_destination_emit_batch_writes_one_call(monkeypatch) -> None:
+    client = FakeClient()
+    destination = _destination(monkeypatch, client)
+
+    destination.emit_batch(
+        [
+            ({"event": "a"}, "event", "INFO"),
+            ({"event": "b"}, "request", "WARNING"),
+        ]
+    )
+    destination.emit_batch([])
+
+    assert len(client.logging_api._gapic_api.calls) == 1
+    request, _retry, _timeout = client.logging_api._gapic_api.calls[0]
+    from google.logging.type.log_severity_pb2 import LogSeverity
+
+    assert len(request.entries) == 2
+    assert LogSeverity.Name(request.entries[1].severity) == "WARNING"
+
+
+def test_google_destination_handles_plain_mapping_resource(
+    monkeypatch,
+) -> None:
+    client = FakeClient(gapic=False)
+    client.fake_logger.default_resource = {
+        "type": "gce_instance",
+        "labels": {},
+    }
+    destination = _destination(monkeypatch, client)
+
+    destination.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    (entry,), _ = client.logging_api.calls[0]
+    assert entry["resource"] == {"type": "gce_instance", "labels": {}}
 
 
 # ── Destination circuit breaker ──────────────────────────────────────────

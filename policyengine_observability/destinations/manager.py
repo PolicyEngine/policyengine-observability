@@ -132,6 +132,7 @@ class LogDestinationManager:
             return GoogleCloudLoggingDestination(
                 project=self.config.google_cloud_project,
                 log_name=self.config.google_cloud_log_name,
+                timeout_seconds=self.config.google_log_timeout_seconds,
             )
         raise ValueError(
             f"Unknown observability log destination: {destination_name}"
