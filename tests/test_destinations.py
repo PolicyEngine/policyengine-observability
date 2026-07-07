@@ -439,3 +439,256 @@ def test_manager_stdout_fallback_carries_configured_format() -> None:
 
     assert destination.output_format == "google"
     assert destination.google_cloud_project == "central-project"
+
+
+# ── Background emitter ───────────────────────────────────────────────────
+
+
+class BatchRecordingDestination:
+    name = "batch-recording"
+
+    def __init__(self) -> None:
+        self.batches = []
+        self.single_emits = []
+
+    def emit(self, payload, *, log_type, severity) -> None:
+        self.single_emits.append((payload, log_type, severity))
+
+    def emit_batch(self, records) -> None:
+        self.batches.append(list(records))
+
+
+class FailingDestination:
+    name = "failing"
+
+    def emit(self, payload, *, log_type, severity) -> None:
+        raise RuntimeError("sink down")
+
+
+def _background(wrapped, **kwargs):
+    from policyengine_observability.destinations.background import (
+        BackgroundEmitDestination,
+    )
+
+    failures = []
+    destination = BackgroundEmitDestination(
+        wrapped,
+        on_failure=lambda operation, exc, **fields: failures.append(
+            (operation, fields)
+        ),
+        **kwargs,
+    )
+    return destination, failures
+
+
+def _inline(destination, monkeypatch):
+    """Disable the worker thread so tests drive draining synchronously."""
+    monkeypatch.setattr(destination, "_ensure_worker", lambda: None)
+    return destination
+
+
+def test_background_emit_enqueues_without_writing(monkeypatch) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, _failures = _background(wrapped, batch_size=2)
+    _inline(destination, monkeypatch)
+
+    for index in range(3):
+        destination.emit({"event": index}, log_type="event", severity="INFO")
+
+    assert wrapped.batches == []
+    assert len(destination._buffer) == 3
+
+
+def test_background_drain_prefers_emit_batch(monkeypatch) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, _failures = _background(wrapped, batch_size=2)
+    _inline(destination, monkeypatch)
+
+    for index in range(3):
+        destination.emit({"event": index}, log_type="event", severity="INFO")
+    while destination._drain_once():
+        pass
+
+    assert [len(batch) for batch in wrapped.batches] == [2, 1]
+    assert wrapped.single_emits == []
+    assert wrapped.batches[0][0] == ({"event": 0}, "event", "INFO")
+
+
+def test_background_drain_falls_back_to_single_emits(monkeypatch) -> None:
+    wrapped = RecordingDestination()
+    destination, _failures = _background(wrapped, batch_size=2)
+    _inline(destination, monkeypatch)
+
+    destination.emit({"event": "a"}, log_type="event", severity="INFO")
+    while destination._drain_once():
+        pass
+
+    assert wrapped.payloads == [{"event": "a"}]
+
+
+def test_background_overflow_drops_newest_and_reports(monkeypatch) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, failures = _background(wrapped, queue_size=2)
+    _inline(destination, monkeypatch)
+
+    for index in range(4):
+        destination.emit({"event": index}, log_type="event", severity="INFO")
+
+    kept = [payload["event"] for payload, _, _ in destination._buffer]
+    assert kept == [0, 1]
+    overflow = [
+        fields
+        for operation, fields in failures
+        if operation == "logging.destination_queue_overflow"
+    ]
+    assert len(overflow) == 1
+    assert overflow[0]["dropped_total"] == 1
+    assert destination._dropped == 2
+
+
+def test_background_trips_after_consecutive_batch_failures(
+    monkeypatch,
+) -> None:
+    import pytest
+
+    destination, failures = _background(
+        FailingDestination(), batch_size=1, failure_limit=3
+    )
+    _inline(destination, monkeypatch)
+
+    for index in range(5):
+        destination.emit({"event": index}, log_type="event", severity="INFO")
+    drained = True
+    while drained:
+        drained = destination._drain_once()
+
+    counts = [
+        fields["consecutive_failures"]
+        for operation, fields in failures
+        if operation == "logging.destination_emit_async"
+    ]
+    assert counts == [1, 2, 3]
+    with pytest.raises(RuntimeError, match="tripped"):
+        destination.emit({"event": "x"}, log_type="event", severity="INFO")
+
+
+def test_background_trip_flows_through_manager_breaker(monkeypatch) -> None:
+    from policyengine_observability.destinations.manager import (
+        DESTINATION_FAILURE_LIMIT,
+    )
+    from policyengine_observability.destinations.stdout import (
+        StdoutJsonDestination,
+    )
+
+    destination, _failures = _background(
+        FailingDestination(), batch_size=1, failure_limit=1
+    )
+    _inline(destination, monkeypatch)
+    manager, manager_failures = _manager([destination])
+
+    manager.emit({"event": "seed"}, log_type="event", severity="INFO")
+    destination._drain_once()
+    for _ in range(DESTINATION_FAILURE_LIMIT):
+        manager.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert destination not in manager.destinations
+    assert any(
+        operation == "logging.destination_disabled"
+        for operation, _fields in manager_failures
+    )
+    assert any(
+        isinstance(existing, StdoutJsonDestination)
+        for existing in manager.destinations
+    )
+
+
+def test_background_flush_drains_everything(monkeypatch) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, failures = _background(wrapped, batch_size=2)
+    _inline(destination, monkeypatch)
+
+    for index in range(5):
+        destination.emit({"event": index}, log_type="event", severity="INFO")
+    destination.flush()
+
+    assert sum(len(batch) for batch in wrapped.batches) == 5
+    assert len(destination._buffer) == 0
+    assert failures == []
+
+
+def test_background_flush_reports_undelivered_remainder(
+    monkeypatch,
+) -> None:
+    destination, failures = _background(
+        FailingDestination(), batch_size=1, failure_limit=1
+    )
+    _inline(destination, monkeypatch)
+
+    for index in range(4):
+        destination.emit({"event": index}, log_type="event", severity="INFO")
+    destination.flush()
+
+    incomplete = [
+        fields
+        for operation, fields in failures
+        if operation == "logging.destination_flush_incomplete"
+    ]
+    assert len(incomplete) == 1
+    assert incomplete[0]["remaining"] == 3
+
+
+def test_background_restart_clears_trip_and_buffer(monkeypatch) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, _failures = _background(
+        FailingDestination(), batch_size=1, failure_limit=1
+    )
+    _inline(destination, monkeypatch)
+    destination.emit({"event": "x"}, log_type="event", severity="INFO")
+    destination._drain_once()
+    assert destination._tripped.is_set()
+
+    destination.restart()
+    destination.wrapped = wrapped
+    _inline(destination, monkeypatch)
+
+    assert not destination._tripped.is_set()
+    assert len(destination._buffer) == 0
+    destination.emit({"event": "y"}, log_type="event", severity="INFO")
+    destination._drain_once()
+    assert wrapped.batches == [[({"event": "y"}, "event", "INFO")]]
+
+
+def test_background_worker_delivers_end_to_end() -> None:
+    wrapped = BatchRecordingDestination()
+    destination, failures = _background(
+        wrapped, batch_size=10, batch_latency_seconds=0.01
+    )
+
+    for index in range(3):
+        destination.emit({"event": index}, log_type="event", severity="INFO")
+    destination.flush(1.0)
+    destination.close()
+
+    assert sum(len(batch) for batch in wrapped.batches) == 3
+    assert failures == []
+    assert destination._atexit_registered is True
+
+
+def test_background_worker_restarts_after_fork(monkeypatch) -> None:
+    import os as os_module
+
+    from policyengine_observability.destinations import background
+
+    wrapped = BatchRecordingDestination()
+    destination, _failures = _background(wrapped)
+    destination.emit({"event": "a"}, log_type="event", severity="INFO")
+    first_worker = destination._worker
+    assert first_worker is not None
+
+    real_pid = os_module.getpid()
+    monkeypatch.setattr(background.os, "getpid", lambda: real_pid + 1)
+    destination.emit({"event": "b"}, log_type="event", severity="INFO")
+
+    assert destination._worker is not first_worker
+    destination.flush(1.0)
+    destination.close()
