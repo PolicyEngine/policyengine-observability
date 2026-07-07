@@ -8,7 +8,7 @@ from policyengine_observability.google_credentials import (
     load_google_credentials,
 )
 
-from .base import normalize_payload
+from .base import bounded_labels, normalize_payload
 
 DEFAULT_WRITE_TIMEOUT_SECONDS = 2.0
 
@@ -109,7 +109,7 @@ class GoogleCloudLoggingDestination:
             "resource": _resource_dict(self.logger.default_resource),
             "jsonPayload": normalized,
             "severity": str(severity).upper(),
-            "labels": _labels(normalized, log_type=log_type),
+            "labels": bounded_labels(normalized, log_type=log_type),
         }
         trace_id = normalized.get("trace_id")
         if trace_id and self.project:
@@ -155,17 +155,3 @@ def _resource_dict(resource: Any) -> Any:
     if callable(to_dict):
         return to_dict()
     return resource
-
-
-def _labels(payload: dict[str, Any], *, log_type: str) -> dict[str, str]:
-    labels = {"log_type": log_type}
-    for key in (
-        "service_name",
-        "service_role",
-        "environment",
-        "schema_version",
-    ):
-        value = payload.get(key)
-        if value is not None:
-            labels[key] = str(value)
-    return labels

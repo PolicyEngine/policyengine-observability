@@ -35,3 +35,21 @@ def normalize_payload(value: Any) -> Any:
         return str(value)
     except BaseException:
         return f"<unprintable {type(value).__name__}>"
+
+
+def bounded_labels(
+    payload: dict[str, Any],
+    *,
+    log_type: str,
+) -> dict[str, str]:
+    labels = {"log_type": log_type}
+    for key in (
+        "service_name",
+        "service_role",
+        "environment",
+        "schema_version",
+    ):
+        value = payload.get(key)
+        if value is not None:
+            labels[key] = str(value)
+    return labels

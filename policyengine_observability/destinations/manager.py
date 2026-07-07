@@ -142,4 +142,6 @@ class LogDestinationManager:
         return StdoutJsonDestination(
             loggers=self.loggers,
             serializer=self.serializer,
+            output_format=self.config.stdout_format,
+            google_cloud_project=self.config.google_cloud_project,
         )

@@ -309,3 +309,133 @@ def test_sole_disabled_destination_falls_back_to_stdout() -> None:
         isinstance(destination, StdoutJsonDestination)
         for destination in manager.destinations
     )
+
+
+# ── Stdout output formats ────────────────────────────────────────────────
+
+
+class RecordingLogger:
+    def __init__(self) -> None:
+        self.lines = []
+
+    def info(self, message) -> None:
+        self.lines.append(("info", message))
+
+    def warning(self, message) -> None:
+        self.lines.append(("warning", message))
+
+    def error(self, message) -> None:
+        self.lines.append(("error", message))
+
+
+def _stdout_destination(**kwargs):
+    import json
+
+    from policyengine_observability.destinations.stdout import (
+        StdoutJsonDestination,
+    )
+
+    logger = RecordingLogger()
+    destination = StdoutJsonDestination(
+        loggers={"event": logger},
+        serializer=json.dumps,
+        **kwargs,
+    )
+    return destination, logger
+
+
+def test_stdout_google_format_maps_agent_keys() -> None:
+    import json
+
+    destination, logger = _stdout_destination(
+        output_format="google",
+        google_cloud_project="central-project",
+    )
+
+    destination.emit(
+        {
+            "created_at": "2026-07-07T00:00:00+00:00",
+            "trace_id": "abc123",
+            "span_id": "def456",
+            "service_name": "svc",
+            "path": "/calculate",
+        },
+        log_type="event",
+        severity="WARNING",
+    )
+
+    level, message = logger.lines[0]
+    line = json.loads(message)
+    assert level == "warning"
+    assert line["severity"] == "WARNING"
+    assert line["time"] == "2026-07-07T00:00:00+00:00"
+    assert (
+        line["logging.googleapis.com/trace"]
+        == "projects/central-project/traces/abc123"
+    )
+    assert line["logging.googleapis.com/spanId"] == "def456"
+    assert line["logging.googleapis.com/labels"] == {
+        "log_type": "event",
+        "service_name": "svc",
+    }
+    assert line["path"] == "/calculate"
+
+
+def test_stdout_google_format_omits_trace_without_project() -> None:
+    import json
+
+    destination, logger = _stdout_destination(output_format="google")
+
+    destination.emit(
+        {"trace_id": "abc123"},
+        log_type="event",
+        severity="ERROR",
+    )
+
+    _level, message = logger.lines[0]
+    line = json.loads(message)
+    assert "logging.googleapis.com/trace" not in line
+    assert "time" not in line
+    assert line["severity"] == "ERROR"
+
+
+def test_stdout_plain_format_adds_no_agent_keys() -> None:
+    import json
+
+    destination, logger = _stdout_destination()
+
+    destination.emit(
+        {"trace_id": "abc123", "severity": "INFO"},
+        log_type="event",
+        severity="INFO",
+    )
+
+    level, message = logger.lines[0]
+    line = json.loads(message)
+    assert level == "info"
+    assert line == {"trace_id": "abc123", "severity": "INFO"}
+
+
+def test_manager_stdout_fallback_carries_configured_format() -> None:
+    import json
+    import logging
+
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations.manager import (
+        LogDestinationManager,
+    )
+
+    manager = LogDestinationManager(
+        config=ObservabilityConfig(
+            stdout_format="google",
+            google_cloud_project="central-project",
+        ),
+        loggers={"event": logging.getLogger("test-stdout-format")},
+        serializer=json.dumps,
+        on_failure=lambda *args, **kwargs: None,
+    )
+
+    destination = manager._stdout_destination()
+
+    assert destination.output_format == "google"
+    assert destination.google_cloud_project == "central-project"
