@@ -1070,7 +1070,22 @@ class ObservabilityRuntime:
         except BaseException as exc:
             self.log_observability_failure("httpx.auto_instrument", exc)
 
+    def flush_log_destinations(
+        self, deadline_seconds: float | None = None
+    ) -> None:
+        try:
+            self.log_destination_manager.flush(deadline_seconds)
+        except BaseException as exc:
+            self.log_observability_failure("logging.flush", exc)
+
+    def restart_log_destinations(self) -> None:
+        try:
+            self.log_destination_manager.restart()
+        except BaseException as exc:
+            self.log_observability_failure("logging.restart", exc)
+
     def shutdown(self) -> None:
+        self.flush_log_destinations()
         providers = [
             ("trace", self.tracer_provider),
             ("metrics", self.meter_provider),

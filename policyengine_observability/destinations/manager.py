@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from ..config import ObservabilityConfig
+from .background import BackgroundEmitDestination
 from .base import LogDestination
 from .google_cloud_logging import GoogleCloudLoggingDestination
 from .stdout import StdoutJsonDestination
@@ -129,14 +130,59 @@ class LogDestinationManager:
         if normalized == "stdout":
             return self._stdout_destination()
         if normalized in {"google", "google_cloud", "google_cloud_logging"}:
-            return GoogleCloudLoggingDestination(
-                project=self.config.google_cloud_project,
-                log_name=self.config.google_cloud_log_name,
-                timeout_seconds=self.config.google_log_timeout_seconds,
+            return self._maybe_background(
+                GoogleCloudLoggingDestination(
+                    project=self.config.google_cloud_project,
+                    log_name=self.config.google_cloud_log_name,
+                    timeout_seconds=self.config.google_log_timeout_seconds,
+                )
             )
         raise ValueError(
             f"Unknown observability log destination: {destination_name}"
         )
+
+    def _maybe_background(self, destination: LogDestination) -> LogDestination:
+        # Stdout is the fallback sink and stays synchronous; it must keep
+        # working when everything else (including threads) is broken.
+        if self.config.log_emit_mode != "async":
+            return destination
+        return BackgroundEmitDestination(
+            destination,
+            on_failure=self.on_failure,
+            queue_size=self.config.log_queue_size,
+            batch_size=self.config.log_batch_size,
+            batch_latency_seconds=self.config.log_batch_latency_seconds,
+            flush_deadline_seconds=self.config.log_flush_deadline_seconds,
+            failure_limit=DESTINATION_FAILURE_LIMIT,
+        )
+
+    def flush(self, deadline_seconds: float | None = None) -> None:
+        for destination in list(self.destinations):
+            flush = getattr(destination, "flush", None)
+            if not callable(flush):
+                continue
+            try:
+                flush(deadline_seconds)
+            except BaseException as exc:
+                self.on_failure(
+                    "logging.destination_flush",
+                    exc,
+                    destination=getattr(destination, "name", None),
+                )
+
+    def restart(self) -> None:
+        for destination in list(self.destinations):
+            restart = getattr(destination, "restart", None)
+            if not callable(restart):
+                continue
+            try:
+                restart()
+            except BaseException as exc:
+                self.on_failure(
+                    "logging.destination_restart",
+                    exc,
+                    destination=getattr(destination, "name", None),
+                )
 
     def _stdout_destination(self) -> StdoutJsonDestination:
         return StdoutJsonDestination(

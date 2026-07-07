@@ -692,3 +692,212 @@ def test_background_worker_restarts_after_fork(monkeypatch) -> None:
     assert destination._worker is not first_worker
     destination.flush(1.0)
     destination.close()
+
+
+# ── Async wiring, lifecycle, and config knobs ────────────────────────────
+
+
+def _config_manager(config):
+    import json
+    import logging
+
+    from policyengine_observability.destinations.manager import (
+        LogDestinationManager,
+    )
+
+    return LogDestinationManager(
+        config=config,
+        loggers={"event": logging.getLogger("test-wiring")},
+        serializer=json.dumps,
+        on_failure=lambda *args, **kwargs: None,
+    )
+
+
+def test_async_mode_wraps_google_destination(monkeypatch) -> None:
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations import manager as manager_mod
+    from policyengine_observability.destinations.background import (
+        BackgroundEmitDestination,
+    )
+
+    class StubGoogle:
+        name = "google_cloud_logging"
+
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def emit(self, payload, *, log_type, severity) -> None:
+            pass
+
+    monkeypatch.setattr(
+        manager_mod, "GoogleCloudLoggingDestination", StubGoogle
+    )
+    manager = _config_manager(
+        ObservabilityConfig(log_emit_mode="async", log_queue_size=7)
+    )
+
+    destination = manager._build_destination("google_cloud_logging")
+
+    assert isinstance(destination, BackgroundEmitDestination)
+    assert isinstance(destination.wrapped, StubGoogle)
+    assert destination.queue_size == 7
+    assert destination.name == "google_cloud_logging"
+
+
+def test_sync_mode_returns_bare_destination(monkeypatch) -> None:
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations import manager as manager_mod
+
+    class StubGoogle:
+        name = "google_cloud_logging"
+
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def emit(self, payload, *, log_type, severity) -> None:
+            pass
+
+    monkeypatch.setattr(
+        manager_mod, "GoogleCloudLoggingDestination", StubGoogle
+    )
+    manager = _config_manager(ObservabilityConfig())
+
+    destination = manager._build_destination("google")
+
+    assert isinstance(destination, StubGoogle)
+
+
+def test_async_mode_never_wraps_stdout() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations.stdout import (
+        StdoutJsonDestination,
+    )
+
+    manager = _config_manager(ObservabilityConfig(log_emit_mode="async"))
+
+    destination = manager._build_destination("stdout")
+
+    assert isinstance(destination, StdoutJsonDestination)
+
+
+class FlushRecordingDestination:
+    name = "flush-recording"
+
+    def __init__(self) -> None:
+        self.flushes = []
+        self.restarts = 0
+
+    def emit(self, payload, *, log_type, severity) -> None:
+        pass
+
+    def flush(self, deadline_seconds=None) -> None:
+        self.flushes.append(deadline_seconds)
+
+    def restart(self) -> None:
+        self.restarts += 1
+
+
+def test_manager_flush_and_restart_reach_capable_destinations() -> None:
+    flushable = FlushRecordingDestination()
+    plain = RecordingDestination()
+    manager, failures = _manager([flushable, plain])
+
+    manager.flush(1.5)
+    manager.restart()
+
+    assert flushable.flushes == [1.5]
+    assert flushable.restarts == 1
+    assert failures == []
+
+
+def test_manager_flush_reports_but_survives_failures() -> None:
+    class ExplodingFlush(FlushRecordingDestination):
+        def flush(self, deadline_seconds=None) -> None:
+            raise RuntimeError("flush failed")
+
+    manager, failures = _manager([ExplodingFlush()])
+
+    manager.flush()
+
+    assert any(
+        operation == "logging.destination_flush"
+        for operation, _fields in failures
+    )
+
+
+def test_runtime_shutdown_flushes_log_destinations() -> None:
+    from policyengine_observability import (
+        ObservabilityConfig,
+        ObservabilityRuntime,
+    )
+
+    runtime = ObservabilityRuntime(
+        ObservabilityConfig(service_name="svc", otel_enabled=False)
+    )
+    flushable = FlushRecordingDestination()
+    runtime.log_destination_manager.destinations = [flushable]
+    runtime.log_destination_manager.configured = True
+
+    runtime.shutdown()
+
+    assert flushable.flushes == [None]
+
+
+def test_public_flush_and_restart_facades(monkeypatch) -> None:
+    import policyengine_observability as observability
+
+    calls = []
+
+    class StubRuntime:
+        def flush_log_destinations(self, deadline_seconds=None) -> None:
+            calls.append(("flush", deadline_seconds))
+
+        def restart_log_destinations(self) -> None:
+            calls.append(("restart", None))
+
+    monkeypatch.setattr(
+        observability, "observability_runtime", lambda: StubRuntime()
+    )
+
+    observability.flush_observability(2.0)
+    observability.restart_observability()
+
+    assert calls == [("flush", 2.0), ("restart", None)]
+    assert "flush_observability" in observability.__all__
+    assert "restart_observability" in observability.__all__
+
+
+def test_from_env_parses_emission_knobs(monkeypatch) -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    monkeypatch.setenv("OBSERVABILITY_LOG_EMIT_MODE", "Async")
+    monkeypatch.setenv("OBSERVABILITY_STDOUT_FORMAT", "Google")
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_SIZE", "50")
+    monkeypatch.setenv("OBSERVABILITY_LOG_BATCH_SIZE", "5")
+    monkeypatch.setenv("OBSERVABILITY_LOG_BATCH_LATENCY_SECONDS", "0.5")
+    monkeypatch.setenv("OBSERVABILITY_LOG_FLUSH_DEADLINE_SECONDS", "9")
+    monkeypatch.setenv("OBSERVABILITY_GOOGLE_LOG_TIMEOUT_SECONDS", "1.5")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.log_emit_mode == "async"
+    assert config.stdout_format == "google"
+    assert config.log_queue_size == 50
+    assert config.log_batch_size == 5
+    assert config.log_batch_latency_seconds == 0.5
+    assert config.log_flush_deadline_seconds == 9.0
+    assert config.google_log_timeout_seconds == 1.5
+
+
+def test_from_env_emission_knobs_default_and_reject_garbage(
+    monkeypatch,
+) -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    monkeypatch.delenv("OBSERVABILITY_LOG_EMIT_MODE", raising=False)
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_SIZE", "not-a-number")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.log_emit_mode == "sync"
+    assert config.log_queue_size == 1000

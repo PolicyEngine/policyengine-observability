@@ -45,6 +45,16 @@ def csv_from_env(name: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw_value.split(",") if part.strip())
 
 
+def int_from_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
 def float_from_env(name: str, default: float) -> float:
     raw_value = os.getenv(name)
     if raw_value is None:
@@ -89,6 +99,11 @@ class ObservabilityConfig:
     google_cloud_log_name: str = "policyengine-observability"
     google_log_timeout_seconds: float = 2.0
     stdout_format: str = "plain"
+    log_emit_mode: str = "sync"
+    log_queue_size: int = 1000
+    log_batch_size: int = 10
+    log_batch_latency_seconds: float = 0.25
+    log_flush_deadline_seconds: float = 5.0
 
     @classmethod
     def from_env(
@@ -177,6 +192,27 @@ class ObservabilityConfig:
             )
             .strip()
             .lower(),
+            log_emit_mode=(
+                os.getenv("OBSERVABILITY_LOG_EMIT_MODE") or cls.log_emit_mode
+            )
+            .strip()
+            .lower(),
+            log_queue_size=int_from_env(
+                "OBSERVABILITY_LOG_QUEUE_SIZE",
+                cls.log_queue_size,
+            ),
+            log_batch_size=int_from_env(
+                "OBSERVABILITY_LOG_BATCH_SIZE",
+                cls.log_batch_size,
+            ),
+            log_batch_latency_seconds=float_from_env(
+                "OBSERVABILITY_LOG_BATCH_LATENCY_SECONDS",
+                cls.log_batch_latency_seconds,
+            ),
+            log_flush_deadline_seconds=float_from_env(
+                "OBSERVABILITY_LOG_FLUSH_DEADLINE_SECONDS",
+                cls.log_flush_deadline_seconds,
+            ),
         )
 
 

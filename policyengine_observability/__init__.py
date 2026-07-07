@@ -105,6 +105,14 @@ def shutdown_observability() -> None:
     observability_runtime().shutdown()
 
 
+def flush_observability(deadline_seconds: float | None = None) -> None:
+    observability_runtime().flush_log_destinations(deadline_seconds)
+
+
+def restart_observability() -> None:
+    observability_runtime().restart_log_destinations()
+
+
 def shutdown_tracing() -> None:
     shutdown_observability()
 
@@ -171,6 +179,8 @@ __all__ = [
     "set_attribute",
     "set_observability_runtime",
     "shutdown_observability",
+    "flush_observability",
+    "restart_observability",
     "shutdown_tracing",
     "start_scope",
     "traceparent_header",
