@@ -187,3 +187,14 @@ OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL=<temporary-bridge-writer-service-acco
 
 Leave the central project and sink in place during rollback unless the sink
 itself is the source of the problem.
+
+
+## Kill-switches
+
+Both take effect on the next process start (or immediately via a Cloud Run
+`--update-env-vars` revision):
+
+- `OBSERVABILITY_LOG_DESTINATIONS=stdout` — turn off the direct Google Cloud
+  Logging path entirely; logs go to stdout only.
+- `OBSERVABILITY_LOG_EMIT_MODE=sync` — keep the Google path but revert from the
+  background emitter to bounded synchronous writes.

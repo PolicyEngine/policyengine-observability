@@ -103,6 +103,61 @@ The Google Cloud setup needs:
 For the fixed PolicyEngine Google Cloud destination, see
 [`docs/operations/google-cloud-stage3-runbook.md`](docs/operations/google-cloud-stage3-runbook.md).
 
+## Log emission and delivery semantics
+
+Writes to Google Cloud Logging carry an explicit per-call timeout with
+retries disabled so a degraded Logging API cannot stall the caller:
+
+```bash
+OBSERVABILITY_GOOGLE_LOG_TIMEOUT_SECONDS=2.0
+```
+
+By default, log emission is synchronous on the caller's thread. Setting
+the emit mode to `async` installs the standard accept/emit split: the
+logging call only appends the record to a bounded in-memory buffer and
+returns immediately, and a background worker thread drains the buffer in
+batches to the network destination:
+
+```bash
+OBSERVABILITY_LOG_EMIT_MODE=async
+OBSERVABILITY_LOG_QUEUE_SIZE=1000
+OBSERVABILITY_LOG_BATCH_SIZE=10
+OBSERVABILITY_LOG_BATCH_LATENCY_SECONDS=0.25
+OBSERVABILITY_LOG_FLUSH_DEADLINE_SECONDS=5.0
+```
+
+Async delivery is best-effort by design. When the buffer is full, the
+newest records are dropped and the drops are counted and reported through
+the internal-error channel. After three consecutive failed batches the
+destination is disabled for the remainder of the process and logging
+falls back to stdout, matching the synchronous circuit breaker. Buffered
+records are flushed at interpreter exit and by `runtime.shutdown()`;
+`flush_observability(deadline_seconds)` flushes on demand. A hard kill
+loses whatever was still buffered. Stdout destinations are never wrapped:
+the fallback sink stays synchronous and dependency-free.
+
+Processes that fork or restore from memory snapshots (for example Modal
+Functions with memory snapshots enabled) do not preserve threads. The
+worker is pid-aware and restarts automatically after a fork; runtimes
+that restore process memory should call `restart_observability()` in
+their post-restore hook to clear buffered state and revive the worker.
+
+On platforms whose logging agent collects stdout (Cloud Run, GKE), the
+agent-native stdout format emits JSON lines carrying the special keys the
+agent promotes to first-class LogEntry fields (severity, time, trace,
+span, labels), giving full-fidelity Cloud Logging ingestion with no
+in-process network emission:
+
+```bash
+OBSERVABILITY_LOG_DESTINATIONS=stdout
+OBSERVABILITY_STDOUT_FORMAT=google
+OBSERVABILITY_GOOGLE_CLOUD_PROJECT=PROJECT_ID
+```
+
+Because entries are written directly rather than through
+`Logger.log_struct`, the Google client library's one-time instrumentation
+diagnostic entry is not emitted.
+
 ## Release workflow
 
 Changes should include a Towncrier fragment in `changelog.d/`. Pull requests
