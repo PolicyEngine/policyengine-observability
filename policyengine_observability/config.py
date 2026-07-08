@@ -75,6 +75,69 @@ def default_environment() -> str:
     )
 
 
+# A log profile is a named preset expanding to generic routing primitives
+# (a destination-name tuple and a stdout-formatter name). Presets may name
+# strategies; the expansion mechanism knows nothing about any backend.
+LOG_PROFILE_PRESETS: dict[str, tuple[tuple[str, ...], str]] = {
+    # Platforms whose logging agent ingests stdout (Cloud Run, GKE):
+    # agent-native stdout only, fully synchronous, zero threads.
+    "gcp-agent": (("stdout",), "google"),
+    # Platforms with no ingesting agent (Modal): plain stdout as the
+    # durable record plus queued direct Cloud Logging writes.
+    "gcp-direct": (("stdout", "google_cloud_logging"), "plain"),
+    # Local development and the kill switch: plain stdout, zero threads.
+    "plain-sync": (("stdout",), "plain"),
+}
+
+
+def _detect_log_profile() -> str | None:
+    platform = (os.getenv("OBSERVABILITY_PLATFORM") or "").strip().lower()
+    if platform == "google_cloud_run":
+        return "gcp-agent"
+    if platform == "modal":
+        return "gcp-direct"
+    if os.getenv("K_SERVICE"):
+        return "gcp-agent"
+    if os.getenv("MODAL_ENVIRONMENT") or os.getenv("MODAL_TASK_ID"):
+        return "gcp-direct"
+    return None
+
+
+def _resolve_log_profile(
+    raw_profile: str,
+    *,
+    google_cloud_project: str | None,
+) -> tuple[str, tuple[tuple[str, ...], str] | None, list[str]]:
+    """Resolve a profile name to (name, preset-or-None, warnings).
+
+    ``auto`` without a recognized platform marker resolves to no preset,
+    so caller-supplied defaults keep applying.
+    """
+    warnings: list[str] = []
+    profile = raw_profile.strip().lower()
+    if profile == "auto":
+        detected = _detect_log_profile()
+        if detected is None:
+            return "auto", None, warnings
+        profile = detected
+    preset = LOG_PROFILE_PRESETS.get(profile)
+    if preset is None:
+        warnings.append(
+            f"Unknown OBSERVABILITY_LOG_PROFILE {raw_profile!r}; "
+            "using plain-sync."
+        )
+        profile = "plain-sync"
+        preset = LOG_PROFILE_PRESETS[profile]
+    if "google_cloud_logging" in preset[0] and not google_cloud_project:
+        warnings.append(
+            "Log profile gcp-direct requires a resolvable Google Cloud "
+            "project; using plain-sync."
+        )
+        profile = "plain-sync"
+        preset = LOG_PROFILE_PRESETS[profile]
+    return profile, preset, warnings
+
+
 @dataclass(frozen=True)
 class ObservabilityConfig:
     service_name: str = "policyengine-service"
@@ -101,6 +164,8 @@ class ObservabilityConfig:
     stdout_format: str = "plain"
     log_queue_maxsize: int = 1000
     log_queue_close_timeout_seconds: float = 2.0
+    log_profile: str = "auto"
+    config_warnings: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
@@ -134,6 +199,30 @@ class ObservabilityConfig:
             or DEFAULT_METRIC_ATTRIBUTE_KEYS,
             (*extra_metric_attribute_keys, *env_extra_metric_keys),
         )
+        google_cloud_project = (
+            os.getenv("OBSERVABILITY_GOOGLE_CLOUD_PROJECT")
+            or os.getenv("GOOGLE_CLOUD_PROJECT")
+            or os.getenv("GCP_PROJECT")
+            or os.getenv("GCLOUD_PROJECT")
+            or None
+        )
+        log_profile, preset, profile_warnings = _resolve_log_profile(
+            os.getenv("OBSERVABILITY_LOG_PROFILE") or cls.log_profile,
+            google_cloud_project=google_cloud_project,
+        )
+        profile_destinations, profile_stdout_format = preset or (None, None)
+        # Explicit granular env vars override the profile's expansion;
+        # the profile overrides caller-supplied defaults.
+        resolved_log_destinations = _dedupe(
+            env_log_destinations
+            or profile_destinations
+            or default_log_destinations
+        )
+        resolved_stdout_format = (
+            os.getenv("OBSERVABILITY_STDOUT_FORMAT")
+            or profile_stdout_format
+            or cls.stdout_format
+        )
         return cls(
             service_name=os.getenv("OBSERVABILITY_SERVICE_NAME")
             or os.getenv("OTEL_SERVICE_NAME")
@@ -166,16 +255,8 @@ class ObservabilityConfig:
                 instrument_httpx,
             ),
             metric_attribute_keys=resolved_metric_keys,
-            log_destinations=_dedupe(
-                env_log_destinations or default_log_destinations
-            ),
-            google_cloud_project=(
-                os.getenv("OBSERVABILITY_GOOGLE_CLOUD_PROJECT")
-                or os.getenv("GOOGLE_CLOUD_PROJECT")
-                or os.getenv("GCP_PROJECT")
-                or os.getenv("GCLOUD_PROJECT")
-                or None
-            ),
+            log_destinations=resolved_log_destinations,
+            google_cloud_project=google_cloud_project,
             google_cloud_log_name=(
                 os.getenv("OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME")
                 or cls.google_cloud_log_name
@@ -184,9 +265,7 @@ class ObservabilityConfig:
                 "OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS",
                 cls.google_cloud_write_timeout_seconds,
             ),
-            stdout_format=(
-                os.getenv("OBSERVABILITY_STDOUT_FORMAT") or cls.stdout_format
-            ),
+            stdout_format=resolved_stdout_format,
             log_queue_maxsize=int_from_env(
                 "OBSERVABILITY_LOG_QUEUE_MAXSIZE",
                 cls.log_queue_maxsize,
@@ -195,6 +274,8 @@ class ObservabilityConfig:
                 "OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS",
                 cls.log_queue_close_timeout_seconds,
             ),
+            log_profile=log_profile,
+            config_warnings=tuple(profile_warnings),
         )
 
 

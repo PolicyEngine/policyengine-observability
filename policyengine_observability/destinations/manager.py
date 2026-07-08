@@ -73,6 +73,8 @@ class LogDestinationManager:
                 exc,
                 destination=destination_name,
             )
+        for warning in getattr(self.config, "config_warnings", ()):
+            self.on_failure("logging.profile_config", ValueError(warning))
 
     def emit(
         self,
