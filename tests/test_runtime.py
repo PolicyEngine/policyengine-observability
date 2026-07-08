@@ -1455,6 +1455,106 @@ def test_shutdown_logs_provider_failures_and_timeout() -> None:
     assert "otel.shutdown_timeout" in failures
 
 
+def test_shutdown_closes_destinations_with_full_budget_and_no_thread(
+    monkeypatch,
+) -> None:
+    observed = runtime(shutdown_timeout_seconds=2.0)
+    close_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "close",
+        lambda deadline=None: close_calls.append(deadline),
+    )
+
+    def fail_thread(*args, **kwargs):
+        raise AssertionError(
+            "no watchdog thread should exist without providers"
+        )
+
+    monkeypatch.setattr(runtime_module.threading, "Thread", fail_thread)
+
+    observed.shutdown()
+
+    assert close_calls == [2.0]
+
+
+def test_shutdown_destination_deadline_fits_inside_provider_budget(
+    monkeypatch,
+) -> None:
+    """The prior design gave the log flush a deadline larger than the
+    join bounding it, starving provider shutdown; the deadline must be
+    derived from (and smaller than) the shutdown budget."""
+
+    class Provider:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    observed = runtime(shutdown_timeout_seconds=2.0)
+    provider = Provider()
+    observed.tracer_provider = provider
+    close_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "close",
+        lambda deadline=None: close_calls.append(deadline),
+    )
+
+    observed.shutdown()
+
+    assert close_calls == [1.0]
+    assert provider.shutdown_called
+
+
+def test_shutdown_slow_destination_close_still_runs_providers() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    observed = runtime(shutdown_timeout_seconds=0.2)
+    provider = Provider()
+    observed.tracer_provider = provider
+    observed.log_destination_manager.close = lambda deadline=None: time.sleep(
+        0.05
+    )
+
+    observed.shutdown()
+
+    assert provider.shutdown_called
+
+
+def test_shutdown_clamps_pathological_budget(monkeypatch) -> None:
+    observed = runtime(shutdown_timeout_seconds=float("inf"))
+    close_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "close",
+        lambda deadline=None: close_calls.append(deadline),
+    )
+
+    observed.shutdown()
+
+    assert close_calls == [3.0]
+
+
+def test_restart_log_destinations_rebuilds_from_config() -> None:
+    observed = runtime(otel_enabled=False)
+    observed.configure()
+    first = observed.log_destination_manager.destinations[0]
+
+    observed.restart_log_destinations()
+
+    rebuilt = observed.log_destination_manager.destinations
+    assert len(rebuilt) == 1
+    assert rebuilt[0] is not first
+    assert observed.log_destination_manager.configured is True
+
+
 def test_configure_otel_creates_real_providers_and_instruments() -> None:
     observed = runtime(otel_enabled=True)
 

@@ -84,9 +84,11 @@ def test_public_decorators_support_sync_and_async_functions() -> None:
     observability.instrument_httpx()
     observability.shutdown_tracing()
     observability.shutdown_observability()
+    observability.restart_observability()
 
     assert runtime.operation_duration.calls
     assert runtime.segment_duration.calls
+    assert runtime.log_destination_manager.configured is True
 
 
 def test_setting_public_runtime_clears_stale_context() -> None:

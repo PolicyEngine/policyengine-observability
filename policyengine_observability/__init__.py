@@ -109,6 +109,17 @@ def shutdown_tracing() -> None:
     shutdown_observability()
 
 
+def restart_observability() -> None:
+    """Close and rebuild log destinations from configuration.
+
+    For runtimes whose processes fork or restore from memory snapshots
+    (threads and network clients do not survive either). Call ONLY from
+    single-threaded lifecycle moments — a post-snapshot-restore hook, a
+    post-fork hook, before serving traffic.
+    """
+    observability_runtime().restart_log_destinations()
+
+
 def operation(name: str, *, flavor: str | None = None, **attrs: Any):
     return observability_runtime().operation(name, flavor=flavor, **attrs)
 
@@ -167,6 +178,7 @@ __all__ = [
     "operation",
     "record_error",
     "record_event",
+    "restart_observability",
     "segment",
     "set_attribute",
     "set_observability_runtime",
