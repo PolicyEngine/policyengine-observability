@@ -1174,6 +1174,14 @@ def test_from_env_reads_google_write_timeout(monkeypatch) -> None:
     assert config.google_cloud_write_timeout_seconds == 2.5
 
 
+def test_from_env_reads_stdout_format(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_STDOUT_FORMAT", "google")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.stdout_format == "google"
+
+
 def test_from_env_google_write_timeout_defaults(monkeypatch) -> None:
     monkeypatch.setenv("OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", "bad")
 

@@ -88,6 +88,7 @@ class ObservabilityConfig:
     google_cloud_project: str | None = None
     google_cloud_log_name: str = "policyengine-observability"
     google_cloud_write_timeout_seconds: float = 10.0
+    stdout_format: str = "plain"
 
     @classmethod
     def from_env(
@@ -170,6 +171,9 @@ class ObservabilityConfig:
             google_cloud_write_timeout_seconds=float_from_env(
                 "OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS",
                 cls.google_cloud_write_timeout_seconds,
+            ),
+            stdout_format=(
+                os.getenv("OBSERVABILITY_STDOUT_FORMAT") or cls.stdout_format
             ),
         )
 

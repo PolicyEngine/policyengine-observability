@@ -7,7 +7,7 @@ from typing import Any
 from ..config import ObservabilityConfig
 from .base import LogDestination
 from .google_cloud_logging import GoogleCloudLoggingDestination
-from .stdout import StdoutJsonDestination
+from .stdout import StdoutJsonDestination, resolve_stdout_formatter
 
 # A destination that fails this many consecutive emits is disabled for the
 # rest of the process. Emission is synchronous on the caller's (request) path,
@@ -141,4 +141,5 @@ class LogDestinationManager:
         return StdoutJsonDestination(
             loggers=self.loggers,
             serializer=self.serializer,
+            formatter=resolve_stdout_formatter(self.config),
         )

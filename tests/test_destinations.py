@@ -215,6 +215,166 @@ def test_google_destination_forwards_enqueue_timestamp(monkeypatch) -> None:
     assert "timestamp" not in plain_kwargs
 
 
+# ── Stdout formatters ────────────────────────────────────────────────────
+
+
+class RecordingLogger:
+    def __init__(self) -> None:
+        self.lines = []
+
+    def info(self, message) -> None:
+        self.lines.append(("INFO", message))
+
+    def warning(self, message) -> None:
+        self.lines.append(("WARNING", message))
+
+    def error(self, message) -> None:
+        self.lines.append(("ERROR", message))
+
+
+def _stdout_destination(config=None, formatter=None):
+    import json
+
+    from policyengine_observability.destinations.stdout import (
+        StdoutJsonDestination,
+        resolve_stdout_formatter,
+    )
+
+    logger = RecordingLogger()
+    if formatter is None and config is not None:
+        formatter = resolve_stdout_formatter(config)
+    destination = StdoutJsonDestination(
+        loggers={"event": logger},
+        serializer=json.dumps,
+        formatter=formatter,
+    )
+    return destination, logger
+
+
+def _emitted_line(logger):
+    import json
+
+    ((_, message),) = logger.lines
+    return json.loads(message)
+
+
+def test_stdout_google_formatter_maps_agent_native_keys() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    config = ObservabilityConfig(
+        stdout_format="google", google_cloud_project="proj"
+    )
+    destination, logger = _stdout_destination(config)
+
+    destination.emit(
+        {
+            "schema_version": "policyengine.observability.event.v1",
+            "service_name": "svc",
+            "event": "x",
+            "trace_id": "abc123",
+            "span_id": 456,
+        },
+        log_type="event",
+        severity="error",
+    )
+
+    line = _emitted_line(logger)
+    assert line["severity"] == "ERROR"
+    assert line["logging.googleapis.com/trace"] == (
+        "projects/proj/traces/abc123"
+    )
+    assert line["logging.googleapis.com/spanId"] == "456"
+    assert line["logging.googleapis.com/labels"] == {
+        "log_type": "event",
+        "service_name": "svc",
+        "schema_version": "policyengine.observability.event.v1",
+    }
+    assert "time" not in line
+    assert line["event"] == "x"
+
+
+def test_stdout_google_formatter_omits_trace_without_project() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    config = ObservabilityConfig(stdout_format="google")
+    destination, logger = _stdout_destination(config)
+
+    destination.emit(
+        {"event": "x", "trace_id": "abc"}, log_type="event", severity="INFO"
+    )
+
+    line = _emitted_line(logger)
+    assert "logging.googleapis.com/trace" not in line
+
+
+def test_stdout_unknown_format_falls_back_to_plain() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    config = ObservabilityConfig(stdout_format=" GoOgLeX ")
+    destination, logger = _stdout_destination(config)
+
+    destination.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert _emitted_line(logger) == {"event": "x"}
+
+
+def test_stdout_format_name_is_normalized() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    config = ObservabilityConfig(stdout_format=" GOOGLE ")
+    destination, logger = _stdout_destination(config)
+
+    destination.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert _emitted_line(logger)["severity"] == "INFO"
+
+
+def test_stdout_broken_formatter_degrades_to_unformatted() -> None:
+    def broken(payload, *, log_type, severity):
+        raise RuntimeError("formatter bug")
+
+    destination, logger = _stdout_destination(formatter=broken)
+
+    destination.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert _emitted_line(logger) == {"event": "x"}
+
+
+def test_stdout_google_formatter_never_mutates_caller_payload() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    config = ObservabilityConfig(
+        stdout_format="google", google_cloud_project="proj"
+    )
+    destination, logger = _stdout_destination(config)
+    payload = {"event": "x", "trace_id": "abc"}
+
+    destination.emit(payload, log_type="event", severity="INFO")
+
+    assert payload == {"event": "x", "trace_id": "abc"}
+
+
+def test_custom_stdout_formatter_registers_and_resolves() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations.stdout import (
+        _FORMATTER_FACTORIES,
+        register_stdout_formatter,
+    )
+
+    def factory(config):
+        return lambda payload, *, log_type, severity: {"wrapped": payload}
+
+    register_stdout_formatter("custom-test", factory)
+    try:
+        config = ObservabilityConfig(stdout_format="custom-test")
+        destination, logger = _stdout_destination(config)
+        destination.emit({"event": "x"}, log_type="event", severity="INFO")
+    finally:
+        _FORMATTER_FACTORIES.pop("custom-test", None)
+
+    assert _emitted_line(logger) == {"wrapped": {"event": "x"}}
+
+
 # ── Destination circuit breaker ──────────────────────────────────────────
 
 

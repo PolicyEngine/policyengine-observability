@@ -11,10 +11,17 @@ from policyengine_observability.google_credentials import (
 )
 
 from .base import clamped, normalize_payload
+from .stdout import StdoutFormatter, register_stdout_formatter
 
 DEFAULT_WRITE_TIMEOUT_SECONDS = 10.0
 MIN_WRITE_TIMEOUT_SECONDS = 0.5
 MAX_WRITE_TIMEOUT_SECONDS = 60.0
+
+# Structured-JSON keys the Cloud Run/GKE logging agent promotes to
+# first-class LogEntry fields when it ingests a stdout line.
+GOOGLE_TRACE_KEY = "logging.googleapis.com/trace"
+GOOGLE_SPAN_ID_KEY = "logging.googleapis.com/spanId"
+GOOGLE_LABELS_KEY = "logging.googleapis.com/labels"
 
 
 class GoogleCloudLogger(Protocol):
@@ -153,3 +160,30 @@ def _labels(payload: dict[str, Any], *, log_type: str) -> dict[str, str]:
         if value is not None:
             labels[key] = str(value)
     return labels
+
+
+def _google_stdout_formatter_factory(config: Any) -> StdoutFormatter:
+    """Shape stdout lines with the agent-native Cloud Logging keys.
+
+    Emission stays synchronous, so no ``time`` key is set — the agent's
+    receive time is the event time.
+    """
+    project = getattr(config, "google_cloud_project", None)
+
+    def format_google(
+        payload: dict[str, Any], *, log_type: str, severity: str
+    ) -> dict[str, Any]:
+        payload["severity"] = str(severity).upper()
+        payload[GOOGLE_LABELS_KEY] = _labels(payload, log_type=log_type)
+        trace_id = payload.get("trace_id")
+        if trace_id and project:
+            payload[GOOGLE_TRACE_KEY] = f"projects/{project}/traces/{trace_id}"
+        span_id = payload.get("span_id")
+        if span_id:
+            payload[GOOGLE_SPAN_ID_KEY] = str(span_id)
+        return payload
+
+    return format_google
+
+
+register_stdout_formatter("google", _google_stdout_formatter_factory)
