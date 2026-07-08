@@ -15,38 +15,91 @@ configured, spans and metrics stay in-process while logs still receive trace
 context. Set `OTEL_ENABLED=false` to opt out. Configure
 `OTEL_EXPORTER_OTLP_ENDPOINT` to export traces and metrics.
 
-Structured logs write to stdout by default:
+## Log routing profiles
+
+Log routing is owned by this package: consumers set one env var and the
+package expands it into destinations, formats, and transport.
 
 ```bash
-OBSERVABILITY_LOG_DESTINATIONS=stdout
+OBSERVABILITY_LOG_PROFILE=gcp-agent   # or gcp-direct | plain-sync | auto
 ```
 
-Applications can override that default in code when constructing
-`ObservabilityConfig`:
+- `gcp-agent` — google-format stdout only, for platforms whose logging
+  agent ingests stdout (Cloud Run, GKE). Fully synchronous, zero
+  threads; the agent ships lines to Cloud Logging with severity, trace,
+  span, and labels promoted to first-class LogEntry fields.
+- `gcp-direct` — plain stdout (the durable record) plus queued direct
+  Cloud Logging writes, for platforms with no ingesting agent (Modal).
+  Requires a resolvable Google Cloud project; downgrades to `plain-sync`
+  with a warning otherwise.
+- `plain-sync` — plain stdout only, guaranteed zero threads. Local
+  development and the kill switch: setting it disables all background
+  log machinery.
+- `auto` (default) — detects the platform via `OBSERVABILITY_PLATFORM`
+  (`google_cloud_run`/`modal`), then `K_SERVICE`, then Modal env
+  markers; when nothing matches, caller-supplied defaults apply.
 
-```python
-ObservabilityConfig.from_env(
-    service_name="policyengine-api",
-    default_log_destinations=("google_cloud_logging",),
-)
-```
-
-`OBSERVABILITY_LOG_DESTINATIONS` still has precedence over application
-defaults. Cloud Run captures stdout and stderr into Google Cloud Logging
-automatically, but applications that need one consistent destination across
-Cloud Run and non-GCP runtimes can write directly to Google Cloud Logging by
-installing the `google` extra and enabling the Google destination:
+The granular controls still exist underneath and override the profile's
+expansion when set explicitly:
 
 ```bash
-OBSERVABILITY_LOG_DESTINATIONS=google_cloud_logging
+OBSERVABILITY_LOG_DESTINATIONS=stdout,google_cloud_logging
+OBSERVABILITY_STDOUT_FORMAT=google
 OBSERVABILITY_GOOGLE_CLOUD_PROJECT=policyengine-api
 OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME=policyengine-observability
 ```
 
-Multiple destinations can be enabled with a comma-separated list, for example
-`OBSERVABILITY_LOG_DESTINATIONS=stdout,google_cloud_logging`. Google Cloud
-Logging uses Application Default Credentials and requires permission to create
-log entries, typically through `roles/logging.logWriter`.
+Destinations are named strategies: `stdout` is `inline` (synchronous on
+the caller's thread), and every `remote` strategy — `google_cloud_logging`
+today; future backends register the same way — is automatically wrapped
+in the queued transport below. Google Cloud Logging uses Application
+Default Credentials and requires permission to create log entries,
+typically through `roles/logging.logWriter`.
+
+## Log emission and delivery semantics
+
+Remote destinations never write on a request thread. The log call only
+snapshots the payload, stamps the enqueue time, and appends to a bounded
+in-memory queue (microseconds, never blocks, never raises); a stdlib
+`QueueListener` thread drains the queue and performs the writes, sending
+the enqueue time as the entry timestamp so delayed writes keep their
+event time.
+
+Delivery through the queue is best-effort by design — stdout is the
+durable sibling record. When the queue is full the newest record is
+dropped, and drops are counted and reported through the internal-error
+channel (first drop, then every 100th). Write failures are likewise
+reported and the record dropped; there is deliberately no breaker or
+retry queue in the transport. Each Google write carries an explicit
+budget that caps the call and its transient-error retries:
+
+```bash
+OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS=10.0
+OBSERVABILITY_LOG_QUEUE_MAXSIZE=1000
+OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS=2.0
+```
+
+(The bounded write rebinds the client's private gapic method at
+construction; when that handle is unavailable — HTTP transports,
+injected fakes — the library's ~60s default applies, which is harmless
+off the request path. All numeric knobs are clamped, so `0`, negative,
+or non-finite values can never disable or unbound a mechanism. Because
+entries are written directly per record, the Google client library's
+one-time instrumentation diagnostic entry is not emitted.)
+
+Shutdown closes log destinations inside the same bounded budget that
+flushes OpenTelemetry (`OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS`); a
+queue that cannot drain before its deadline is abandoned with a report.
+A hard kill loses whatever was still queued. Note the google stdout
+format sets no `time` key: stdout emission is synchronous, so the
+agent's receive time is the correct event time.
+
+Processes that fork or restore from memory snapshots do not preserve
+threads or network clients. Call `restart_observability()` from the
+post-restore or post-fork hook (for example gunicorn `post_fork` when
+using `--preload`, or a Modal post-snapshot hook) — it closes and
+rebuilds destinations from configuration, and must only be called from
+single-threaded lifecycle moments, before serving traffic.
 
 Request and operation logs include two timing views:
 
