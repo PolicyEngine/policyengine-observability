@@ -87,6 +87,7 @@ class ObservabilityConfig:
     log_destinations: tuple[str, ...] = ("stdout",)
     google_cloud_project: str | None = None
     google_cloud_log_name: str = "policyengine-observability"
+    google_cloud_write_timeout_seconds: float = 10.0
 
     @classmethod
     def from_env(
@@ -165,6 +166,10 @@ class ObservabilityConfig:
             google_cloud_log_name=(
                 os.getenv("OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME")
                 or cls.google_cloud_log_name
+            ),
+            google_cloud_write_timeout_seconds=float_from_env(
+                "OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS",
+                cls.google_cloud_write_timeout_seconds,
             ),
         )
 

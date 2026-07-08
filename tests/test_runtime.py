@@ -1166,6 +1166,22 @@ def test_from_env_invalid_shutdown_timeout_falls_back(monkeypatch) -> None:
     assert config.shutdown_timeout_seconds == 3.0
 
 
+def test_from_env_reads_google_write_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", "2.5")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.google_cloud_write_timeout_seconds == 2.5
+
+
+def test_from_env_google_write_timeout_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", "bad")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.google_cloud_write_timeout_seconds == 10.0
+
+
 def test_from_env_enables_otel_by_default() -> None:
     config = ObservabilityConfig.from_env(service_name="svc")
 

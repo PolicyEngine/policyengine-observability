@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
@@ -15,6 +16,21 @@ class LogDestination(Protocol):
         severity: str,
     ) -> None:
         """Write one structured observability payload."""
+
+
+def clamped(value: Any, *, low: float, high: float, default: float) -> float:
+    """Coerce a config knob to a finite float within [low, high].
+
+    Anything unparseable or non-finite falls back to the default, so a
+    stray env value can never disable or unbound the mechanism it tunes.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(number):
+        return default
+    return min(max(number, low), high)
 
 
 def normalize_payload(value: Any) -> Any:

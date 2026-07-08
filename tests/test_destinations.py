@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import math
+
+import pytest
+
 from policyengine_observability.destinations import (
     GoogleCloudLoggingDestination,
     google_cloud_logging,
     normalize_payload,
 )
+from policyengine_observability.destinations.base import clamped
 
 
 class Unprintable:
@@ -20,15 +25,70 @@ class FakeLogger:
         self.calls.append((payload, kwargs))
 
 
-class FakeClient:
+class FakeGapicApi:
     def __init__(self) -> None:
+        self.calls = []
+
+    def write_log_entries(self, *args, **kwargs) -> None:
+        self.calls.append((args, kwargs))
+
+
+class FakeLoggingApi:
+    def __init__(self) -> None:
+        self._gapic_api = FakeGapicApi()
+
+
+class FakeClient:
+    def __init__(self, *, gapic: bool = False) -> None:
         self.project = "resolved-project"
         self.fake_logger = FakeLogger()
         self.log_names = []
+        if gapic:
+            self.logging_api = FakeLoggingApi()
 
     def logger(self, log_name: str) -> FakeLogger:
         self.log_names.append(log_name)
         return self.fake_logger
+
+
+def _google_destination(monkeypatch, client, **kwargs):
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "load_google_credentials",
+        lambda *, prefer_workload_identity: None,
+    )
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "configure_google_application_credentials",
+        lambda: None,
+    )
+    return GoogleCloudLoggingDestination(
+        project=None,
+        log_name="policyengine-observability",
+        client_factory=lambda _project, _credentials: client,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (5.0, 5.0),
+        ("5", 5.0),
+        (0, 0.5),
+        (-3, 0.5),
+        (1000, 60.0),
+        (float("inf"), 10.0),
+        (float("nan"), 10.0),
+        (None, 10.0),
+        ("garbage", 10.0),
+    ],
+)
+def test_clamped_bounds_and_rejects_non_finite(value, expected) -> None:
+    result = clamped(value, low=0.5, high=60.0, default=10.0)
+
+    assert result == expected
+    assert math.isfinite(result)
 
 
 def test_normalize_payload_recursively_stringifies_unsafe_values() -> None:
@@ -100,6 +160,59 @@ def test_google_destination_writes_structured_log_with_bounded_labels(
     }
     assert "request_id" not in kwargs["labels"]
     assert "path" not in kwargs["labels"]
+
+
+def test_google_destination_bounds_gapic_writes(monkeypatch) -> None:
+    client = FakeClient(gapic=True)
+
+    destination = _google_destination(
+        monkeypatch, client, write_timeout_seconds=5.0
+    )
+    # The write path under log_struct funnels through this method; the
+    # rebinding must inject the bounded retry and per-call timeout.
+    client.logging_api._gapic_api.write_log_entries(request="sentinel")
+
+    assert destination.write_timeout_seconds == 5.0
+    ((args, kwargs),) = client.logging_api._gapic_api.calls
+    assert kwargs["request"] == "sentinel"
+    assert kwargs["timeout"] == 5.0
+    assert kwargs["retry"].timeout == 5.0
+
+
+def test_google_destination_clamps_write_timeout(monkeypatch) -> None:
+    destination = _google_destination(
+        monkeypatch, FakeClient(gapic=True), write_timeout_seconds=0.0
+    )
+
+    assert destination.write_timeout_seconds == 0.5
+
+
+def test_google_destination_without_gapic_transport_still_works(
+    monkeypatch,
+) -> None:
+    client = FakeClient()
+
+    destination = _google_destination(monkeypatch, client)
+    destination.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert len(client.fake_logger.calls) == 1
+
+
+def test_google_destination_forwards_enqueue_timestamp(monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    client = FakeClient()
+    destination = _google_destination(monkeypatch, client)
+    stamp = datetime(2026, 7, 8, 12, 0, 0, tzinfo=UTC)
+
+    destination.emit(
+        {"event": "x"}, log_type="event", severity="INFO", timestamp=stamp
+    )
+    destination.emit({"event": "y"}, log_type="event", severity="INFO")
+
+    (_, stamped_kwargs), (_, plain_kwargs) = client.fake_logger.calls
+    assert stamped_kwargs["timestamp"] is stamp
+    assert "timestamp" not in plain_kwargs
 
 
 # ── Destination circuit breaker ──────────────────────────────────────────
