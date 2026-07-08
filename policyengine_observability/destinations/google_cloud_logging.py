@@ -11,6 +11,7 @@ from policyengine_observability.google_credentials import (
 )
 
 from .base import clamped, normalize_payload
+from .registry import register_destination
 from .stdout import StdoutFormatter, register_stdout_formatter
 
 DEFAULT_WRITE_TIMEOUT_SECONDS = 10.0
@@ -187,3 +188,19 @@ def _google_stdout_formatter_factory(config: Any) -> StdoutFormatter:
 
 
 register_stdout_formatter("google", _google_stdout_formatter_factory)
+
+
+def _google_destination_factory(*, config: Any, **_: Any):
+    return GoogleCloudLoggingDestination(
+        project=config.google_cloud_project,
+        log_name=config.google_cloud_log_name,
+        write_timeout_seconds=config.google_cloud_write_timeout_seconds,
+    )
+
+
+register_destination(
+    "google_cloud_logging",
+    _google_destination_factory,
+    transport="remote",
+    aliases=("google", "google_cloud"),
+)

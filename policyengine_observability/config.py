@@ -55,6 +55,16 @@ def float_from_env(name: str, default: float) -> float:
         return default
 
 
+def int_from_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
+
+
 def default_environment() -> str:
     return (
         os.getenv("OBSERVABILITY_ENVIRONMENT")
@@ -89,6 +99,8 @@ class ObservabilityConfig:
     google_cloud_log_name: str = "policyengine-observability"
     google_cloud_write_timeout_seconds: float = 10.0
     stdout_format: str = "plain"
+    log_queue_maxsize: int = 1000
+    log_queue_close_timeout_seconds: float = 2.0
 
     @classmethod
     def from_env(
@@ -174,6 +186,14 @@ class ObservabilityConfig:
             ),
             stdout_format=(
                 os.getenv("OBSERVABILITY_STDOUT_FORMAT") or cls.stdout_format
+            ),
+            log_queue_maxsize=int_from_env(
+                "OBSERVABILITY_LOG_QUEUE_MAXSIZE",
+                cls.log_queue_maxsize,
+            ),
+            log_queue_close_timeout_seconds=float_from_env(
+                "OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS",
+                cls.log_queue_close_timeout_seconds,
             ),
         )
 

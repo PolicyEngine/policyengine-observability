@@ -19,7 +19,7 @@ from policyengine_observability import (
 from policyengine_observability import runtime as runtime_module
 from policyengine_observability.config import DEFAULT_METRIC_ATTRIBUTE_KEYS
 from policyengine_observability.destinations import (
-    manager as destination_manager_module,
+    google_cloud_logging as google_cloud_logging_module,
 )
 
 
@@ -1182,6 +1182,26 @@ def test_from_env_reads_stdout_format(monkeypatch) -> None:
     assert config.stdout_format == "google"
 
 
+def test_from_env_reads_queue_knobs(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_MAXSIZE", "50")
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS", "1.5")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.log_queue_maxsize == 50
+    assert config.log_queue_close_timeout_seconds == 1.5
+
+
+def test_from_env_queue_knobs_fall_back_on_garbage(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_MAXSIZE", "many")
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS", "soon")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.log_queue_maxsize == 1000
+    assert config.log_queue_close_timeout_seconds == 2.0
+
+
 def test_from_env_google_write_timeout_defaults(monkeypatch) -> None:
     monkeypatch.setenv("OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", "bad")
 
@@ -1925,7 +1945,7 @@ def test_google_destination_init_failure_falls_back_to_stdout(
         raise ImportError("google-cloud-logging missing")
 
     monkeypatch.setattr(
-        destination_manager_module,
+        google_cloud_logging_module,
         "GoogleCloudLoggingDestination",
         fail_google_destination,
     )
@@ -1952,7 +1972,7 @@ def test_disabled_configure_does_not_initialize_log_destinations(
         raise AssertionError("google destination should not initialize")
 
     monkeypatch.setattr(
-        destination_manager_module,
+        google_cloud_logging_module,
         "GoogleCloudLoggingDestination",
         fail_google_destination,
     )

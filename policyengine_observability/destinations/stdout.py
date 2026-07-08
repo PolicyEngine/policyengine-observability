@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from .base import normalize_payload
+from .registry import register_destination
 
 # A stdout formatter shapes the normalized payload into the JSON line a
 # platform's log agent expects. Formatters are registered by name so
@@ -82,3 +83,14 @@ class StdoutJsonDestination:
             logger.warning(message)
         else:
             logger.info(message)
+
+
+def _stdout_factory(*, config: Any, loggers: Any, serializer: Any, **_: Any):
+    return StdoutJsonDestination(
+        loggers=loggers,
+        serializer=serializer,
+        formatter=resolve_stdout_formatter(config),
+    )
+
+
+register_destination("stdout", _stdout_factory, transport="inline")
