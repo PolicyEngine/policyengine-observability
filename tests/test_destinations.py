@@ -113,8 +113,9 @@ def test_google_destination_writes_bounded_gapic_entry(monkeypatch) -> None:
     assert client.log_names == ["policyengine-observability"]
     assert client.logging_api.calls == []
     request, retry, timeout = client.logging_api._gapic_api.calls[0]
-    assert retry is None
-    assert timeout == 2.0
+    # Transient errors retry only inside the bounded write budget.
+    assert retry is not None
+    assert timeout == 5.0
     assert request.partial_success is True
     (entry,) = request.entries
     from google.logging.type.log_severity_pb2 import LogSeverity
@@ -458,13 +459,6 @@ class BatchRecordingDestination:
         self.batches.append(list(records))
 
 
-class FailingDestination:
-    name = "failing"
-
-    def emit(self, payload, *, log_type, severity) -> None:
-        raise RuntimeError("sink down")
-
-
 def _background(wrapped, **kwargs):
     from policyengine_observability.destinations.background import (
         BackgroundEmitDestination,
@@ -506,7 +500,7 @@ def test_background_drain_prefers_emit_batch(monkeypatch) -> None:
 
     for index in range(3):
         destination.emit({"event": index}, log_type="event", severity="INFO")
-    while destination._drain_once():
+    while destination._drain_once() != "empty":
         pass
 
     assert [len(batch) for batch in wrapped.batches] == [2, 1]
@@ -520,13 +514,13 @@ def test_background_drain_falls_back_to_single_emits(monkeypatch) -> None:
     _inline(destination, monkeypatch)
 
     destination.emit({"event": "a"}, log_type="event", severity="INFO")
-    while destination._drain_once():
+    while destination._drain_once() != "empty":
         pass
 
     assert wrapped.payloads == [{"event": "a"}]
 
 
-def test_background_overflow_drops_newest_and_reports(monkeypatch) -> None:
+def test_background_overflow_drops_oldest_and_reports(monkeypatch) -> None:
     wrapped = BatchRecordingDestination()
     destination, failures = _background(wrapped, queue_size=2)
     _inline(destination, monkeypatch)
@@ -535,7 +529,7 @@ def test_background_overflow_drops_newest_and_reports(monkeypatch) -> None:
         destination.emit({"event": index}, log_type="event", severity="INFO")
 
     kept = [payload["event"] for payload, _, _ in destination._buffer]
-    assert kept == [0, 1]
+    assert kept == [2, 3]
     overflow = [
         fields
         for operation, fields in failures
@@ -552,15 +546,14 @@ def test_background_trips_after_consecutive_batch_failures(
     import pytest
 
     destination, failures = _background(
-        FailingDestination(), batch_size=1, failure_limit=3
+        FlakyDestination(), batch_size=1, failure_limit=3
     )
     _inline(destination, monkeypatch)
 
     for index in range(5):
         destination.emit({"event": index}, log_type="event", severity="INFO")
-    drained = True
-    while drained:
-        drained = destination._drain_once()
+    while not destination._tripped.is_set():
+        destination._drain_once()
 
     counts = [
         fields["consecutive_failures"]
@@ -581,7 +574,7 @@ def test_background_trip_flows_through_manager_breaker(monkeypatch) -> None:
     )
 
     destination, _failures = _background(
-        FailingDestination(), batch_size=1, failure_limit=1
+        FlakyDestination(), batch_size=1, failure_limit=1
     )
     _inline(destination, monkeypatch)
     manager, manager_failures = _manager([destination])
@@ -620,7 +613,7 @@ def test_background_flush_reports_undelivered_remainder(
     monkeypatch,
 ) -> None:
     destination, failures = _background(
-        FailingDestination(), batch_size=1, failure_limit=1
+        FlakyDestination(), batch_size=1, failure_limit=1
     )
     _inline(destination, monkeypatch)
 
@@ -640,7 +633,7 @@ def test_background_flush_reports_undelivered_remainder(
 def test_background_restart_clears_trip_and_buffer(monkeypatch) -> None:
     wrapped = BatchRecordingDestination()
     destination, _failures = _background(
-        FailingDestination(), batch_size=1, failure_limit=1
+        FlakyDestination(), batch_size=1, failure_limit=1
     )
     _inline(destination, monkeypatch)
     destination.emit({"event": "x"}, log_type="event", severity="INFO")
@@ -667,11 +660,12 @@ def test_background_worker_delivers_end_to_end() -> None:
     for index in range(3):
         destination.emit({"event": index}, log_type="event", severity="INFO")
     destination.flush(1.0)
+    assert destination._atexit_registered is True
     destination.close()
 
     assert sum(len(batch) for batch in wrapped.batches) == 3
     assert failures == []
-    assert destination._atexit_registered is True
+    assert destination._atexit_registered is False
 
 
 def test_background_worker_restarts_after_fork(monkeypatch) -> None:
@@ -690,6 +684,8 @@ def test_background_worker_restarts_after_fork(monkeypatch) -> None:
     destination.emit({"event": "b"}, log_type="event", severity="INFO")
 
     assert destination._worker is not first_worker
+    first_worker.join(timeout=2.0)
+    assert not first_worker.is_alive()
     destination.flush(1.0)
     destination.close()
 
@@ -797,17 +793,180 @@ class FlushRecordingDestination:
         self.restarts += 1
 
 
-def test_manager_flush_and_restart_reach_capable_destinations() -> None:
+def test_manager_flush_reaches_capable_destinations() -> None:
     flushable = FlushRecordingDestination()
     plain = RecordingDestination()
     manager, failures = _manager([flushable, plain])
 
     manager.flush(1.5)
-    manager.restart()
 
     assert flushable.flushes == [1.5]
-    assert flushable.restarts == 1
     assert failures == []
+
+
+def test_manager_restart_rebuilds_destinations_from_config() -> None:
+    from policyengine_observability.destinations.stdout import (
+        StdoutJsonDestination,
+    )
+
+    stale = FlushRecordingDestination()
+    manager, _failures = _manager([stale])
+    manager._consecutive_failures[id(stale)] = 2
+
+    manager.restart()
+
+    assert stale not in manager.destinations
+    assert any(
+        isinstance(destination, StdoutJsonDestination)
+        for destination in manager.destinations
+    )
+    assert manager._consecutive_failures == {}
+
+
+def test_manager_restart_revives_a_disabled_destination(monkeypatch) -> None:
+    """The Modal snapshot-restore path: a destination tripped and
+    disabled before the snapshot must come back after restart, with a
+    fresh client."""
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations import manager as manager_mod
+    from policyengine_observability.destinations.manager import (
+        DESTINATION_FAILURE_LIMIT,
+    )
+
+    built = []
+
+    class StubGoogleRebuild:
+        name = "google_cloud_logging"
+
+        def __init__(self, **kwargs) -> None:
+            built.append(self)
+
+        def emit(self, payload, *, log_type, severity) -> None:
+            raise RuntimeError("sink down")
+
+    monkeypatch.setattr(
+        manager_mod, "GoogleCloudLoggingDestination", StubGoogleRebuild
+    )
+    manager = _config_manager(
+        ObservabilityConfig(log_destinations=("google_cloud_logging",))
+    )
+    manager.configure()
+    for _ in range(DESTINATION_FAILURE_LIMIT):
+        manager.emit({"event": "x"}, log_type="event", severity="INFO")
+    assert built[0] not in manager.destinations
+
+    manager.restart()
+
+    assert len(built) == 2
+    assert built[1] in manager.destinations
+
+
+def test_manager_configure_closes_replaced_destinations() -> None:
+    class ClosableDestination(FlushRecordingDestination):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    stale = ClosableDestination()
+    manager, _failures = _manager([stale])
+
+    manager.configure()
+
+    assert stale.closed == 1
+    assert stale not in manager.destinations
+
+
+def test_background_flush_waits_for_in_flight_batch(monkeypatch) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, failures = _background(wrapped)
+    _inline(destination, monkeypatch)
+
+    with destination._lock:
+        destination._in_flight = 1
+    destination.flush(0.05)
+
+    incomplete = [
+        fields
+        for operation, fields in failures
+        if operation == "logging.destination_flush_incomplete"
+    ]
+    assert len(incomplete) == 1
+    assert incomplete[0]["remaining"] == 1
+    with destination._lock:
+        destination._in_flight = 0
+
+
+def test_google_destination_reports_unbounded_transport(monkeypatch) -> None:
+    failures = []
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "load_google_credentials",
+        lambda *, prefer_workload_identity: None,
+    )
+    monkeypatch.setattr(
+        google_cloud_logging,
+        "configure_google_application_credentials",
+        lambda: None,
+    )
+    GoogleCloudLoggingDestination(
+        project=None,
+        log_name="policyengine-observability",
+        client_factory=lambda _project, _credentials: FakeClient(gapic=False),
+        on_failure=lambda operation, exc, **fields: failures.append(
+            (operation, fields)
+        ),
+    )
+
+    assert failures[0][0] == "logging.destination_unbounded_transport"
+
+
+def test_google_destination_stamps_event_timestamp(monkeypatch) -> None:
+    client = FakeClient(gapic=False)
+    destination = _destination(monkeypatch, client)
+
+    destination.emit(
+        {"created_at": "2026-07-08T00:00:00+00:00", "event": "x"},
+        log_type="event",
+        severity="INFO",
+    )
+    destination.emit(
+        {"created_at": "not-a-timestamp", "event": "y"},
+        log_type="event",
+        severity="INFO",
+    )
+
+    (stamped,), _ = client.logging_api.calls[0]
+    assert stamped["timestamp"] == "2026-07-08T00:00:00+00:00"
+    (unstamped,), _ = client.logging_api.calls[1]
+    assert "timestamp" not in unstamped
+
+
+def test_internal_error_flag_is_thread_local() -> None:
+    import threading
+
+    from policyengine_observability import (
+        ObservabilityConfig,
+        ObservabilityRuntime,
+    )
+
+    runtime = ObservabilityRuntime(
+        ObservabilityConfig(service_name="svc", otel_enabled=False)
+    )
+    runtime._emitting_internal_error = True
+    seen_in_thread = []
+
+    def read_flag() -> None:
+        seen_in_thread.append(runtime._emitting_internal_error)
+
+    thread = threading.Thread(target=read_flag)
+    thread.start()
+    thread.join()
+
+    assert runtime._emitting_internal_error is True
+    assert seen_in_thread == [False]
 
 
 def test_manager_flush_reports_but_survives_failures() -> None:

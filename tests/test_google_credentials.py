@@ -277,11 +277,16 @@ def test_google_destination_bootstraps_application_credentials(
         lambda *, prefer_workload_identity: None,
     )
 
+    class FakeLogger:
+        def __init__(self, log_name):
+            self.full_name = f"projects/test-project/logs/{log_name}"
+            self.default_resource = {"type": "global", "labels": {}}
+
     class FakeClient:
         project = "test-project"
 
         def logger(self, log_name):
-            return log_name
+            return FakeLogger(log_name)
 
     destination = google_cloud_logging.GoogleCloudLoggingDestination(
         project=None,
@@ -291,7 +296,9 @@ def test_google_destination_bootstraps_application_credentials(
 
     assert calls == ["configured"]
     assert destination.project == "test-project"
-    assert destination.logger == "policyengine-observability"
+    assert destination.logger.full_name == (
+        "projects/test-project/logs/policyengine-observability"
+    )
 
 
 def test_google_destination_passes_loaded_credentials(monkeypatch) -> None:
@@ -303,11 +310,16 @@ def test_google_destination_passes_loaded_credentials(monkeypatch) -> None:
 
     calls = []
 
+    class FakeLogger:
+        def __init__(self, log_name):
+            self.full_name = f"projects/test-project/logs/{log_name}"
+            self.default_resource = {"type": "global", "labels": {}}
+
     class FakeClient:
         project = "test-project"
 
         def logger(self, log_name):
-            return log_name
+            return FakeLogger(log_name)
 
     destination = google_cloud_logging.GoogleCloudLoggingDestination(
         project="central-project",
@@ -318,4 +330,6 @@ def test_google_destination_passes_loaded_credentials(monkeypatch) -> None:
     )
 
     assert calls == [("central-project", "wif-credentials")]
-    assert destination.logger == "policyengine-observability"
+    assert destination.logger.full_name == (
+        "projects/test-project/logs/policyengine-observability"
+    )

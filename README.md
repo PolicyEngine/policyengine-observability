@@ -105,11 +105,12 @@ For the fixed PolicyEngine Google Cloud destination, see
 
 ## Log emission and delivery semantics
 
-Writes to Google Cloud Logging carry an explicit per-call timeout with
-retries disabled so a degraded Logging API cannot stall the caller:
+Writes to Google Cloud Logging carry an explicit per-call timeout, with
+transient errors retried only inside that budget, so a degraded Logging
+API cannot stall the caller while brief blips are still absorbed:
 
 ```bash
-OBSERVABILITY_GOOGLE_LOG_TIMEOUT_SECONDS=2.0
+OBSERVABILITY_GOOGLE_LOG_TIMEOUT_SECONDS=5.0
 ```
 
 By default, log emission is synchronous on the caller's thread. Setting
@@ -127,14 +128,18 @@ OBSERVABILITY_LOG_FLUSH_DEADLINE_SECONDS=5.0
 ```
 
 Async delivery is best-effort by design. When the buffer is full, the
-newest records are dropped and the drops are counted and reported through
-the internal-error channel. After three consecutive failed batches the
-destination is disabled for the remainder of the process and logging
-falls back to stdout, matching the synchronous circuit breaker. Buffered
+oldest records are dropped — keeping the freshest, most diagnostic
+records — and drops are counted and reported through the internal-error
+channel. After three consecutive failed batches (with backoff between
+attempts) the emitter trips; subsequent log calls surface the failure to
+the manager's circuit breaker, which disables the destination and falls
+back to stdout. `restart_observability()` rebuilds destinations from
+config, reviving a disabled destination with a fresh client. Buffered
 records are flushed at interpreter exit and by `runtime.shutdown()`;
-`flush_observability(deadline_seconds)` flushes on demand. A hard kill
-loses whatever was still buffered. Stdout destinations are never wrapped:
-the fallback sink stays synchronous and dependency-free.
+`flush_observability(deadline_seconds)` flushes on demand and waits for
+any in-flight batch. A hard kill loses whatever was still buffered.
+Stdout destinations are never wrapped: the fallback sink stays
+synchronous and dependency-free.
 
 Processes that fork or restore from memory snapshots (for example Modal
 Functions with memory snapshots enabled) do not preserve threads. The

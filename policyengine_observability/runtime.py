@@ -115,7 +115,7 @@ class ObservabilityRuntime:
         self.failover_events = _NoOpInstrument()
         self.active_requests = _NoOpInstrument()
         self._httpx_instrumented = False
-        self._emitting_internal_error = False
+        self._internal_error_local = threading.local()
         self.log_destination_manager = LogDestinationManager(
             config=config,
             loggers={
@@ -127,6 +127,17 @@ class ObservabilityRuntime:
             serializer=self._json,
             on_failure=self._handle_destination_failure,
         )
+
+    @property
+    def _emitting_internal_error(self) -> bool:
+        # Thread-local: the async log worker reports failures concurrently
+        # with request threads, and a shared flag would misroute one
+        # thread's report to stderr because another thread is mid-report.
+        return getattr(self._internal_error_local, "value", False)
+
+    @_emitting_internal_error.setter
+    def _emitting_internal_error(self, value: bool) -> None:
+        self._internal_error_local.value = value
 
     @classmethod
     def disabled(cls) -> ObservabilityRuntime:

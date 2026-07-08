@@ -5,6 +5,12 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+DEFAULT_GOOGLE_LOG_TIMEOUT_SECONDS = 5.0
+DEFAULT_LOG_QUEUE_SIZE = 1000
+DEFAULT_LOG_BATCH_SIZE = 10
+DEFAULT_LOG_BATCH_LATENCY_SECONDS = 0.25
+DEFAULT_LOG_FLUSH_DEADLINE_SECONDS = 5.0
+
 DEFAULT_METRIC_ATTRIBUTE_KEYS = (
     "service.name",
     "service.role",
@@ -97,13 +103,13 @@ class ObservabilityConfig:
     log_destinations: tuple[str, ...] = ("stdout",)
     google_cloud_project: str | None = None
     google_cloud_log_name: str = "policyengine-observability"
-    google_log_timeout_seconds: float = 2.0
+    google_log_timeout_seconds: float = DEFAULT_GOOGLE_LOG_TIMEOUT_SECONDS
     stdout_format: str = "plain"
     log_emit_mode: str = "sync"
-    log_queue_size: int = 1000
-    log_batch_size: int = 10
-    log_batch_latency_seconds: float = 0.25
-    log_flush_deadline_seconds: float = 5.0
+    log_queue_size: int = DEFAULT_LOG_QUEUE_SIZE
+    log_batch_size: int = DEFAULT_LOG_BATCH_SIZE
+    log_batch_latency_seconds: float = DEFAULT_LOG_BATCH_LATENCY_SECONDS
+    log_flush_deadline_seconds: float = DEFAULT_LOG_FLUSH_DEADLINE_SECONDS
 
     @classmethod
     def from_env(
