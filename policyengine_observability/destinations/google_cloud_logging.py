@@ -14,7 +14,6 @@ from policyengine_observability.google_credentials import (
 from .base import (
     bounded_labels,
     normalize_payload,
-    rfc3339_timestamp,
     trace_resource_name,
 )
 
@@ -85,14 +84,12 @@ class GoogleCloudLoggingDestination:
         self.logger = self.client.logger(log_name)
         self._full_name = self.logger.full_name
         self._resource = _resource_dict(self.logger.default_resource)
-        self._gapic_api = None
-        self._gapic_tools: tuple[Any, Any] | None = None
-        self._retry: Any = None
-        self._resolve_transport(on_failure)
+        self._bounded_write: Callable[[list[dict[str, Any]]], None] | None
+        self._bounded_write = self._resolve_transport(on_failure)
 
     def _resolve_transport(
         self, on_failure: Callable[..., None] | None
-    ) -> None:
+    ) -> Callable[[list[dict[str, Any]]], None] | None:
         api = getattr(self.client, "logging_api", None)
         gapic_api = getattr(api, "_gapic_api", None)
         if gapic_api is not None:
@@ -111,15 +108,10 @@ class GoogleCloudLoggingDestination:
             except ImportError:  # pragma: no cover - exotic installs only
                 gapic_api = None
             else:
-                self._gapic_api = gapic_api
-                self._gapic_tools = (
-                    _log_entry_mapping_to_pb,
-                    WriteLogEntriesRequest,
-                )
-                # Retry transient errors, but only inside the overall
-                # write budget, so a Logging API blip does not surface as
-                # a destination failure while a real outage stays bounded.
-                self._retry = Retry(
+                # Retry transient errors inside the write budget. Note
+                # the worst case is ~2x the budget: api-core hands the
+                # final retry attempt a fresh per-attempt timeout.
+                retry = Retry(
                     initial=0.1,
                     maximum=1.0,
                     multiplier=1.3,
@@ -130,7 +122,24 @@ class GoogleCloudLoggingDestination:
                         api_exceptions.ServiceUnavailable,
                     ),
                 )
-        if self._gapic_api is None and on_failure is not None:
+                timeout_seconds = self.timeout_seconds
+
+                def bounded_write(entries: list[dict[str, Any]]) -> None:
+                    request = WriteLogEntriesRequest(
+                        entries=[
+                            _log_entry_mapping_to_pb(entry)
+                            for entry in entries
+                        ],
+                        partial_success=True,
+                    )
+                    gapic_api.write_log_entries(
+                        request=request,
+                        retry=retry,
+                        timeout=timeout_seconds,
+                    )
+
+                return bounded_write
+        if on_failure is not None:
             on_failure(
                 "logging.destination_unbounded_transport",
                 RuntimeError(
@@ -140,6 +149,7 @@ class GoogleCloudLoggingDestination:
                 ),
                 destination=self.name,
             )
+        return None
 
     def emit(
         self,
@@ -154,15 +164,38 @@ class GoogleCloudLoggingDestination:
 
     def emit_batch(
         self,
-        records: Sequence[tuple[dict[str, Any], str, str]],
+        records: Sequence[tuple[dict[str, Any], str, str, str | None]],
     ) -> None:
-        """Write ``(payload, log_type, severity)`` records in one call."""
+        """Write ``(payload, log_type, severity, timestamp)`` records in
+        one bounded call. Payloads must already be normalized and the
+        timestamp (RFC3339 enqueue time, or None) preserves event time
+        against asynchronous emission delay — this is the background
+        emitter's contract."""
         entries = [
-            self._build_entry(payload, log_type=log_type, severity=severity)
-            for payload, log_type, severity in records
+            self._build_entry(
+                payload,
+                log_type=log_type,
+                severity=severity,
+                timestamp=timestamp,
+                pre_normalized=True,
+            )
+            for payload, log_type, severity, timestamp in records
         ]
         if entries:
             self._write(entries)
+
+    def close(self) -> None:
+        """Release the underlying client transport when possible."""
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+            return
+        api = getattr(self.client, "logging_api", None)
+        gapic_api = getattr(api, "_gapic_api", None)
+        transport = getattr(gapic_api, "transport", None)
+        transport_close = getattr(transport, "close", None)
+        if callable(transport_close):
+            transport_close()
 
     def _build_entry(
         self,
@@ -170,8 +203,10 @@ class GoogleCloudLoggingDestination:
         *,
         log_type: str,
         severity: str,
+        timestamp: str | None = None,
+        pre_normalized: bool = False,
     ) -> dict[str, Any]:
-        normalized = normalize_payload(payload)
+        normalized = payload if pre_normalized else normalize_payload(payload)
         entry: dict[str, Any] = {
             "logName": self._full_name,
             "resource": self._resource,
@@ -179,9 +214,9 @@ class GoogleCloudLoggingDestination:
             "severity": str(severity).upper(),
             "labels": bounded_labels(normalized, log_type=log_type),
         }
-        # Stamp the event time when the payload carries one; async
-        # emission means the server's receive time can lag the event.
-        timestamp = rfc3339_timestamp(normalized.get("created_at"))
+        # Synchronous writes rely on the server's receive time; the
+        # background emitter supplies its enqueue time instead, so
+        # delayed batches keep their event time.
         if timestamp:
             entry["timestamp"] = timestamp
         trace = trace_resource_name(self.project, normalized.get("trace_id"))
@@ -193,17 +228,8 @@ class GoogleCloudLoggingDestination:
         return entry
 
     def _write(self, entries: list[dict[str, Any]]) -> None:
-        if self._gapic_api is not None and self._gapic_tools is not None:
-            mapping_to_pb, request_class = self._gapic_tools
-            request = request_class(
-                entries=[mapping_to_pb(entry) for entry in entries],
-                partial_success=True,
-            )
-            self._gapic_api.write_log_entries(
-                request=request,
-                retry=self._retry,
-                timeout=self.timeout_seconds,
-            )
+        if self._bounded_write is not None:
+            self._bounded_write(entries)
             return
         self.client.logging_api.write_entries(entries, partial_success=True)
 

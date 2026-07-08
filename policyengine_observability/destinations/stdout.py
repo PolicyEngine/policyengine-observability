@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .base import bounded_labels, normalize_payload
+from .base import bounded_labels, normalize_payload, trace_resource_name
 
 GOOGLE_TRACE_KEY = "logging.googleapis.com/trace"
 GOOGLE_SPAN_ID_KEY = "logging.googleapis.com/spanId"
@@ -65,21 +65,21 @@ class StdoutJsonDestination:
         log_type: str,
         severity: str,
     ) -> dict[str, Any]:
-        line = dict(normalized)
-        line["severity"] = str(severity).upper()
-        created_at = normalized.get("created_at")
-        if created_at:
-            line["time"] = created_at
-        trace_id = normalized.get("trace_id")
-        if trace_id and self.google_cloud_project:
-            line[GOOGLE_TRACE_KEY] = (
-                f"projects/{self.google_cloud_project}/traces/{trace_id}"
-            )
+        # normalize_payload returned a fresh dict; mutate it in place.
+        # Stdout emission is synchronous, so the agent's receive time is
+        # the event time and no explicit `time` key is needed.
+        normalized["severity"] = str(severity).upper()
+        trace = trace_resource_name(
+            self.google_cloud_project,
+            normalized.get("trace_id"),
+        )
+        if trace:
+            normalized[GOOGLE_TRACE_KEY] = trace
         span_id = normalized.get("span_id")
         if span_id:
-            line[GOOGLE_SPAN_ID_KEY] = str(span_id)
-        line[GOOGLE_LABELS_KEY] = bounded_labels(
+            normalized[GOOGLE_SPAN_ID_KEY] = str(span_id)
+        normalized[GOOGLE_LABELS_KEY] = bounded_labels(
             normalized,
             log_type=log_type,
         )
-        return line
+        return normalized

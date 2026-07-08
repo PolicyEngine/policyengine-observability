@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
 from typing import Any, Protocol
 
 
@@ -63,17 +62,3 @@ def trace_resource_name(
     if not trace_id or not project:
         return None
     return f"projects/{project}/traces/{trace_id}"
-
-
-def rfc3339_timestamp(value: Any) -> str | None:
-    """Return an RFC3339 timestamp for a payload-supplied value, or None
-    when the value cannot be interpreted as an aware datetime."""
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.isoformat()

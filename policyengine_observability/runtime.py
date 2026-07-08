@@ -1086,7 +1086,7 @@ class ObservabilityRuntime:
     ) -> None:
         try:
             self.log_destination_manager.flush(deadline_seconds)
-        except BaseException as exc:
+        except Exception as exc:
             self.log_observability_failure("logging.flush", exc)
 
     def restart_log_destinations(self) -> None:
@@ -1096,7 +1096,6 @@ class ObservabilityRuntime:
             self.log_observability_failure("logging.restart", exc)
 
     def shutdown(self) -> None:
-        self.flush_log_destinations()
         providers = [
             ("trace", self.tracer_provider),
             ("metrics", self.meter_provider),
@@ -1106,10 +1105,11 @@ class ObservabilityRuntime:
             for name, provider in providers
             if provider is not None
         ]
-        if not providers:
-            return
 
         def flush() -> None:
+            # Log flush runs inside the same hard-bounded thread as the
+            # OTel providers so a hung sink cannot stall process exit.
+            self.flush_log_destinations()
             for name, provider in providers:
                 try:
                     provider.shutdown()

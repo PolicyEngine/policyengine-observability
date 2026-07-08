@@ -111,6 +111,20 @@ class ObservabilityConfig:
     log_batch_latency_seconds: float = DEFAULT_LOG_BATCH_LATENCY_SECONDS
     log_flush_deadline_seconds: float = DEFAULT_LOG_FLUSH_DEADLINE_SECONDS
 
+    def __post_init__(self) -> None:
+        # Normalize string knobs regardless of construction path, so
+        # programmatic configs behave like env-driven ones.
+        object.__setattr__(
+            self,
+            "stdout_format",
+            (self.stdout_format or "plain").strip().lower(),
+        )
+        object.__setattr__(
+            self,
+            "log_emit_mode",
+            (self.log_emit_mode or "sync").strip().lower(),
+        )
+
     @classmethod
     def from_env(
         cls,
@@ -195,14 +209,10 @@ class ObservabilityConfig:
             ),
             stdout_format=(
                 os.getenv("OBSERVABILITY_STDOUT_FORMAT") or cls.stdout_format
-            )
-            .strip()
-            .lower(),
+            ),
             log_emit_mode=(
                 os.getenv("OBSERVABILITY_LOG_EMIT_MODE") or cls.log_emit_mode
-            )
-            .strip()
-            .lower(),
+            ),
             log_queue_size=int_from_env(
                 "OBSERVABILITY_LOG_QUEUE_SIZE",
                 cls.log_queue_size,

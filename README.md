@@ -107,7 +107,9 @@ For the fixed PolicyEngine Google Cloud destination, see
 
 Writes to Google Cloud Logging carry an explicit per-call timeout, with
 transient errors retried only inside that budget, so a degraded Logging
-API cannot stall the caller while brief blips are still absorbed:
+API cannot stall the caller while brief blips are still absorbed. (The
+retry machinery hands the final attempt a fresh per-attempt timeout, so
+the worst-case wall time is about twice the configured budget.)
 
 ```bash
 OBSERVABILITY_GOOGLE_LOG_TIMEOUT_SECONDS=5.0
@@ -117,7 +119,10 @@ By default, log emission is synchronous on the caller's thread. Setting
 the emit mode to `async` installs the standard accept/emit split: the
 logging call only appends the record to a bounded in-memory buffer and
 returns immediately, and a background worker thread drains the buffer in
-batches to the network destination:
+batches to the network destination. The worker naps for the batch
+latency after waking so bursts coalesce into fewer, larger writes, and
+each record is written with its enqueue time as the entry timestamp so
+delayed batches keep their event time:
 
 ```bash
 OBSERVABILITY_LOG_EMIT_MODE=async
@@ -133,13 +138,15 @@ records — and drops are counted and reported through the internal-error
 channel. After three consecutive failed batches (with backoff between
 attempts) the emitter trips; subsequent log calls surface the failure to
 the manager's circuit breaker, which disables the destination and falls
-back to stdout. `restart_observability()` rebuilds destinations from
-config, reviving a disabled destination with a fresh client. Buffered
-records are flushed at interpreter exit and by `runtime.shutdown()`;
-`flush_observability(deadline_seconds)` flushes on demand and waits for
-any in-flight batch. A hard kill loses whatever was still buffered.
-Stdout destinations are never wrapped: the fallback sink stays
-synchronous and dependency-free.
+back to stdout. Recovery is deliberately manual: a disabled destination
+stays disabled until `restart_observability()` rebuilds destinations
+from config with fresh clients (automatic half-open probing is future
+work). Buffered records are flushed at interpreter exit and by
+`runtime.shutdown()`; `flush_observability(deadline_seconds)` flushes on
+demand and waits for any in-flight batch. Closing with records still
+buffered reports the count of records lost. A hard kill loses whatever
+was still buffered. Stdout destinations are never wrapped: the fallback
+sink stays synchronous and dependency-free.
 
 Processes that fork or restore from memory snapshots (for example Modal
 Functions with memory snapshots enabled) do not preserve threads. The
@@ -149,8 +156,8 @@ their post-restore hook to clear buffered state and revive the worker.
 
 On platforms whose logging agent collects stdout (Cloud Run, GKE), the
 agent-native stdout format emits JSON lines carrying the special keys the
-agent promotes to first-class LogEntry fields (severity, time, trace,
-span, labels), giving full-fidelity Cloud Logging ingestion with no
+agent promotes to first-class LogEntry fields (severity, trace, span,
+labels), giving full-fidelity Cloud Logging ingestion with no
 in-process network emission:
 
 ```bash

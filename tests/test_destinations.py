@@ -174,8 +174,8 @@ def test_google_destination_emit_batch_writes_one_call(monkeypatch) -> None:
 
     destination.emit_batch(
         [
-            ({"event": "a"}, "event", "INFO"),
-            ({"event": "b"}, "request", "WARNING"),
+            ({"event": "a"}, "event", "INFO", "2026-07-08T00:00:00+00:00"),
+            ({"event": "b"}, "request", "WARNING", None),
         ]
     )
     destination.emit_batch([])
@@ -369,7 +369,7 @@ def test_stdout_google_format_maps_agent_keys() -> None:
     line = json.loads(message)
     assert level == "warning"
     assert line["severity"] == "WARNING"
-    assert line["time"] == "2026-07-07T00:00:00+00:00"
+    assert "time" not in line
     assert (
         line["logging.googleapis.com/trace"]
         == "projects/central-project/traces/abc123"
@@ -396,7 +396,6 @@ def test_stdout_google_format_omits_trace_without_project() -> None:
     _level, message = logger.lines[0]
     line = json.loads(message)
     assert "logging.googleapis.com/trace" not in line
-    assert "time" not in line
     assert line["severity"] == "ERROR"
 
 
@@ -505,7 +504,9 @@ def test_background_drain_prefers_emit_batch(monkeypatch) -> None:
 
     assert [len(batch) for batch in wrapped.batches] == [2, 1]
     assert wrapped.single_emits == []
-    assert wrapped.batches[0][0] == ({"event": 0}, "event", "INFO")
+    payload, log_type, severity, timestamp = wrapped.batches[0][0]
+    assert (payload, log_type, severity) == ({"event": 0}, "event", "INFO")
+    assert isinstance(timestamp, str) and "T" in timestamp
 
 
 def test_background_drain_falls_back_to_single_emits(monkeypatch) -> None:
@@ -528,7 +529,7 @@ def test_background_overflow_drops_oldest_and_reports(monkeypatch) -> None:
     for index in range(4):
         destination.emit({"event": index}, log_type="event", severity="INFO")
 
-    kept = [payload["event"] for payload, _, _ in destination._buffer]
+    kept = [payload["event"] for payload, *_ in destination._buffer]
     assert kept == [2, 3]
     overflow = [
         fields
@@ -555,12 +556,15 @@ def test_background_trips_after_consecutive_batch_failures(
     while not destination._tripped.is_set():
         destination._drain_once()
 
-    counts = [
-        fields["consecutive_failures"]
+    reports = [
+        fields
         for operation, fields in failures
         if operation == "logging.destination_emit_async"
     ]
-    assert counts == [1, 2, 3]
+    assert [fields["consecutive_failures"] for fields in reports] == [1, 2, 3]
+    assert all(fields["records_lost"] == 1 for fields in reports)
+    assert "stranded" not in reports[0]
+    assert reports[2]["stranded"] == 2
     with pytest.raises(RuntimeError, match="tripped"):
         destination.emit({"event": "x"}, log_type="event", severity="INFO")
 
@@ -585,6 +589,7 @@ def test_background_trip_flows_through_manager_breaker(monkeypatch) -> None:
         manager.emit({"event": "x"}, log_type="event", severity="INFO")
 
     assert destination not in manager.destinations
+    assert destination._stopped.is_set()
     assert any(
         operation == "logging.destination_disabled"
         for operation, _fields in manager_failures
@@ -630,27 +635,6 @@ def test_background_flush_reports_undelivered_remainder(
     assert incomplete[0]["remaining"] == 3
 
 
-def test_background_restart_clears_trip_and_buffer(monkeypatch) -> None:
-    wrapped = BatchRecordingDestination()
-    destination, _failures = _background(
-        FlakyDestination(), batch_size=1, failure_limit=1
-    )
-    _inline(destination, monkeypatch)
-    destination.emit({"event": "x"}, log_type="event", severity="INFO")
-    destination._drain_once()
-    assert destination._tripped.is_set()
-
-    destination.restart()
-    destination.wrapped = wrapped
-    _inline(destination, monkeypatch)
-
-    assert not destination._tripped.is_set()
-    assert len(destination._buffer) == 0
-    destination.emit({"event": "y"}, log_type="event", severity="INFO")
-    destination._drain_once()
-    assert wrapped.batches == [[({"event": "y"}, "event", "INFO")]]
-
-
 def test_background_worker_delivers_end_to_end() -> None:
     wrapped = BatchRecordingDestination()
     destination, failures = _background(
@@ -670,12 +654,14 @@ def test_background_worker_delivers_end_to_end() -> None:
 
 def test_background_worker_restarts_after_fork(monkeypatch) -> None:
     import os as os_module
+    import time as time_module
 
     from policyengine_observability.destinations import background
 
     wrapped = BatchRecordingDestination()
     destination, _failures = _background(wrapped)
     destination.emit({"event": "a"}, log_type="event", severity="INFO")
+    destination.flush(1.0)
     first_worker = destination._worker
     assert first_worker is not None
 
@@ -686,11 +672,36 @@ def test_background_worker_restarts_after_fork(monkeypatch) -> None:
     assert destination._worker is not first_worker
     first_worker.join(timeout=2.0)
     assert not first_worker.is_alive()
-    destination.flush(1.0)
+    # The record must be delivered by the NEW worker, not a caller flush.
+    for _ in range(200):
+        if sum(len(batch) for batch in wrapped.batches) >= 2:
+            break
+        time_module.sleep(0.01)
+    delivered = [
+        payload["event"] for batch in wrapped.batches for payload, *_ in batch
+    ]
+    assert "b" in delivered
     destination.close()
 
 
-# ── Async wiring, lifecycle, and config knobs ────────────────────────────
+def test_reset_after_fork_drops_inherited_buffer(monkeypatch) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, failures = _background(wrapped)
+    _inline(destination, monkeypatch)
+    destination.emit({"event": "a"}, log_type="event", severity="INFO")
+
+    destination._reset_after_fork()
+
+    assert len(destination._buffer) == 0
+    destination.emit({"event": "b"}, log_type="event", severity="INFO")
+    fork_reports = [
+        fields
+        for operation, fields in failures
+        if operation == "logging.destination_fork_buffer_dropped"
+    ]
+    assert fork_reports == [
+        {"destination": "batch-recording", "dropped_total": 1}
+    ]
 
 
 def _config_manager(config):
@@ -732,7 +743,9 @@ def test_async_mode_wraps_google_destination(monkeypatch) -> None:
         ObservabilityConfig(log_emit_mode="async", log_queue_size=7)
     )
 
-    destination = manager._build_destination("google_cloud_logging")
+    destination = manager._build_destination(
+        "google_cloud_logging", lambda *args, **kwargs: None
+    )
 
     assert isinstance(destination, BackgroundEmitDestination)
     assert isinstance(destination.wrapped, StubGoogle)
@@ -758,7 +771,9 @@ def test_sync_mode_returns_bare_destination(monkeypatch) -> None:
     )
     manager = _config_manager(ObservabilityConfig())
 
-    destination = manager._build_destination("google")
+    destination = manager._build_destination(
+        "google", lambda *args, **kwargs: None
+    )
 
     assert isinstance(destination, StubGoogle)
 
@@ -771,7 +786,9 @@ def test_async_mode_never_wraps_stdout() -> None:
 
     manager = _config_manager(ObservabilityConfig(log_emit_mode="async"))
 
-    destination = manager._build_destination("stdout")
+    destination = manager._build_destination(
+        "stdout", lambda *args, **kwargs: None
+    )
 
     assert isinstance(destination, StdoutJsonDestination)
 
@@ -781,16 +798,12 @@ class FlushRecordingDestination:
 
     def __init__(self) -> None:
         self.flushes = []
-        self.restarts = 0
 
     def emit(self, payload, *, log_type, severity) -> None:
         pass
 
     def flush(self, deadline_seconds=None) -> None:
         self.flushes.append(deadline_seconds)
-
-    def restart(self) -> None:
-        self.restarts += 1
 
 
 def test_manager_flush_reaches_capable_destinations() -> None:
@@ -800,7 +813,8 @@ def test_manager_flush_reaches_capable_destinations() -> None:
 
     manager.flush(1.5)
 
-    assert flushable.flushes == [1.5]
+    assert len(flushable.flushes) == 1
+    assert 1.0 < flushable.flushes[0] <= 1.5
     assert failures == []
 
 
@@ -924,6 +938,8 @@ def test_google_destination_reports_unbounded_transport(monkeypatch) -> None:
 
 
 def test_google_destination_stamps_event_timestamp(monkeypatch) -> None:
+    """Synchronous writes rely on server receive time; batch records
+    carry the background emitter's enqueue timestamp."""
     client = FakeClient(gapic=False)
     destination = _destination(monkeypatch, client)
 
@@ -932,16 +948,14 @@ def test_google_destination_stamps_event_timestamp(monkeypatch) -> None:
         log_type="event",
         severity="INFO",
     )
-    destination.emit(
-        {"created_at": "not-a-timestamp", "event": "y"},
-        log_type="event",
-        severity="INFO",
+    destination.emit_batch(
+        [({"event": "y"}, "event", "INFO", "2026-07-08T01:00:00+00:00")]
     )
 
-    (stamped,), _ = client.logging_api.calls[0]
-    assert stamped["timestamp"] == "2026-07-08T00:00:00+00:00"
-    (unstamped,), _ = client.logging_api.calls[1]
-    assert "timestamp" not in unstamped
+    (sync_entry,), _ = client.logging_api.calls[0]
+    assert "timestamp" not in sync_entry
+    (batch_entry,), _ = client.logging_api.calls[1]
+    assert batch_entry["timestamp"] == "2026-07-08T01:00:00+00:00"
 
 
 def test_internal_error_flag_is_thread_local() -> None:
@@ -1060,3 +1074,202 @@ def test_from_env_emission_knobs_default_and_reject_garbage(
 
     assert config.log_emit_mode == "sync"
     assert config.log_queue_size == 1000
+
+
+def test_background_flush_zero_deadline_attempts_one_drain(
+    monkeypatch,
+) -> None:
+    wrapped = BatchRecordingDestination()
+    destination, failures = _background(wrapped)
+    _inline(destination, monkeypatch)
+    destination.emit({"event": "a"}, log_type="event", severity="INFO")
+
+    destination.flush(0)
+
+    assert sum(len(batch) for batch in wrapped.batches) == 1
+    assert failures == []
+
+
+def test_background_flush_waits_for_completing_in_flight_batch(
+    monkeypatch,
+) -> None:
+    import threading
+
+    wrapped = BatchRecordingDestination()
+    destination, failures = _background(wrapped)
+    _inline(destination, monkeypatch)
+    with destination._lock:
+        destination._in_flight = 1
+
+    def complete() -> None:
+        with destination._lock:
+            destination._in_flight = 0
+
+    timer = threading.Timer(0.05, complete)
+    timer.start()
+    destination.flush(1.0)
+    timer.join()
+
+    assert failures == []
+
+
+def test_background_worker_survives_base_exception_with_report(
+    monkeypatch,
+) -> None:
+    import threading
+
+    class ExitingDestination:
+        name = "exiting"
+
+        def emit(self, payload, *, log_type, severity) -> None:
+            raise SystemExit(1)
+
+    destination, failures = _background(ExitingDestination(), batch_size=1)
+    _inline(destination, monkeypatch)
+    destination.emit({"event": "a"}, log_type="event", severity="INFO")
+    closed = threading.Event()
+
+    destination._run(closed)
+
+    crashes = [
+        operation
+        for operation, _fields in failures
+        if operation == "logging.destination_worker_crashed"
+    ]
+    assert crashes == ["logging.destination_worker_crashed"]
+
+
+def test_background_close_reports_pending_and_is_terminal(
+    monkeypatch,
+) -> None:
+    class ClosableWrapped(BatchRecordingDestination):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    wrapped = ClosableWrapped()
+    destination, failures = _background(wrapped)
+    _inline(destination, monkeypatch)
+    destination.emit({"event": "a"}, log_type="event", severity="INFO")
+
+    destination.close()
+
+    pending = [
+        fields
+        for operation, fields in failures
+        if operation == "logging.destination_closed_pending"
+    ]
+    assert pending == [{"destination": "batch-recording", "remaining": 1}]
+    assert wrapped.closed == 1
+    assert len(destination._buffer) == 0
+    # Terminal: no acceptance, no worker respawn, no atexit re-register.
+    destination.emit({"event": "b"}, log_type="event", severity="INFO")
+    assert len(destination._buffer) == 0
+    assert destination._worker is None
+    assert destination._atexit_registered is False
+
+
+def test_manager_reports_unknown_emit_mode(monkeypatch) -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    manager = _config_manager(ObservabilityConfig(log_emit_mode="asnyc"))
+    warnings = []
+    manager.on_failure = lambda operation, exc, **fields: warnings.append(
+        operation
+    )
+
+    manager.configure()
+
+    assert "logging.destination_config_warning" in warnings
+
+
+def test_manager_warns_on_double_ingestion_combo(monkeypatch) -> None:
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations import manager as manager_mod
+
+    class StubGoogle:
+        name = "google_cloud_logging"
+
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def emit(self, payload, *, log_type, severity) -> None:
+            pass
+
+    monkeypatch.setattr(
+        manager_mod, "GoogleCloudLoggingDestination", StubGoogle
+    )
+    manager = _config_manager(
+        ObservabilityConfig(
+            stdout_format="google",
+            log_destinations=("stdout", "google_cloud_logging"),
+        )
+    )
+    warnings = []
+    manager.on_failure = lambda operation, exc, **fields: warnings.append(
+        (operation, str(exc))
+    )
+
+    manager.configure()
+
+    assert any(
+        operation == "logging.destination_config_warning"
+        and "twice" in message
+        for operation, message in warnings
+    )
+
+
+def test_config_normalizes_string_knobs_programmatically() -> None:
+    from policyengine_observability.config import ObservabilityConfig
+
+    config = ObservabilityConfig(
+        stdout_format=" Google ", log_emit_mode="ASYNC"
+    )
+
+    assert config.stdout_format == "google"
+    assert config.log_emit_mode == "async"
+
+
+def test_configure_defers_reports_until_destinations_are_live(
+    monkeypatch,
+) -> None:
+    """Failure reports fire only after the new destination set is live,
+    so a report's own emission cannot re-enter configuration."""
+    import json
+    import logging
+
+    from policyengine_observability.config import ObservabilityConfig
+    from policyengine_observability.destinations import manager as manager_mod
+    from policyengine_observability.destinations.manager import (
+        LogDestinationManager,
+    )
+
+    events = []
+
+    def on_failure(operation, exc, **fields):
+        events.append(operation)
+        # Emulate the runtime: a report re-enters manager.emit.
+        manager.emit({"event": "report"}, log_type="event", severity="INFO")
+
+    manager = LogDestinationManager(
+        config=ObservabilityConfig(log_destinations=("google_cloud_logging",)),
+        loggers={"event": logging.getLogger("test-deferred")},
+        serializer=json.dumps,
+        on_failure=on_failure,
+    )
+    monkeypatch.setattr(
+        manager_mod,
+        "GoogleCloudLoggingDestination",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    manager.emit({"event": "first"}, log_type="event", severity="INFO")
+
+    # The build failure was reported after the fallback set went live,
+    # and the reentrant emit found a configured manager (no recursion).
+    assert "logging.destination_config" in events
+    assert manager.configured is True
+    assert len(manager.destinations) == 1
