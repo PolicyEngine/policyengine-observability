@@ -896,7 +896,7 @@ wheels = [
 
 [[package]]
 name = "policyengine-observability"
-version = "1.3.2"
+version = "1.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "opentelemetry-api" },
