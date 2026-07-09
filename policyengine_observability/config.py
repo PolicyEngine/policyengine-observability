@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
+
+# Defaults for the generic queued-transport knobs; the queued destination
+# imports these so a constructor call and an env-configured build can
+# never disagree about what "default" means.
+DEFAULT_LOG_QUEUE_MAXSIZE = 1000
+DEFAULT_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS = 2.0
 
 DEFAULT_METRIC_ATTRIBUTE_KEYS = (
     "service.name",
@@ -103,18 +110,49 @@ def _detect_log_profile() -> str | None:
     return None
 
 
+def _missing_strategy_requirements(
+    destination_names: Sequence[str],
+    resolved_config: Mapping[str, Any],
+) -> list[tuple[str, str]]:
+    """(destination, config field) pairs a preset needs but lacks.
+
+    Strategies declare their requirements at registration
+    (``register_destination(required_config=...)``); this check knows
+    nothing about any backend.
+    """
+    # Imported lazily: the destinations package imports this module, so
+    # a module-level import here would be circular. By the time a config
+    # is resolved the package (and its strategy registrations) is loaded.
+    from .destinations.registry import destination_strategy
+
+    missing: list[tuple[str, str]] = []
+    for name in destination_names:
+        strategy = destination_strategy(name)
+        if strategy is None:
+            continue
+        for field in strategy.required_config:
+            if not resolved_config.get(field):
+                missing.append((name, field))
+    return missing
+
+
 def _resolve_log_profile(
     raw_profile: str,
     *,
-    google_cloud_project: str | None,
+    resolved_config: Mapping[str, Any],
 ) -> tuple[str, tuple[tuple[str, ...], str] | None, list[str]]:
     """Resolve a profile name to (name, preset-or-None, warnings).
 
     ``auto`` without a recognized platform marker resolves to no preset,
-    so caller-supplied defaults keep applying.
+    so caller-supplied defaults keep applying. ``resolved_config``
+    carries the already-resolved config values that registered
+    strategies may declare as requirements.
     """
     warnings: list[str] = []
-    profile = raw_profile.strip().lower()
+    # Canonical profile names are hyphenated; accept the same case,
+    # whitespace, and hyphen/underscore variance as destination and
+    # formatter names.
+    profile = raw_profile.strip().lower().replace("_", "-")
     if profile == "auto":
         detected = _detect_log_profile()
         if detected is None:
@@ -128,10 +166,13 @@ def _resolve_log_profile(
         )
         profile = "plain-sync"
         preset = LOG_PROFILE_PRESETS[profile]
-    if "google_cloud_logging" in preset[0] and not google_cloud_project:
+    missing = _missing_strategy_requirements(preset[0], resolved_config)
+    if missing:
+        requirements = ", ".join(
+            f"{field} (destination {name})" for name, field in missing
+        )
         warnings.append(
-            "Log profile gcp-direct requires a resolvable Google Cloud "
-            "project; using plain-sync."
+            f"Log profile {profile} requires {requirements}; using plain-sync."
         )
         profile = "plain-sync"
         preset = LOG_PROFILE_PRESETS[profile]
@@ -160,10 +201,11 @@ class ObservabilityConfig:
     log_destinations: tuple[str, ...] = ("stdout",)
     google_cloud_project: str | None = None
     google_cloud_log_name: str = "policyengine-observability"
-    google_cloud_write_timeout_seconds: float = 10.0
     stdout_format: str = "plain"
-    log_queue_maxsize: int = 1000
-    log_queue_close_timeout_seconds: float = 2.0
+    log_queue_maxsize: int = DEFAULT_LOG_QUEUE_MAXSIZE
+    log_queue_close_timeout_seconds: float = (
+        DEFAULT_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS
+    )
     log_profile: str = "auto"
     config_warnings: tuple[str, ...] = ()
 
@@ -208,7 +250,9 @@ class ObservabilityConfig:
         )
         log_profile, preset, profile_warnings = _resolve_log_profile(
             os.getenv("OBSERVABILITY_LOG_PROFILE") or cls.log_profile,
-            google_cloud_project=google_cloud_project,
+            # The values strategies may declare via required_config;
+            # extend as future fields become requirement candidates.
+            resolved_config={"google_cloud_project": google_cloud_project},
         )
         profile_destinations, profile_stdout_format = preset or (None, None)
         # Explicit granular env vars override the profile's expansion;
@@ -244,7 +288,7 @@ class ObservabilityConfig:
             meter_name=os.getenv("OBSERVABILITY_METER_NAME"),
             shutdown_timeout_seconds=float_from_env(
                 "OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS",
-                3.0,
+                cls.shutdown_timeout_seconds,
             ),
             instrument_fastapi=bool_from_env(
                 "OBSERVABILITY_INSTRUMENT_FASTAPI",
@@ -260,10 +304,6 @@ class ObservabilityConfig:
             google_cloud_log_name=(
                 os.getenv("OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME")
                 or cls.google_cloud_log_name
-            ),
-            google_cloud_write_timeout_seconds=float_from_env(
-                "OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS",
-                cls.google_cloud_write_timeout_seconds,
             ),
             stdout_format=resolved_stdout_format,
             log_queue_maxsize=int_from_env(

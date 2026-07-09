@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
+from fakes import (
+    ClosableRecordingDestination,
+    FailingDestination,
+    RecordingDestination,
+    RecordingLogger,
+    make_manager,
+)
 
+from policyengine_observability.config import ObservabilityConfig
 from policyengine_observability.destinations import (
     GoogleCloudLoggingDestination,
     google_cloud_logging,
     normalize_payload,
 )
-from policyengine_observability.destinations.base import clamped
+from policyengine_observability.destinations.base import (
+    accepts_keyword,
+    clamped,
+)
+from policyengine_observability.destinations.stdout import (
+    StdoutJsonDestination,
+    resolve_stdout_formatter,
+)
 
 
 class Unprintable:
@@ -89,6 +105,24 @@ def test_clamped_bounds_and_rejects_non_finite(value, expected) -> None:
 
     assert result == expected
     assert math.isfinite(result)
+
+
+def test_accepts_keyword_covers_named_var_keyword_and_uninspectable() -> None:
+    def named(payload, *, timestamp=None):
+        pass
+
+    def var_keyword(payload, **kwargs):
+        pass
+
+    def blind(payload):
+        pass
+
+    assert accepts_keyword(named, "timestamp") is True
+    assert accepts_keyword(var_keyword, "timestamp") is True
+    assert accepts_keyword(blind, "timestamp") is False
+    # Builtins without introspectable signatures degrade to False
+    # instead of raising at construction time.
+    assert accepts_keyword(min, "timestamp") is False
 
 
 def test_normalize_payload_recursively_stringifies_unsafe_values() -> None:
@@ -215,31 +249,103 @@ def test_google_destination_forwards_enqueue_timestamp(monkeypatch) -> None:
     assert "timestamp" not in plain_kwargs
 
 
+def test_google_destination_close_closes_client(monkeypatch) -> None:
+    class ClosableFakeClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    client = ClosableFakeClient()
+    destination = _google_destination(monkeypatch, client)
+
+    destination.close()
+
+    assert client.closed == 1
+
+
+def test_google_destination_close_tolerates_closeless_client(
+    monkeypatch,
+) -> None:
+    destination = _google_destination(monkeypatch, FakeClient())
+
+    destination.close()  # FakeClient has no close; must be a no-op
+
+
+def test_google_destination_suppresses_instrumentation_entry(
+    monkeypatch,
+) -> None:
+    logging_v2 = pytest.importorskip("google.cloud.logging_v2")
+    monkeypatch.setattr(
+        logging_v2, "_instrumentation_emitted", False, raising=False
+    )
+
+    _google_destination(monkeypatch, FakeClient())
+
+    assert logging_v2._instrumentation_emitted is True
+
+
+def test_google_factory_reads_write_timeout_env(monkeypatch) -> None:
+    captured = {}
+
+    class StubDestination:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        google_cloud_logging, "GoogleCloudLoggingDestination", StubDestination
+    )
+    monkeypatch.setenv("OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", "2.5")
+
+    from policyengine_observability.destinations.registry import (
+        destination_strategy,
+    )
+
+    destination_strategy("google_cloud_logging").factory(
+        config=ObservabilityConfig(google_cloud_project="proj"),
+        loggers={},
+        serializer=json.dumps,
+    )
+
+    assert captured["project"] == "proj"
+    assert captured["write_timeout_seconds"] == 2.5
+
+
+def test_google_factory_write_timeout_defaults_without_env(
+    monkeypatch,
+) -> None:
+    captured = {}
+
+    class StubDestination:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        google_cloud_logging, "GoogleCloudLoggingDestination", StubDestination
+    )
+    monkeypatch.delenv(
+        "OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", raising=False
+    )
+
+    from policyengine_observability.destinations.registry import (
+        destination_strategy,
+    )
+
+    destination_strategy("google_cloud_logging").factory(
+        config=ObservabilityConfig(google_cloud_project="proj"),
+        loggers={},
+        serializer=json.dumps,
+    )
+
+    assert captured["write_timeout_seconds"] == 10.0
+
+
 # ── Stdout formatters ────────────────────────────────────────────────────
 
 
-class RecordingLogger:
-    def __init__(self) -> None:
-        self.lines = []
-
-    def info(self, message) -> None:
-        self.lines.append(("INFO", message))
-
-    def warning(self, message) -> None:
-        self.lines.append(("WARNING", message))
-
-    def error(self, message) -> None:
-        self.lines.append(("ERROR", message))
-
-
 def _stdout_destination(config=None, formatter=None):
-    import json
-
-    from policyengine_observability.destinations.stdout import (
-        StdoutJsonDestination,
-        resolve_stdout_formatter,
-    )
-
     logger = RecordingLogger()
     if formatter is None and config is not None:
         formatter = resolve_stdout_formatter(config)
@@ -252,15 +358,11 @@ def _stdout_destination(config=None, formatter=None):
 
 
 def _emitted_line(logger):
-    import json
-
     ((_, message),) = logger.lines
     return json.loads(message)
 
 
 def test_stdout_google_formatter_maps_agent_native_keys() -> None:
-    from policyengine_observability.config import ObservabilityConfig
-
     config = ObservabilityConfig(
         stdout_format="google", google_cloud_project="proj"
     )
@@ -294,8 +396,6 @@ def test_stdout_google_formatter_maps_agent_native_keys() -> None:
 
 
 def test_stdout_google_formatter_omits_trace_without_project() -> None:
-    from policyengine_observability.config import ObservabilityConfig
-
     config = ObservabilityConfig(stdout_format="google")
     destination, logger = _stdout_destination(config)
 
@@ -308,8 +408,6 @@ def test_stdout_google_formatter_omits_trace_without_project() -> None:
 
 
 def test_stdout_unknown_format_falls_back_to_plain() -> None:
-    from policyengine_observability.config import ObservabilityConfig
-
     config = ObservabilityConfig(stdout_format=" GoOgLeX ")
     destination, logger = _stdout_destination(config)
 
@@ -318,9 +416,24 @@ def test_stdout_unknown_format_falls_back_to_plain() -> None:
     assert _emitted_line(logger) == {"event": "x"}
 
 
-def test_stdout_format_name_is_normalized() -> None:
-    from policyengine_observability.config import ObservabilityConfig
+def test_stdout_unknown_format_reports_when_channel_available() -> None:
+    failures = []
+    formatter = resolve_stdout_formatter(
+        ObservabilityConfig(stdout_format="agent-natve"),
+        on_failure=lambda operation, exc, **fields: failures.append(
+            (operation, str(exc))
+        ),
+    )
 
+    formatted = formatter({"event": "x"}, log_type="event", severity="INFO")
+
+    assert formatted == {"event": "x"}
+    assert len(failures) == 1
+    assert failures[0][0] == "logging.stdout_format"
+    assert "agent-natve" in failures[0][1]
+
+
+def test_stdout_format_name_is_normalized() -> None:
     config = ObservabilityConfig(stdout_format=" GOOGLE ")
     destination, logger = _stdout_destination(config)
 
@@ -341,8 +454,6 @@ def test_stdout_broken_formatter_degrades_to_unformatted() -> None:
 
 
 def test_stdout_google_formatter_never_mutates_caller_payload() -> None:
-    from policyengine_observability.config import ObservabilityConfig
-
     config = ObservabilityConfig(
         stdout_format="google", google_cloud_project="proj"
     )
@@ -355,7 +466,6 @@ def test_stdout_google_formatter_never_mutates_caller_payload() -> None:
 
 
 def test_custom_stdout_formatter_registers_and_resolves() -> None:
-    from policyengine_observability.config import ObservabilityConfig
     from policyengine_observability.destinations.stdout import (
         _FORMATTER_FACTORIES,
         register_stdout_formatter,
@@ -366,62 +476,18 @@ def test_custom_stdout_formatter_registers_and_resolves() -> None:
 
     register_stdout_formatter("custom-test", factory)
     try:
-        config = ObservabilityConfig(stdout_format="custom-test")
+        # Hyphen/underscore variance is forgiven the same way it is for
+        # destination names.
+        config = ObservabilityConfig(stdout_format=" Custom_Test ")
         destination, logger = _stdout_destination(config)
         destination.emit({"event": "x"}, log_type="event", severity="INFO")
     finally:
-        _FORMATTER_FACTORIES.pop("custom-test", None)
+        _FORMATTER_FACTORIES.pop("custom_test", None)
 
     assert _emitted_line(logger) == {"wrapped": {"event": "x"}}
 
 
-# ── Destination circuit breaker ──────────────────────────────────────────
-
-
-class FlakyDestination:
-    name = "flaky"
-
-    def __init__(self, fail_first: int | None = None) -> None:
-        self.calls = 0
-        self.fail_first = fail_first
-
-    def emit(self, payload, *, log_type, severity) -> None:
-        self.calls += 1
-        if self.fail_first is None or self.calls <= self.fail_first:
-            raise RuntimeError("emit failed")
-
-
-class RecordingDestination:
-    name = "recording"
-
-    def __init__(self) -> None:
-        self.payloads = []
-
-    def emit(self, payload, *, log_type, severity) -> None:
-        self.payloads.append(payload)
-
-
-def _manager(destinations):
-    import json
-    import logging
-
-    from policyengine_observability.config import ObservabilityConfig
-    from policyengine_observability.destinations.manager import (
-        LogDestinationManager,
-    )
-
-    failures = []
-    manager = LogDestinationManager(
-        config=ObservabilityConfig(),
-        loggers={"event": logging.getLogger("test-destinations")},
-        serializer=json.dumps,
-        on_failure=lambda operation, exc, **fields: failures.append(
-            (operation, fields)
-        ),
-    )
-    manager.destinations = list(destinations)
-    manager.configured = True
-    return manager, failures
+# ── Destination circuit breaker and manager lifecycle ───────────────────
 
 
 def test_destination_disabled_after_consecutive_emit_failures() -> None:
@@ -429,9 +495,9 @@ def test_destination_disabled_after_consecutive_emit_failures() -> None:
         DESTINATION_FAILURE_LIMIT,
     )
 
-    flaky = FlakyDestination()
+    flaky = FailingDestination()
     healthy = RecordingDestination()
-    manager, failures = _manager([flaky, healthy])
+    manager, failures = make_manager(destinations=[flaky, healthy])
 
     for _ in range(DESTINATION_FAILURE_LIMIT + 2):
         manager.emit({"event": "x"}, log_type="event", severity="INFO")
@@ -439,7 +505,7 @@ def test_destination_disabled_after_consecutive_emit_failures() -> None:
     assert flaky.calls == DESTINATION_FAILURE_LIMIT
     assert flaky not in manager.destinations
     assert len(healthy.payloads) == DESTINATION_FAILURE_LIMIT + 2
-    assert any(op == "logging.destination_disabled" for op, _ in failures)
+    assert any(op == "logging.destination_disabled" for op, *_ in failures)
 
 
 def test_emit_success_resets_the_failure_counter() -> None:
@@ -447,8 +513,8 @@ def test_emit_success_resets_the_failure_counter() -> None:
         DESTINATION_FAILURE_LIMIT,
     )
 
-    flaky = FlakyDestination(fail_first=DESTINATION_FAILURE_LIMIT - 1)
-    manager, failures = _manager([flaky])
+    flaky = FailingDestination(fail_first=DESTINATION_FAILURE_LIMIT - 1)
+    manager, failures = make_manager(destinations=[flaky])
 
     for _ in range(DESTINATION_FAILURE_LIMIT + 2):
         manager.emit({"event": "x"}, log_type="event", severity="INFO")
@@ -456,7 +522,7 @@ def test_emit_success_resets_the_failure_counter() -> None:
     assert flaky in manager.destinations
     counts = [
         fields["consecutive_failures"]
-        for op, fields in failures
+        for op, _exc, fields in failures
         if op == "logging.destination_emit"
     ]
     assert max(counts) == DESTINATION_FAILURE_LIMIT - 1
@@ -466,12 +532,9 @@ def test_sole_disabled_destination_falls_back_to_stdout() -> None:
     from policyengine_observability.destinations.manager import (
         DESTINATION_FAILURE_LIMIT,
     )
-    from policyengine_observability.destinations.stdout import (
-        StdoutJsonDestination,
-    )
 
-    flaky = FlakyDestination()
-    manager, failures = _manager([flaky])
+    flaky = FailingDestination()
+    manager, _failures = make_manager(destinations=[flaky])
 
     for _ in range(DESTINATION_FAILURE_LIMIT + 1):
         manager.emit({"event": "x"}, log_type="event", severity="INFO")
@@ -481,3 +544,90 @@ def test_sole_disabled_destination_falls_back_to_stdout() -> None:
         isinstance(destination, StdoutJsonDestination)
         for destination in manager.destinations
     )
+
+
+def test_manager_close_reports_failures_and_closes_the_rest() -> None:
+    class ExplodingClose(RecordingDestination):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    exploding = ExplodingClose()
+    closable = ClosableRecordingDestination()
+    manager, failures = make_manager(destinations=[exploding, closable])
+
+    manager.close(1.0)  # must not raise
+
+    assert closable.closed == 1
+    assert any(op == "logging.destination_close" for op, *_ in failures)
+
+
+def test_manager_close_accepts_zero_argument_close() -> None:
+    """A duck-typed close(self) works under every close path — the
+    deadline is passed only when the signature accepts it."""
+    closable = ClosableRecordingDestination()
+    manager, failures = make_manager(destinations=[closable])
+
+    manager.close(1.0)
+
+    assert closable.closed == 1
+    assert failures == []
+
+
+def test_manager_close_shares_one_deadline_across_destinations() -> None:
+    import time
+
+    deadlines = []
+
+    class SlowClose(RecordingDestination):
+        def close(self, deadline_seconds=None) -> None:
+            deadlines.append(deadline_seconds)
+            time.sleep(0.05)
+
+    manager, _failures = make_manager(destinations=[SlowClose(), SlowClose()])
+
+    manager.close(1.0)
+
+    first, second = deadlines
+    # The second destination only gets what the first one left, so N
+    # stuck destinations cannot take N times the budget.
+    assert first <= 1.0
+    assert second <= first - 0.04
+
+
+def test_emit_falls_back_to_stdout_when_configure_crashes(
+    monkeypatch,
+) -> None:
+    logger = RecordingLogger()
+    manager, failures = make_manager(loggers={"event": logger})
+
+    def broken_configure() -> None:
+        raise RuntimeError("configure exploded")
+
+    monkeypatch.setattr(manager, "configure", broken_configure)
+
+    manager.emit({"event": "x"}, log_type="event", severity="INFO")
+
+    assert manager.configured is True
+    assert isinstance(manager.destinations[0], StdoutJsonDestination)
+    assert _emitted_line(logger) == {"event": "x", "severity": "INFO"}
+    assert any(op == "logging.destination_config" for op, *_ in failures)
+
+
+def test_reconfigure_closes_previous_after_installing_new() -> None:
+    """Close-phase failure reports route through emit; the replaced
+    destinations must be closed only after the new ones are installed
+    so those reports still have a sink."""
+    sink_states = []
+    manager, _failures = make_manager()
+
+    class CloseProbe(RecordingDestination):
+        def close(self) -> None:
+            sink_states.append(list(manager.destinations))
+
+    manager.destinations = [CloseProbe()]
+    manager.configured = True
+
+    manager.configure()
+
+    assert len(sink_states) == 1
+    assert sink_states[0], "previous destination closed before new install"

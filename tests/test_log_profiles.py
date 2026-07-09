@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import json
-import logging
 
 import pytest
+from fakes import RecordingLogger, make_manager
 
 from policyengine_observability.config import ObservabilityConfig
-from policyengine_observability.destinations.manager import (
-    LogDestinationManager,
-)
 from policyengine_observability.destinations.queued import (
     QueuedLogDestination,
 )
@@ -49,6 +46,13 @@ def test_explicit_gcp_agent_profile(monkeypatch) -> None:
     assert config.config_warnings == ()
 
 
+def test_profile_name_accepts_underscore_variant(monkeypatch) -> None:
+    config = _from_env(monkeypatch, OBSERVABILITY_LOG_PROFILE=" GCP_Agent ")
+
+    assert config.log_profile == "gcp-agent"
+    assert config.config_warnings == ()
+
+
 def test_explicit_gcp_direct_profile_with_project(monkeypatch) -> None:
     config = _from_env(
         monkeypatch,
@@ -71,7 +75,10 @@ def test_gcp_direct_without_project_downgrades_with_warning(
     assert config.log_destinations == ("stdout",)
     assert config.stdout_format == "plain"
     assert len(config.config_warnings) == 1
-    assert "Google Cloud project" in config.config_warnings[0]
+    # The requirement comes from the strategy registration, and the
+    # warning names the actual profile — no hard-coded backend text.
+    assert "gcp-direct" in config.config_warnings[0]
+    assert "google_cloud_project" in config.config_warnings[0]
 
 
 def test_explicit_plain_sync_profile_is_kill_switch(monkeypatch) -> None:
@@ -133,6 +140,27 @@ def test_auto_detects_modal_via_task_marker(monkeypatch) -> None:
     assert config.log_profile == "gcp-direct"
 
 
+def test_auto_detects_modal_via_environment_marker(monkeypatch) -> None:
+    config = _from_env(
+        monkeypatch,
+        MODAL_ENVIRONMENT="main",
+        OBSERVABILITY_GOOGLE_CLOUD_PROJECT="proj",
+    )
+
+    assert config.log_profile == "gcp-direct"
+
+
+def test_auto_detected_modal_without_project_downgrades(monkeypatch) -> None:
+    """The deployment-realistic failure: Modal markers present but no
+    resolvable project must land on plain-sync with a warning, exactly
+    like the explicit profile."""
+    config = _from_env(monkeypatch, MODAL_TASK_ID="ta-123")
+
+    assert config.log_profile == "plain-sync"
+    assert config.log_destinations == ("stdout",)
+    assert any("google_cloud_project" in w for w in config.config_warnings)
+
+
 def test_observability_platform_beats_generic_markers(monkeypatch) -> None:
     config = _from_env(
         monkeypatch,
@@ -179,24 +207,11 @@ def test_explicit_stdout_format_env_overrides_profile(monkeypatch) -> None:
     assert config.log_destinations == ("stdout",)
 
 
-def _configured_manager(config):
-    failures = []
-    manager = LogDestinationManager(
-        config=config,
-        loggers={"event": logging.getLogger("test-profiles")},
-        serializer=json.dumps,
-        on_failure=lambda operation, exc, **fields: failures.append(
-            (operation, str(exc))
-        ),
-    )
-    manager.configure()
-    return manager, failures
-
-
 def test_sync_profiles_build_no_queued_destinations(monkeypatch) -> None:
     for profile in ("gcp-agent", "plain-sync"):
         config = _from_env(monkeypatch, OBSERVABILITY_LOG_PROFILE=profile)
-        manager, failures = _configured_manager(config)
+        manager, failures = make_manager(config)
+        manager.configure()
 
         assert not any(
             isinstance(destination, QueuedLogDestination)
@@ -205,13 +220,38 @@ def test_sync_profiles_build_no_queued_destinations(monkeypatch) -> None:
         assert failures == []
 
 
+def test_gcp_agent_profile_formats_stdout_through_manager(
+    monkeypatch,
+) -> None:
+    """End-to-end wiring: the profile's formatter half must survive the
+    manager's build path, not just direct construction."""
+    config = _from_env(
+        monkeypatch,
+        OBSERVABILITY_LOG_PROFILE="gcp-agent",
+        OBSERVABILITY_GOOGLE_CLOUD_PROJECT="proj",
+    )
+    logger = RecordingLogger()
+    manager, failures = make_manager(config, loggers={"event": logger})
+    manager.configure()
+
+    manager.emit(
+        {"event": "x", "trace_id": "abc"}, log_type="event", severity="INFO"
+    )
+
+    line = json.loads(logger.lines[0][1])
+    assert line["logging.googleapis.com/labels"]["log_type"] == "event"
+    assert line["logging.googleapis.com/trace"] == "projects/proj/traces/abc"
+    assert failures == []
+
+
 def test_manager_reports_profile_warnings_once(monkeypatch) -> None:
     config = _from_env(monkeypatch, OBSERVABILITY_LOG_PROFILE="bogus")
-    manager, failures = _configured_manager(config)
+    manager, failures = make_manager(config)
+    manager.configure()
 
     warnings = [
-        message
-        for operation, message in failures
+        str(exc)
+        for operation, exc, _fields in failures
         if operation == "logging.profile_config"
     ]
     assert len(warnings) == 1
@@ -241,7 +281,8 @@ def test_gcp_direct_profile_builds_queued_google(monkeypatch) -> None:
         OBSERVABILITY_LOG_PROFILE="gcp-direct",
         OBSERVABILITY_GOOGLE_CLOUD_PROJECT="proj",
     )
-    manager, failures = _configured_manager(config)
+    manager, failures = make_manager(config)
+    manager.configure()
 
     stdout_destination, queued = manager.destinations
     assert isinstance(queued, QueuedLogDestination)

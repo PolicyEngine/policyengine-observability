@@ -5,12 +5,12 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Protocol
 
-from policyengine_observability.google_credentials import (
+from ..config import float_from_env
+from .base import clamped, normalize_payload
+from .google_credentials import (
     configure_google_application_credentials,
     load_google_credentials,
 )
-
-from .base import clamped, normalize_payload
 from .registry import register_destination
 from .stdout import StdoutFormatter, register_stdout_formatter
 
@@ -83,6 +83,21 @@ class GoogleCloudLoggingDestination:
         self.project = project or getattr(self.client, "project", None)
         self.logger = self.client.logger(log_name)
         self._bound_write_timeout()
+        self._suppress_instrumentation_entry()
+
+    def _suppress_instrumentation_entry(self) -> None:
+        """Keep the library's diagnostic entry out of the log stream.
+
+        ``log_struct`` prepends a one-time instrumentation diagnostic
+        entry to the first write per process; observability entries
+        should be only the records we were asked to write.
+        """
+        try:
+            from google.cloud import logging_v2
+
+            logging_v2._instrumentation_emitted = True
+        except ImportError:  # pragma: no cover - google extra has it
+            pass
 
     def _bound_write_timeout(self) -> None:
         """Bound every write on this destination's own client.
@@ -142,11 +157,24 @@ class GoogleCloudLoggingDestination:
             kwargs["timestamp"] = timestamp
         trace_id = normalized.get("trace_id")
         if trace_id and self.project:
-            kwargs["trace"] = f"projects/{self.project}/traces/{trace_id}"
+            kwargs["trace"] = _trace_resource(self.project, trace_id)
         span_id = normalized.get("span_id")
         if span_id:
             kwargs["span_id"] = span_id
         self.logger.log_struct(normalized, **kwargs)
+
+    def close(self) -> None:
+        """Release the owned client's transport, if it supports it."""
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
+
+def _trace_resource(project: str, trace_id: str) -> str:
+    # The LogEntry trace resource name; the direct write path and the
+    # agent-native stdout formatter must build it identically for trace
+    # correlation to work.
+    return f"projects/{project}/traces/{trace_id}"
 
 
 def _labels(payload: dict[str, Any], *, log_type: str) -> dict[str, str]:
@@ -178,7 +206,7 @@ def _google_stdout_formatter_factory(config: Any) -> StdoutFormatter:
         payload[GOOGLE_LABELS_KEY] = _labels(payload, log_type=log_type)
         trace_id = payload.get("trace_id")
         if trace_id and project:
-            payload[GOOGLE_TRACE_KEY] = f"projects/{project}/traces/{trace_id}"
+            payload[GOOGLE_TRACE_KEY] = _trace_resource(project, trace_id)
         span_id = payload.get("span_id")
         if span_id:
             payload[GOOGLE_SPAN_ID_KEY] = str(span_id)
@@ -194,7 +222,13 @@ def _google_destination_factory(*, config: Any, **_: Any):
     return GoogleCloudLoggingDestination(
         project=config.google_cloud_project,
         log_name=config.google_cloud_log_name,
-        write_timeout_seconds=config.google_cloud_write_timeout_seconds,
+        # Backend knobs belong to the strategy: parsed here at
+        # construction (so re-read on restart_observability()), keeping
+        # per-backend fields off the core config dataclass.
+        write_timeout_seconds=float_from_env(
+            "OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS",
+            DEFAULT_WRITE_TIMEOUT_SECONDS,
+        ),
     )
 
 
@@ -203,4 +237,5 @@ register_destination(
     _google_destination_factory,
     transport="remote",
     aliases=("google", "google_cloud"),
+    required_config=("google_cloud_project",),
 )

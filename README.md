@@ -56,6 +56,20 @@ in the queued transport below. Google Cloud Logging uses Application
 Default Credentials and requires permission to create log entries,
 typically through `roles/logging.logWriter`.
 
+Backends plug in through two top-level hooks, `register_destination`
+(with `transport="inline"|"remote"` and an optional `required_config`
+tuple naming the config fields the strategy needs — profiles that name
+the strategy downgrade gracefully when one is missing) and
+`register_stdout_formatter`. Registration happens at import time, so an
+external backend module must be imported before observability is
+configured. Backend-specific knobs are the strategy's own: the Google
+strategy reads `OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS` itself at
+construction (so it is re-read on `restart_observability()`) rather
+than through a core config field. Name lookups for destinations,
+formatters, and profiles all forgive case, whitespace, and
+hyphen/underscore variance; an unknown format name falls back to plain
+and is reported through the internal-error channel.
+
 ## Log emission and delivery semantics
 
 Remote destinations never write on a request thread. The log call only
@@ -83,9 +97,10 @@ OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS=2.0
 construction; when that handle is unavailable — HTTP transports,
 injected fakes — the library's ~60s default applies, which is harmless
 off the request path. All numeric knobs are clamped, so `0`, negative,
-or non-finite values can never disable or unbound a mechanism. Because
-entries are written directly per record, the Google client library's
-one-time instrumentation diagnostic entry is not emitted.)
+or non-finite values can never disable or unbound a mechanism. The
+Google client library's one-time instrumentation diagnostic entry is
+suppressed at construction, so the stream carries only the records the
+service asked to write.)
 
 Shutdown closes log destinations inside the same bounded budget that
 flushes OpenTelemetry (`OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS`); a
@@ -99,7 +114,9 @@ threads or network clients. Call `restart_observability()` from the
 post-restore or post-fork hook (for example gunicorn `post_fork` when
 using `--preload`, or a Modal post-snapshot hook) — it closes and
 rebuilds destinations from configuration, and must only be called from
-single-threaded lifecycle moments, before serving traffic.
+single-threaded lifecycle moments, before serving traffic. It is a
+no-op when observability is disabled, so the kill switch holds across
+forks and restores.
 
 Request and operation logs include two timing views:
 

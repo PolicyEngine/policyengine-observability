@@ -12,8 +12,11 @@ Mutable state census (any addition needs design review):
 
 1. ``_queue``   — thread-safe by construction (``queue.Queue``).
 2. ``_listener``— started once in ``__init__``, stopped once in ``close``.
-3. ``_dropped`` — best-effort counter for drop accounting and throttling.
+3. ``_drops``   — best-effort drop counter with its throttle state.
 4. ``_closed``  — one-way flag flipped by ``close``.
+
+(The handler's write-failure counter is confined to the listener
+thread, so it is not shared mutable state.)
 
 Accepted races, all bounded and within the best-effort contract:
 
@@ -30,7 +33,6 @@ Accepted races, all bounded and within the best-effort contract:
 from __future__ import annotations
 
 import atexit
-import inspect
 import queue as queue_module
 import time
 from collections.abc import Callable
@@ -39,12 +41,21 @@ from datetime import UTC, datetime
 from logging.handlers import QueueListener
 from typing import Any
 
-from .base import LogDestination, clamped, normalize_payload
+from ..config import (
+    DEFAULT_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS,
+    DEFAULT_LOG_QUEUE_MAXSIZE,
+)
+from .base import (
+    LogDestination,
+    accepts_keyword,
+    clamped,
+    close_destination,
+    normalize_payload,
+    safe_report,
+)
 
-DEFAULT_QUEUE_MAXSIZE = 1000
 MIN_QUEUE_MAXSIZE = 10
 MAX_QUEUE_MAXSIZE = 100_000
-DEFAULT_CLOSE_TIMEOUT_SECONDS = 2.0
 MIN_CLOSE_TIMEOUT_SECONDS = 0.0
 MAX_CLOSE_TIMEOUT_SECONDS = 30.0
 DROP_REPORT_INTERVAL = 100
@@ -59,18 +70,33 @@ class _QueuedRecord:
     enqueued_at: datetime
 
 
-def _accepts_timestamp(destination: LogDestination) -> bool:
-    try:
-        parameters = inspect.signature(destination.emit).parameters
-    except (TypeError, ValueError):
-        return False
-    return "timestamp" in parameters
+class _ThrottledCounter:
+    """Count occurrences; say when one should be reported.
+
+    The shared throttle policy for failure-path reporting: the first
+    occurrence always reports, then every ``interval``-th, so a
+    persistent problem stays visible without flooding the internal-error
+    channel.
+    """
+
+    __slots__ = ("count", "interval")
+
+    def __init__(self, interval: int) -> None:
+        self.interval = max(1, int(interval))
+        self.count = 0
+
+    def tick(self) -> int | None:
+        """Increment; return the count when this occurrence reports."""
+        self.count += 1
+        if self.count == 1 or self.count % self.interval == 0:
+            return self.count
+        return None
 
 
 class _QueuedRecordHandler:
     """Duck-typed QueueListener handler: only ``handle`` is ever called.
 
-    ``write_failures`` is confined to the listener thread. A write
+    The failure counter is confined to the listener thread. A write
     failure must never kill the listener, so everything below the emit
     is guarded; ``BaseException`` is deliberately not caught (swallowing
     ``SystemExit`` on a worker thread is worse than losing the queue —
@@ -88,8 +114,7 @@ class _QueuedRecordHandler:
         self.inner = inner
         self.on_failure = on_failure
         self.forward_timestamp = forward_timestamp
-        self.report_interval = max(1, report_interval)
-        self.write_failures = 0
+        self.failures = _ThrottledCounter(report_interval)
 
     def handle(self, record: _QueuedRecord) -> None:
         try:
@@ -107,20 +132,17 @@ class _QueuedRecordHandler:
                     severity=record.severity,
                 )
         except Exception as exc:
-            self.write_failures += 1
-            count = self.write_failures
-            if count != 1 and count % self.report_interval != 0:
+            count = self.failures.tick()
+            if count is None:
                 return
-            try:
-                self.on_failure(
-                    "logging.queue_write",
-                    exc,
-                    destination=getattr(self.inner, "name", None),
-                    log_type=record.log_type,
-                    write_failures_total=count,
-                )
-            except Exception:
-                pass
+            safe_report(
+                self.on_failure,
+                "logging.queue_write",
+                exc,
+                destination=getattr(self.inner, "name", None),
+                log_type=record.log_type,
+                write_failures_total=count,
+            )
 
 
 class _BoundedQueueListener(QueueListener):
@@ -160,8 +182,8 @@ class QueuedLogDestination:
         *,
         inner: LogDestination,
         on_failure: Callable[..., None],
-        maxsize: float = DEFAULT_QUEUE_MAXSIZE,
-        close_timeout_seconds: float = DEFAULT_CLOSE_TIMEOUT_SECONDS,
+        maxsize: float = DEFAULT_LOG_QUEUE_MAXSIZE,
+        close_timeout_seconds: float = DEFAULT_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS,
         drop_report_interval: int = DROP_REPORT_INTERVAL,
     ) -> None:
         self.inner = inner
@@ -172,16 +194,15 @@ class QueuedLogDestination:
                 maxsize,
                 low=MIN_QUEUE_MAXSIZE,
                 high=MAX_QUEUE_MAXSIZE,
-                default=DEFAULT_QUEUE_MAXSIZE,
+                default=DEFAULT_LOG_QUEUE_MAXSIZE,
             )
         )
         self.close_timeout_seconds = clamped(
             close_timeout_seconds,
             low=MIN_CLOSE_TIMEOUT_SECONDS,
             high=MAX_CLOSE_TIMEOUT_SECONDS,
-            default=DEFAULT_CLOSE_TIMEOUT_SECONDS,
+            default=DEFAULT_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS,
         )
-        self.drop_report_interval = max(1, int(drop_report_interval))
         self._queue: queue_module.Queue[_QueuedRecord | None] = (
             queue_module.Queue(self.maxsize)
         )
@@ -190,10 +211,10 @@ class QueuedLogDestination:
             _QueuedRecordHandler(
                 inner,
                 on_failure,
-                forward_timestamp=_accepts_timestamp(inner),
+                forward_timestamp=accepts_keyword(inner.emit, "timestamp"),
             ),
         )
-        self._dropped = 0
+        self._drops = _ThrottledCounter(drop_report_interval)
         self._closed = False
         # Construction happens at configure time on the startup thread,
         # never lazily on a request thread.
@@ -241,36 +262,22 @@ class QueuedLogDestination:
         )
         drained = self._listener.stop(timeout=deadline)
         if not drained:
-            try:
-                self.on_failure(
-                    "logging.queue_close_timeout",
-                    TimeoutError(
-                        "Observability log queue did not drain before "
-                        "the close deadline; remaining records are lost."
-                    ),
-                    destination=self.name,
-                    deadline_seconds=deadline,
-                    pending_records=self._queue.qsize(),
-                )
-            except Exception:
-                pass
+            safe_report(
+                self.on_failure,
+                "logging.queue_close_timeout",
+                TimeoutError(
+                    "Observability log queue did not drain before "
+                    "the close deadline; remaining records are lost."
+                ),
+                destination=self.name,
+                deadline_seconds=deadline,
+                pending_records=self._queue.qsize(),
+            )
             # The abandoned listener may still be mid-write; leave the
             # inner destination alone rather than closing it underneath
             # an active write.
             return
-        inner_close = getattr(self.inner, "close", None)
-        if callable(inner_close):
-            try:
-                inner_close()
-            except Exception as exc:
-                try:
-                    self.on_failure(
-                        "logging.destination_close",
-                        exc,
-                        destination=getattr(self.inner, "name", None),
-                    )
-                except Exception:
-                    pass
+        close_destination(self.inner, on_failure=self.on_failure)
 
     def _record_drop(
         self,
@@ -278,20 +285,16 @@ class QueuedLogDestination:
         log_type: str,
         exc: BaseException | None = None,
     ) -> None:
-        self._dropped += 1
-        count = self._dropped
-        if count != 1 and count % self.drop_report_interval != 0:
+        count = self._drops.tick()
+        if count is None:
             return
-        try:
-            self.on_failure(
-                "logging.queue_drop",
-                exc
-                or RuntimeError("Observability log queue dropped a record."),
-                destination=self.name,
-                log_type=log_type,
-                reason=reason,
-                dropped_total=count,
-                queue_maxsize=self.maxsize,
-            )
-        except Exception:
-            pass
+        safe_report(
+            self.on_failure,
+            "logging.queue_drop",
+            exc or RuntimeError("Observability log queue dropped a record."),
+            destination=self.name,
+            log_type=log_type,
+            reason=reason,
+            dropped_total=count,
+            queue_maxsize=self.maxsize,
+        )

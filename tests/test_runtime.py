@@ -1166,14 +1166,6 @@ def test_from_env_invalid_shutdown_timeout_falls_back(monkeypatch) -> None:
     assert config.shutdown_timeout_seconds == 3.0
 
 
-def test_from_env_reads_google_write_timeout(monkeypatch) -> None:
-    monkeypatch.setenv("OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", "2.5")
-
-    config = ObservabilityConfig.from_env(service_name="svc")
-
-    assert config.google_cloud_write_timeout_seconds == 2.5
-
-
 def test_from_env_reads_stdout_format(monkeypatch) -> None:
     monkeypatch.setenv("OBSERVABILITY_STDOUT_FORMAT", "google")
 
@@ -1200,14 +1192,6 @@ def test_from_env_queue_knobs_fall_back_on_garbage(monkeypatch) -> None:
 
     assert config.log_queue_maxsize == 1000
     assert config.log_queue_close_timeout_seconds == 2.0
-
-
-def test_from_env_google_write_timeout_defaults(monkeypatch) -> None:
-    monkeypatch.setenv("OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS", "bad")
-
-    config = ObservabilityConfig.from_env(service_name="svc")
-
-    assert config.google_cloud_write_timeout_seconds == 10.0
 
 
 def test_from_env_enables_otel_by_default() -> None:
@@ -1553,6 +1537,51 @@ def test_restart_log_destinations_rebuilds_from_config() -> None:
     assert len(rebuilt) == 1
     assert rebuilt[0] is not first
     assert observed.log_destination_manager.configured is True
+
+
+def test_restart_log_destinations_noops_when_disabled(monkeypatch) -> None:
+    """The kill switch must hold across forks and snapshot restores:
+    a disabled runtime's restart must not build destinations."""
+    observed = runtime(enabled=False)
+    configure_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "configure",
+        lambda: configure_calls.append(True),
+    )
+
+    observed.restart_log_destinations()
+
+    assert configure_calls == []
+
+
+def test_shutdown_survives_destination_close_failure(monkeypatch) -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    observed = runtime(shutdown_timeout_seconds=1.0)
+    provider = Provider()
+    observed.tracer_provider = provider
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+
+    def broken_close(deadline=None):
+        raise RuntimeError("close exploded")
+
+    monkeypatch.setattr(
+        observed.log_destination_manager, "close", broken_close
+    )
+
+    observed.shutdown()
+
+    assert provider.shutdown_called
+    assert "logging.destination_close" in failures
 
 
 def test_configure_otel_creates_real_providers_and_instruments() -> None:

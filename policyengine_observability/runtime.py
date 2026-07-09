@@ -1076,7 +1076,7 @@ class ObservabilityRuntime:
             self.config.shutdown_timeout_seconds,
             low=0.0,
             high=60.0,
-            default=3.0,
+            default=ObservabilityConfig.shutdown_timeout_seconds,
         )
         providers = [
             ("trace", self.tracer_provider),
@@ -1137,7 +1137,12 @@ class ObservabilityRuntime:
         traffic. There is deliberately no locking here: under that
         contract there is no concurrency, and a violated contract costs
         at most a counted drop into a closing destination.
+
+        A no-op when observability is disabled, mirroring configure():
+        the kill switch must hold across forks and snapshot restores.
         """
+        if not self.enabled:
+            return
         self.log_destination_manager.configure()
 
     def log_observability_failure(

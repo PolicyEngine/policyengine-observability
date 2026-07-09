@@ -5,7 +5,7 @@ from .google_cloud_logging import GoogleCloudLoggingDestination
 from .manager import LogDestinationManager
 from .queued import QueuedLogDestination
 from .registry import register_destination
-from .stdout import StdoutJsonDestination
+from .stdout import StdoutJsonDestination, register_stdout_formatter
 
 __all__ = [
     "GoogleCloudLoggingDestination",
@@ -15,4 +15,5 @@ __all__ = [
     "StdoutJsonDestination",
     "normalize_payload",
     "register_destination",
+    "register_stdout_formatter",
 ]

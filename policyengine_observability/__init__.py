@@ -4,7 +4,8 @@ from typing import Any
 
 from .config import ObservabilityConfig
 from .context import OperationObservabilityContext, RequestObservabilityContext
-from .google_credentials import (
+from .destinations import register_destination, register_stdout_formatter
+from .destinations.google_credentials import (
     configure_google_application_credentials,
     load_google_credentials,
 )
@@ -178,6 +179,8 @@ __all__ = [
     "operation",
     "record_error",
     "record_event",
+    "register_destination",
+    "register_stdout_formatter",
     "restart_observability",
     "segment",
     "set_attribute",

@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .base import normalize_payload
+from .base import normalize_name, normalize_payload, safe_report
 from .registry import register_destination
 
 # A stdout formatter shapes the normalized payload into the JSON line a
@@ -22,12 +22,26 @@ _FORMATTER_FACTORIES: dict[str, StdoutFormatterFactory] = {}
 def register_stdout_formatter(
     name: str, factory: StdoutFormatterFactory
 ) -> None:
-    _FORMATTER_FACTORIES[name.strip().lower()] = factory
+    _FORMATTER_FACTORIES[normalize_name(name)] = factory
 
 
-def resolve_stdout_formatter(config: Any) -> StdoutFormatter:
-    name = (getattr(config, "stdout_format", None) or "plain").strip().lower()
-    factory = _FORMATTER_FACTORIES.get(name) or _FORMATTER_FACTORIES["plain"]
+def resolve_stdout_formatter(
+    config: Any,
+    on_failure: Callable[..., None] | None = None,
+) -> StdoutFormatter:
+    raw = getattr(config, "stdout_format", None) or "plain"
+    factory = _FORMATTER_FACTORIES.get(normalize_name(raw))
+    if factory is None:
+        # Falling back must not lose the record, but a typo'd format
+        # name should not pass silently either — the agent-native shape
+        # it named would just quietly never appear.
+        if on_failure is not None:
+            safe_report(
+                on_failure,
+                "logging.stdout_format",
+                ValueError(f"Unknown stdout format {raw!r}; using plain."),
+            )
+        factory = _FORMATTER_FACTORIES["plain"]
     return factory(config)
 
 
@@ -85,12 +99,25 @@ class StdoutJsonDestination:
             logger.info(message)
 
 
-def _stdout_factory(*, config: Any, loggers: Any, serializer: Any, **_: Any):
+def build_stdout_destination(
+    *,
+    config: Any,
+    loggers: Any,
+    serializer: Any,
+    on_failure: Callable[..., None] | None = None,
+    **_: Any,
+) -> StdoutJsonDestination:
+    """The one place a configured stdout destination is assembled.
+
+    Used both as the registered ``stdout`` strategy factory and by the
+    manager's fail-open fallback, so formatter resolution can never
+    diverge between the two paths.
+    """
     return StdoutJsonDestination(
         loggers=loggers,
         serializer=serializer,
-        formatter=resolve_stdout_formatter(config),
+        formatter=resolve_stdout_formatter(config, on_failure=on_failure),
     )
 
 
-register_destination("stdout", _stdout_factory, transport="inline")
+register_destination("stdout", build_stdout_destination, transport="inline")
