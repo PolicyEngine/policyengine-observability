@@ -19,7 +19,7 @@ from policyengine_observability import (
 from policyengine_observability import runtime as runtime_module
 from policyengine_observability.config import DEFAULT_METRIC_ATTRIBUTE_KEYS
 from policyengine_observability.destinations import (
-    manager as destination_manager_module,
+    google_cloud_logging as google_cloud_logging_module,
 )
 
 
@@ -1166,6 +1166,34 @@ def test_from_env_invalid_shutdown_timeout_falls_back(monkeypatch) -> None:
     assert config.shutdown_timeout_seconds == 3.0
 
 
+def test_from_env_reads_stdout_format(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_STDOUT_FORMAT", "google")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.stdout_format == "google"
+
+
+def test_from_env_reads_queue_knobs(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_MAXSIZE", "50")
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS", "1.5")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.log_queue_maxsize == 50
+    assert config.log_queue_close_timeout_seconds == 1.5
+
+
+def test_from_env_queue_knobs_fall_back_on_garbage(monkeypatch) -> None:
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_MAXSIZE", "many")
+    monkeypatch.setenv("OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS", "soon")
+
+    config = ObservabilityConfig.from_env(service_name="svc")
+
+    assert config.log_queue_maxsize == 1000
+    assert config.log_queue_close_timeout_seconds == 2.0
+
+
 def test_from_env_enables_otel_by_default() -> None:
     config = ObservabilityConfig.from_env(service_name="svc")
 
@@ -1409,6 +1437,151 @@ def test_shutdown_logs_provider_failures_and_timeout() -> None:
 
     assert "otel.trace_shutdown" in failures
     assert "otel.shutdown_timeout" in failures
+
+
+def test_shutdown_closes_destinations_with_full_budget_and_no_thread(
+    monkeypatch,
+) -> None:
+    observed = runtime(shutdown_timeout_seconds=2.0)
+    close_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "close",
+        lambda deadline=None: close_calls.append(deadline),
+    )
+
+    def fail_thread(*args, **kwargs):
+        raise AssertionError(
+            "no watchdog thread should exist without providers"
+        )
+
+    monkeypatch.setattr(runtime_module.threading, "Thread", fail_thread)
+
+    observed.shutdown()
+
+    assert close_calls == [2.0]
+
+
+def test_shutdown_destination_deadline_fits_inside_provider_budget(
+    monkeypatch,
+) -> None:
+    """The prior design gave the log flush a deadline larger than the
+    join bounding it, starving provider shutdown; the deadline must be
+    derived from (and smaller than) the shutdown budget."""
+
+    class Provider:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    observed = runtime(shutdown_timeout_seconds=2.0)
+    provider = Provider()
+    observed.tracer_provider = provider
+    close_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "close",
+        lambda deadline=None: close_calls.append(deadline),
+    )
+
+    observed.shutdown()
+
+    assert close_calls == [1.0]
+    assert provider.shutdown_called
+
+
+def test_shutdown_slow_destination_close_still_runs_providers() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    observed = runtime(shutdown_timeout_seconds=0.2)
+    provider = Provider()
+    observed.tracer_provider = provider
+    observed.log_destination_manager.close = lambda deadline=None: time.sleep(
+        0.05
+    )
+
+    observed.shutdown()
+
+    assert provider.shutdown_called
+
+
+def test_shutdown_clamps_pathological_budget(monkeypatch) -> None:
+    observed = runtime(shutdown_timeout_seconds=float("inf"))
+    close_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "close",
+        lambda deadline=None: close_calls.append(deadline),
+    )
+
+    observed.shutdown()
+
+    assert close_calls == [3.0]
+
+
+def test_restart_log_destinations_rebuilds_from_config() -> None:
+    observed = runtime(otel_enabled=False)
+    observed.configure()
+    first = observed.log_destination_manager.destinations[0]
+
+    observed.restart_log_destinations()
+
+    rebuilt = observed.log_destination_manager.destinations
+    assert len(rebuilt) == 1
+    assert rebuilt[0] is not first
+    assert observed.log_destination_manager.configured is True
+
+
+def test_restart_log_destinations_noops_when_disabled(monkeypatch) -> None:
+    """The kill switch must hold across forks and snapshot restores:
+    a disabled runtime's restart must not build destinations."""
+    observed = runtime(enabled=False)
+    configure_calls = []
+    monkeypatch.setattr(
+        observed.log_destination_manager,
+        "configure",
+        lambda: configure_calls.append(True),
+    )
+
+    observed.restart_log_destinations()
+
+    assert configure_calls == []
+
+
+def test_shutdown_survives_destination_close_failure(monkeypatch) -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.shutdown_called = False
+
+        def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    observed = runtime(shutdown_timeout_seconds=1.0)
+    provider = Provider()
+    observed.tracer_provider = provider
+    failures = []
+    observed.log_observability_failure = lambda operation, exc, **fields: (
+        failures.append(operation)
+    )
+
+    def broken_close(deadline=None):
+        raise RuntimeError("close exploded")
+
+    monkeypatch.setattr(
+        observed.log_destination_manager, "close", broken_close
+    )
+
+    observed.shutdown()
+
+    assert provider.shutdown_called
+    assert "logging.destination_close" in failures
 
 
 def test_configure_otel_creates_real_providers_and_instruments() -> None:
@@ -1901,7 +2074,7 @@ def test_google_destination_init_failure_falls_back_to_stdout(
         raise ImportError("google-cloud-logging missing")
 
     monkeypatch.setattr(
-        destination_manager_module,
+        google_cloud_logging_module,
         "GoogleCloudLoggingDestination",
         fail_google_destination,
     )
@@ -1928,7 +2101,7 @@ def test_disabled_configure_does_not_initialize_log_destinations(
         raise AssertionError("google destination should not initialize")
 
     monkeypatch.setattr(
-        destination_manager_module,
+        google_cloud_logging_module,
         "GoogleCloudLoggingDestination",
         fail_google_destination,
     )

@@ -84,9 +84,11 @@ def test_public_decorators_support_sync_and_async_functions() -> None:
     observability.instrument_httpx()
     observability.shutdown_tracing()
     observability.shutdown_observability()
+    observability.restart_observability()
 
     assert runtime.operation_duration.calls
     assert runtime.segment_duration.calls
+    assert runtime.log_destination_manager.configured is True
 
 
 def test_setting_public_runtime_clears_stale_context() -> None:
@@ -117,3 +119,8 @@ def test_public_async_segment_and_collect_timings_wrappers() -> None:
         return timings
 
     assert "load_ms" in asyncio.run(run())
+
+
+def test_registration_hooks_are_exported_at_top_level() -> None:
+    assert callable(observability.register_destination)
+    assert callable(observability.register_stdout_formatter)

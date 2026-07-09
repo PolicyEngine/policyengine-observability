@@ -24,6 +24,7 @@ from .context import (
     _metric_attrs,
 )
 from .destinations import LogDestinationManager
+from .destinations.base import clamped
 from .logging import configure_plain_logger
 from .segments import coerce_segment_name
 
@@ -1071,6 +1072,12 @@ class ObservabilityRuntime:
             self.log_observability_failure("httpx.auto_instrument", exc)
 
     def shutdown(self) -> None:
+        budget = clamped(
+            self.config.shutdown_timeout_seconds,
+            low=0.0,
+            high=60.0,
+            default=ObservabilityConfig.shutdown_timeout_seconds,
+        )
         providers = [
             ("trace", self.tracer_provider),
             ("metrics", self.meter_provider),
@@ -1080,8 +1087,20 @@ class ObservabilityRuntime:
             for name, provider in providers
             if provider is not None
         ]
+        # Destination close is inherently deadline-bounded, so it runs
+        # inline and first, with a deadline that leaves room for the
+        # provider flush when there is one. Everything below fits inside
+        # the one shutdown budget by construction.
+        started = time.monotonic()
+        try:
+            self.log_destination_manager.close(
+                budget / 2 if providers else budget
+            )
+        except BaseException as exc:
+            self.log_observability_failure("logging.destination_close", exc)
         if not providers:
             return
+        remaining = max(0.0, budget - (time.monotonic() - started))
 
         def flush() -> None:
             for name, provider in providers:
@@ -1099,16 +1118,32 @@ class ObservabilityRuntime:
             daemon=True,
         )
         thread.start()
-        thread.join(timeout=self.config.shutdown_timeout_seconds)
+        thread.join(timeout=remaining)
         if thread.is_alive():
             self.log_observability_failure(
                 "otel.shutdown_timeout",
                 TimeoutError("OpenTelemetry shutdown timed out."),
-                timeout_seconds=self.config.shutdown_timeout_seconds,
+                timeout_seconds=remaining,
             )
 
     def shutdown_tracing(self) -> None:
         self.shutdown()
+
+    def restart_log_destinations(self) -> None:
+        """Close and rebuild log destinations from configuration.
+
+        Call ONLY from single-threaded lifecycle moments — a
+        post-snapshot-restore hook, a post-fork hook, before serving
+        traffic. There is deliberately no locking here: under that
+        contract there is no concurrency, and a violated contract costs
+        at most a counted drop into a closing destination.
+
+        A no-op when observability is disabled, mirroring configure():
+        the kill switch must hold across forks and snapshot restores.
+        """
+        if not self.enabled:
+            return
+        self.log_destination_manager.configure()
 
     def log_observability_failure(
         self,

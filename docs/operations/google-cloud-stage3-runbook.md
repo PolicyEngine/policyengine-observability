@@ -100,7 +100,12 @@ the services being deployed.
 Use these variables for deployed Cloud Run and Modal environments:
 
 ```bash
-OBSERVABILITY_LOG_DESTINATIONS=google_cloud_logging
+# Cloud Run: the agent ingests stdout, no direct writes needed.
+OBSERVABILITY_LOG_PROFILE=gcp-agent
+OBSERVABILITY_GOOGLE_CLOUD_PROJECT=<observability-project-id>
+
+# Modal: stdout plus queued direct Cloud Logging writes.
+OBSERVABILITY_LOG_PROFILE=gcp-direct
 OBSERVABILITY_GOOGLE_CLOUD_PROJECT=<observability-project-id>
 OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME=<observability-log-name>
 OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER=projects/<observability-project-number>/locations/global/workloadIdentityPools/<modal-pool-id>/providers/<modal-provider-id>
@@ -170,10 +175,11 @@ jsonPayload.event="observability_internal_error"
 
 ## Rollback
 
-For a failing runtime, set:
+For a failing runtime, set the kill switch — plain stdout only, with all
+background log machinery disabled:
 
 ```bash
-OBSERVABILITY_LOG_DESTINATIONS=stdout
+OBSERVABILITY_LOG_PROFILE=plain-sync
 ```
 
 To restore the temporary bridge destination, set:

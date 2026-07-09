@@ -7,9 +7,11 @@ import tempfile
 
 import pytest
 
-from policyengine_observability import google_credentials
-from policyengine_observability.destinations import google_cloud_logging
-from policyengine_observability.google_credentials import (
+from policyengine_observability.destinations import (
+    google_cloud_logging,
+    google_credentials,
+)
+from policyengine_observability.destinations.google_credentials import (
     configure_google_application_credentials,
     load_google_credentials,
 )
@@ -96,7 +98,7 @@ def test_configure_google_application_credentials_fails_open_on_unexpected_error
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
     monkeypatch.setenv("GCP_CREDENTIALS_JSON", '{"project_id":"test"}')
     monkeypatch.setattr(
-        "policyengine_observability.google_credentials.json.loads",
+        "policyengine_observability.destinations.google_credentials.json.loads",
         lambda _value: (_ for _ in ()).throw(RuntimeError("boom")),
     )
 
