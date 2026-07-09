@@ -453,6 +453,63 @@ def test_stdout_broken_formatter_degrades_to_unformatted() -> None:
     assert _emitted_line(logger) == {"event": "x"}
 
 
+def test_stdout_broken_formatter_factory_degrades_to_plain() -> None:
+    from policyengine_observability.destinations.stdout import (
+        _FORMATTER_FACTORIES,
+        register_stdout_formatter,
+    )
+
+    def broken_factory(config):
+        raise RuntimeError("factory bug")
+
+    register_stdout_formatter("broken-test", broken_factory)
+    try:
+        failures = []
+        formatter = resolve_stdout_formatter(
+            ObservabilityConfig(stdout_format="broken-test"),
+            on_failure=lambda operation, exc, **fields: failures.append(
+                (operation, fields)
+            ),
+        )
+    finally:
+        _FORMATTER_FACTORIES.pop("broken_test", None)
+
+    formatted = formatter({"event": "x"}, log_type="event", severity="INFO")
+
+    assert formatted == {"event": "x"}
+    assert len(failures) == 1
+    assert failures[0][0] == "logging.stdout_format"
+    assert failures[0][1]["stdout_format"] == "broken-test"
+
+
+def test_configure_fallback_survives_broken_formatter_factory() -> None:
+    """The crash path: no destination builds, so the manager's
+    last-resort stdout fallback resolves the same broken formatter —
+    configure must stay fail-open and emit must still write plain."""
+    from policyengine_observability.destinations.stdout import (
+        _FORMATTER_FACTORIES,
+        register_stdout_formatter,
+    )
+
+    def broken_factory(config):
+        raise RuntimeError("factory bug")
+
+    register_stdout_formatter("broken-test", broken_factory)
+    try:
+        config = ObservabilityConfig(
+            log_destinations=("nonexistent",), stdout_format="broken-test"
+        )
+        logger = RecordingLogger()
+        manager, _failures = make_manager(config, loggers={"event": logger})
+
+        manager.configure()  # raised before the resolver guard existed
+        manager.emit({"event": "x"}, log_type="event", severity="INFO")
+    finally:
+        _FORMATTER_FACTORIES.pop("broken_test", None)
+
+    assert _emitted_line(logger) == {"event": "x", "severity": "INFO"}
+
+
 def test_stdout_google_formatter_never_mutates_caller_payload() -> None:
     config = ObservabilityConfig(
         stdout_format="google", google_cloud_project="proj"

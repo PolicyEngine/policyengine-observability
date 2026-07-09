@@ -42,7 +42,22 @@ def resolve_stdout_formatter(
                 ValueError(f"Unknown stdout format {raw!r}; using plain."),
             )
         factory = _FORMATTER_FACTORIES["plain"]
-    return factory(config)
+    try:
+        return factory(config)
+    except Exception as exc:
+        # Stdout is the fail-open record, and this resolver also runs on
+        # the manager's last-resort fallback path: a registered factory
+        # that raises must degrade to the built-in plain formatter (not
+        # the registry entry, which could be the broken one), never
+        # break configure or startup.
+        if on_failure is not None:
+            safe_report(
+                on_failure,
+                "logging.stdout_format",
+                exc,
+                stdout_format=raw,
+            )
+        return _plain_formatter_factory(config)
 
 
 def _plain_formatter_factory(config: Any) -> StdoutFormatter:

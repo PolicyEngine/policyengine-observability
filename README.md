@@ -68,7 +68,9 @@ construction (so it is re-read on `restart_observability()`) rather
 than through a core config field. Name lookups for destinations,
 formatters, and profiles all forgive case, whitespace, and
 hyphen/underscore variance; an unknown format name falls back to plain
-and is reported through the internal-error channel.
+and is reported through the internal-error channel, and a registered
+formatter factory that raises degrades to the built-in plain formatter
+the same way rather than breaking configuration.
 
 ## Log emission and delivery semantics
 
