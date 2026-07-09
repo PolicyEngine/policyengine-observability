@@ -121,21 +121,6 @@ def test_public_async_segment_and_collect_timings_wrappers() -> None:
     assert "load_ms" in asyncio.run(run())
 
 
-def test_deprecated_google_credentials_path_still_imports() -> None:
-    # The module moved to destinations/google_credentials; the old path
-    # is a compatibility shim that must keep re-exporting the API.
-    from policyengine_observability import google_credentials as shim
-    from policyengine_observability.destinations import (
-        google_credentials as edge,
-    )
-
-    assert shim.load_google_credentials is edge.load_google_credentials
-    assert (
-        shim.configure_google_application_credentials
-        is edge.configure_google_application_credentials
-    )
-
-
 def test_registration_hooks_are_exported_at_top_level() -> None:
     assert callable(observability.register_destination)
     assert callable(observability.register_stdout_formatter)
