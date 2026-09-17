@@ -27,8 +27,17 @@ uv run --extra dev towncrier check --compare-with origin/main
   configuration.
 - `policyengine_observability/context.py` defines request and operation log
   payload structures.
-- `policyengine_observability/runtime.py` owns context management, segments,
-  structured logs, metrics, traces, events, and fail-open behavior.
+- `policyengine_observability/runtime.py` preserves the public runtime API,
+  configures the components, and coordinates their shutdown.
+- `policyengine_observability/_state.py` owns shared context variables.
+- `policyengine_observability/_operations.py` and `_requests.py` manage
+  operation and request lifecycles, respectively.
+- `policyengine_observability/segments.py` manages segment naming, nesting,
+  and timing.
+- `policyengine_observability/logging.py` emits structured logs and records
+  observability failures without interrupting application operations.
+- `policyengine_observability/_metrics.py` and `_tracing.py` record metrics
+  and manage OpenTelemetry traces, respectively.
 - `policyengine_observability/adapters/` contains framework adapters such as
   Flask and FastAPI.
 - `policyengine_observability/integrations/` contains optional integrations
@@ -57,9 +66,11 @@ uv run --extra dev towncrier check --compare-with origin/main
 
 ## Testing
 
-Add focused tests for runtime context behavior and failure paths whenever
-changing `runtime.py`. Adapter changes should include framework-level tests that
-exercise request setup, response headers, error paths, and teardown behavior.
+Add focused tests for context behavior and failure paths whenever changing
+the runtime or its components. The corresponding `tests/test_runtime_*.py`
+modules cover operations, requests, segments, log emission, and tracing.
+Adapter changes should include framework-level tests that exercise request
+setup, response headers, error paths, and teardown behavior.
 
 Release automation changes should include tests for the helper scripts when the
 logic is non-trivial.
