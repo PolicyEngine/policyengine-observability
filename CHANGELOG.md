@@ -1,3 +1,10 @@
+## [1.4.1] - 2026-09-17
+
+### Changed
+
+- Organize the observability runtime by request, operation, segment, logging, metrics, and tracing responsibilities without changing its public API.
+
+
 ## [1.4.0] - 2026-07-09
 
 ### Added
