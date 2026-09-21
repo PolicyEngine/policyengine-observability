@@ -66,6 +66,12 @@ Grant only the roles listed in [`iam.yaml`](iam.yaml). The collector receives
 existing Cloud Run identities in the inventory receive collector invocation
 permission on the collector service only.
 
+Remove project-level `roles/logging.logWriter` bindings from every identity
+outside this inventory. Source-project logging service agents use conditional
+`roles/logging.bucketWriter` access to the named analytics bucket and do not
+receive project-level log write access. `verify.sh` fails when another
+project-level log writer is present.
+
 Create a separate `modal-api-v1` workload identity pool and provider using the
 issuer, audience, mappings, workspace, environment, and application condition
 in `iam.yaml`. Do not modify the existing `modal/modal` provider during this
@@ -179,3 +185,30 @@ verify the environment restriction, then delete that environment.
 
 Rollback does not modify the existing `modal/modal` provider or any excluded
 application deployment.
+
+## Deployment record
+
+The infrastructure portion of this runbook was applied and verified on
+2026-09-22:
+
+- the global `policyengine-observability` log bucket retains records for 30
+  days and has log analytics enabled;
+- exact source-project sinks route the two API services and the two simulation
+  entry services to that bucket;
+- the authenticated collector runs in `us-central1` as
+  `policyengine-api-v1-otel-collector`;
+- the dedicated `modal-api-v1` identity provider is active with the workspace,
+  environment, and application conditions in `iam.yaml`;
+- the only project-level `roles/logging.logWriter` identity is
+  `policyengine-api-v1-modal`;
+- the dashboard and six alert policies are present and enabled; and
+- the project currently has no alert notification channel, so the policies
+  record incidents without sending email, Slack, or paging notifications.
+
+The package and consumer service rollout remains pending until the three draft
+pull requests are reviewed, the package is published as version 2.0, and the
+temporary Git source pins in both consumer repositories are replaced with the
+published version. Run the synthetic cross-service request, volume and cost
+measurement, and destination comparison after those deployments. Record the
+deployed revisions and the observation interval here before declaring the
+consumer rollout complete.

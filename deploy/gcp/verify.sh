@@ -20,6 +20,18 @@ gcloud projects get-iam-policy "${project}" \
   --filter='bindings.role:roles/telemetry.writer OR bindings.role:roles/serviceusage.serviceUsageConsumer OR bindings.role:roles/logging.logWriter' \
   --format='table(bindings.role,bindings.members)'
 
+log_writers="$(
+  gcloud projects get-iam-policy "${project}" \
+    --flatten='bindings[].members' \
+    --filter='bindings.role=roles/logging.logWriter' \
+    --format='value(bindings.members)'
+)"
+expected_log_writer='serviceAccount:policyengine-api-v1-modal@policyengine-observability.iam.gserviceaccount.com'
+if [[ "${log_writers}" != "${expected_log_writer}" ]]; then
+  echo "Unexpected project-level Cloud Logging writers: ${log_writers}" >&2
+  exit 1
+fi
+
 gcloud logging views get-iam-policy _AllLogs \
   --bucket=policyengine-observability \
   --location=global \
