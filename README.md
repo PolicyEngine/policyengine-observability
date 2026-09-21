@@ -1,188 +1,262 @@
 # policyengine-observability
 
-Shared PolicyEngine observability runtime for fail-open local timings,
-structured logs, OpenTelemetry traces, and OpenTelemetry metrics.
+`policyengine-observability` provides structured application logs,
+OpenTelemetry traces and metrics, request propagation, and framework request
+instrumentation for PolicyEngine services.
 
-The package intentionally keeps framework support in adapters:
+Version 2 has one explicit ownership model: `configure(config)` returns a
+runtime, and every adapter or manual operation receives that runtime. The
+package does not install a mutable global runtime, infer a remote destination,
+or contact a remote service during configuration.
 
-- `policyengine_observability.adapters.flask`
-- `policyengine_observability.adapters.fastapi`
-- `policyengine_observability.integrations.httpx`
+## Install
 
-OpenTelemetry support is installed and enabled by default. Timing and
-structured logging run even without an OTLP collector; when no endpoint is
-configured, spans and metrics stay in-process while logs still receive trace
-context. Set `OTEL_ENABLED=false` to opt out. Configure
-`OTEL_EXPORTER_OTLP_ENDPOINT` to export traces and metrics.
-
-## Log routing profiles
-
-Log routing is owned by this package: consumers set one env var and the
-package expands it into destinations, formats, and transport.
+Install only the integrations used by the service:
 
 ```bash
-OBSERVABILITY_LOG_PROFILE=gcp-agent   # or gcp-direct | plain-sync | auto
+pip install "policyengine-observability[otel,otlp-grpc]"
+pip install "policyengine-observability[flask,httpx,google]"
+pip install "policyengine-observability[fastapi,httpx,google]"
 ```
 
-- `gcp-agent` — google-format stdout only, for platforms whose logging
-  agent ingests stdout (Cloud Run, GKE). Fully synchronous, zero
-  threads; the agent ships lines to Cloud Logging with severity, trace,
-  span, and labels promoted to first-class LogEntry fields.
-- `gcp-direct` — plain stdout (the durable record) plus queued direct
-  Cloud Logging writes, for platforms with no ingesting agent (Modal).
-  Requires a resolvable Google Cloud project; downgrades to `plain-sync`
-  with a warning otherwise.
-- `plain-sync` — plain stdout only, guaranteed zero threads. Local
-  development and the kill switch: setting it disables all background
-  log machinery.
-- `auto` (default) — detects the platform via `OBSERVABILITY_PLATFORM`
-  (`google_cloud_run`/`modal`), then `K_SERVICE`, then Modal env
-  markers; when nothing matches, caller-supplied defaults apply.
+The base package has no required dependencies. OpenTelemetry, OTLP exporters,
+Google authentication and logging, and web frameworks are optional extras and
+are imported only when configured or called.
 
-The granular controls still exist underneath and override the profile's
-expansion when set explicitly:
+## Configure a runtime
+
+Service and deployment identity are always explicit. Standard OpenTelemetry
+environment variables may supply OTLP transport settings.
+
+```python
+from policyengine_observability import (
+    DeploymentIdentity,
+    ObservabilityConfig,
+    ServiceIdentity,
+    configure,
+)
+
+config = ObservabilityConfig.from_env(
+    service=ServiceIdentity(
+        name="policyengine-api",
+        namespace="policyengine.api-v1",
+        version="1.2.3",
+        role="api",
+    ),
+    deployment=DeploymentIdentity(
+        environment="production",
+        platform="google_cloud_run",
+        region="us-central1",
+    ),
+    google_cloud_project_id="policyengine-observability",
+)
+runtime = configure(config)
+```
+
+Cloud Run writes one-line JSON to standard output. It does not use the Cloud
+Logging API from the application process. When no OTLP endpoint is configured,
+the runtime retains local trace context for log correlation and creates no
+remote exporter.
+
+The supported OTel environment settings include:
 
 ```bash
-OBSERVABILITY_LOG_DESTINATIONS=stdout,google_cloud_logging
-OBSERVABILITY_STDOUT_FORMAT=google
-OBSERVABILITY_GOOGLE_CLOUD_PROJECT=policyengine-api
-OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME=policyengine-observability
+OTEL_EXPORTER_OTLP_ENDPOINT=https://COLLECTOR_HOST
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+OTEL_TRACES_SAMPLER_ARG=1.0
+POLICYENGINE_OTEL_GOOGLE_AUDIENCE=https://COLLECTOR_HOST
 ```
 
-Destinations are named strategies: `stdout` is `inline` (synchronous on
-the caller's thread), and every `remote` strategy — `google_cloud_logging`
-today; future backends register the same way — is automatically wrapped
-in the queued transport below. Google Cloud Logging uses Application
-Default Credentials and requires permission to create log entries,
-typically through `roles/logging.logWriter`.
+## Flask and FastAPI
 
-Backends plug in through two top-level hooks, `register_destination`
-(with `transport="inline"|"remote"` and an optional `required_config`
-tuple naming the config fields the strategy needs — profiles that name
-the strategy downgrade gracefully when one is missing) and
-`register_stdout_formatter`. Registration happens at import time, so an
-external backend module must be imported before observability is
-configured. Backend-specific knobs are the strategy's own: the Google
-strategy reads `OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS` itself at
-construction (so it is re-read on `restart_observability()`) rather
-than through a core config field. Name lookups for destinations,
-formatters, and profiles all forgive case, whitespace, and
-hyphen/underscore variance; an unknown format name falls back to plain
-and is reported through the internal-error channel, and a registered
-formatter factory that raises degrades to the built-in plain formatter
-the same way rather than breaking configuration.
+Install a framework adapter once while constructing the application. Routes
+do not need observability decorators.
 
-## Log emission and delivery semantics
+```python
+from flask import Flask
+from policyengine_observability import instrument_flask
 
-Remote destinations never write on a request thread. The log call only
-snapshots the payload, stamps the enqueue time, and appends to a bounded
-in-memory queue (microseconds, never blocks, never raises); a stdlib
-`QueueListener` thread drains the queue and performs the writes, sending
-the enqueue time as the entry timestamp so delayed writes keep their
-event time.
-
-Delivery through the queue is best-effort by design — stdout is the
-durable sibling record. When the queue is full the newest record is
-dropped, and drops are counted and reported through the internal-error
-channel (first drop, then every 100th). Write failures are likewise
-reported and the record dropped; there is deliberately no breaker or
-retry queue in the transport. Each Google write carries an explicit
-budget that caps the call and its transient-error retries:
-
-```bash
-OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS=10.0
-OBSERVABILITY_LOG_QUEUE_MAXSIZE=1000
-OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS=2.0
+app = Flask(__name__)
+instrument_flask(app, runtime)
 ```
 
-(The bounded write rebinds the client's private gapic method at
-construction; when that handle is unavailable — HTTP transports,
-injected fakes — the library's ~60s default applies, which is harmless
-off the request path. All numeric knobs are clamped, so `0`, negative,
-or non-finite values can never disable or unbound a mechanism. The
-Google client library's one-time instrumentation diagnostic entry is
-suppressed at construction, so the stream carries only the records the
-service asked to write.)
+```python
+from fastapi import FastAPI
+from policyengine_observability import instrument_fastapi
 
-Shutdown closes log destinations inside the same bounded budget that
-flushes OpenTelemetry (`OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS`); a
-queue that cannot drain before its deadline is abandoned with a report.
-A hard kill loses whatever was still queued. Note the google stdout
-format sets no `time` key: stdout emission is synchronous, so the
-agent's receive time is the correct event time.
-
-Processes that fork or restore from memory snapshots do not preserve
-threads or network clients. Call `restart_observability()` from the
-post-restore or post-fork hook (for example gunicorn `post_fork` when
-using `--preload`, or a Modal post-snapshot hook) — it closes and
-rebuilds destinations from configuration, and must only be called from
-single-threaded lifecycle moments, before serving traffic. It is a
-no-op when observability is disabled, so the kill switch holds across
-forks and restores.
-
-Request and operation logs include two timing views:
-
-- `timings_ms` and `timing_counts` are flat inclusive aggregates by segment
-  name, intended for quick scanning and compatibility with existing log
-  queries.
-- `segment_tree` is an ordered nested view of segment occurrences. Repeated
-  sibling segments are preserved as separate entries, and safe scalar segment
-  attributes are included so callers can distinguish settings such as
-  `simulation_kind=baseline` versus `simulation_kind=reform`.
-
-Core structured log fields take precedence over caller-provided attributes with
-the same keys.
-
-On runtimes that do not provide Application Default Credentials, set
-`GCP_CREDENTIALS_JSON` to a service account JSON document. The Google Cloud
-Logging destination will materialize it into a temporary credentials file and
-pass those credentials directly to the Google client. If the credential
-bootstrap fails, observability fails open and continues without raising into
-application code.
-
-Prefer OIDC-based Workload Identity Federation over long-lived service account
-keys when the runtime can provide an OIDC subject token. Modal injects
-generated identity tokens into Function containers through
-`MODAL_IDENTITY_TOKEN`; other runtimes can provide
-`OBSERVABILITY_GOOGLE_OIDC_TOKEN`. The runtime needs these values:
-
-```bash
-OBSERVABILITY_GOOGLE_OIDC_TOKEN=OIDC_TOKEN_FROM_RUNTIME
-OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER=projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID
-OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL=observability-writer@PROJECT_ID.iam.gserviceaccount.com
-OBSERVABILITY_GOOGLE_CLOUD_PROJECT=PROJECT_ID
+app = FastAPI()
+instrument_fastapi(app, runtime)
 ```
 
-When `MODAL_IDENTITY_TOKEN` or `OBSERVABILITY_GOOGLE_OIDC_TOKEN` is present
-alongside `OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER`, the Google Cloud
-Logging destination writes a temporary external-account credential
-configuration and passes those credentials directly to the Cloud Logging
-client. If `OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL` is present, the
-configuration uses service account impersonation. This keeps observability
-credentials separate from any application-level `GOOGLE_APPLICATION_CREDENTIALS`
-or `GCP_CREDENTIALS_JSON` used by the service for other Google clients.
+Both adapters extract W3C trace context and
+`X-PolicyEngine-Request-Id`, create one server span, emit one completion
+record, record request metrics, and clear context-local state. Repeated calls
+reuse the first runtime associated with the application.
 
-The Google Cloud setup needs:
+## Manual operations and spans
 
-- A Workload Identity Pool and OIDC provider whose issuer matches Modal's OIDC
-  issuer, `https://oidc.modal.com`.
-- Attribute mapping for the Modal token claims you want to authorize, such as
-  `google.subject=assertion.sub`.
-- A service account with `roles/logging.logWriter` on the log project.
-- An IAM binding granting the workload identity principal
-  `roles/iam.workloadIdentityUser` on that service account.
+Use an operation for one complete non-HTTP invocation. It emits one completion
+record and records duration, count, and error metrics. Use spans for child
+steps; child spans do not emit additional operation completion records.
 
-For the fixed PolicyEngine Google Cloud destination, see
-[`docs/operations/google-cloud-stage3-runbook.md`](docs/operations/google-cloud-stage3-runbook.md).
+```python
+with runtime.operation(
+    "simulation.run",
+    attributes={"backend": "modal"},
+):
+    with runtime.span("simulation.build"):
+        simulation = build_simulation()
+    result = calculate(simulation)
+```
+
+Operations and spans support synchronous and asynchronous context management
+and decoration:
+
+```python
+@runtime.span("simulation.calculate")
+async def calculate(simulation):
+    return await simulation.calculate()
+```
+
+Function arguments and return values are never captured. Telemetry failures do
+not change the function return value or replace an application exception.
+
+## Events, application logs, and handled exceptions
+
+The runtime accepts only configured attribute keys and scalar values.
+
+```python
+runtime.set_context(auth_result="accepted", simulation_id="sim-123")
+runtime.event("simulation.dispatched", attributes={"backend": "modal"})
+
+try:
+    load_result()
+except ValueError as error:
+    runtime.record_exception(error, handled=True)
+```
+
+To route standard-library logs through the versioned JSON schema, instrument a
+specific logger or configure root capture explicitly:
+
+```python
+import logging
+from policyengine_observability import instrument_logging
+
+logger = logging.getLogger("policyengine.api")
+instrument_logging(logger, runtime)
+logger.info(
+    "Simulation accepted",
+    extra={"policyengine_attributes": {"backend": "modal"}},
+)
+```
+
+The handler ignores Google, gRPC, OTel, and this package's own loggers to avoid
+recursive export failures.
+
+## Outbound HTTP and asynchronous dispatch
+
+Only the supplied HTTPX client is modified:
+
+```python
+import httpx
+from policyengine_observability import instrument_httpx
+
+client = httpx.AsyncClient()
+instrument_httpx(client, runtime)
+```
+
+The request hook injects active W3C context and the PolicyEngine request ID.
+Other clients in the process remain unchanged.
+
+For a queued simulation, serialize the bounded correlation context with the
+job request:
+
+```python
+request.observability_context = runtime.capture_context()
+```
+
+Then restore it around the worker invocation:
+
+```python
+with runtime.operation(
+    "simulation.run",
+    remote_context=request.observability_context,
+):
+    return run_simulation(request)
+```
+
+A direct continuation that starts within five minutes uses the dispatched span
+as its parent. An older invocation, independent retry, or aggregate operation
+starts a new trace with a link to the dispatch span.
+
+## Modal logging and snapshots
+
+Modal writes the same JSON immediately to standard output and may also send a
+copy through one bounded background Cloud Logging writer per process:
+
+```python
+from policyengine_observability import (
+    GoogleCloudLoggingConfig,
+    LoggingConfig,
+)
+
+config = ObservabilityConfig.from_env(
+    service=service,
+    deployment=DeploymentIdentity(
+        environment="production",
+        platform="modal",
+    ),
+    google_cloud_project_id="policyengine-observability",
+    logging=LoggingConfig(
+        remote=GoogleCloudLoggingConfig(
+            project_id="policyengine-observability",
+            log_name="policyengine-api-v1-modal",
+            queue_capacity=1_000,
+            batch_size=100,
+            write_timeout_seconds=5,
+        )
+    ),
+)
+runtime = configure(config)
+```
+
+Remote logging starts no client until the background worker receives its first
+record. The calling thread uses `put_nowait`; a full queue drops the newest
+record and records a local counter.
+
+After a Modal memory snapshot restores, rebuild process-local queues, threads,
+credentials, and exporters before accepting work:
+
+```python
+@modal.enter(snap=False)
+def restore_process_state(self):
+    self.runtime.restart_after_snapshot()
+```
+
+## Failure behavior and shutdown
+
+Remote telemetry delivery is best effort. Exporters have bounded queues,
+batches, retries, network deadlines, and shutdown periods. Missing credentials,
+invalid configuration, unavailable DNS, denied permissions, collector failure,
+queue saturation, and shutdown timeouts produce rate-limited JSON diagnostics
+on standard error. Those diagnostics do not enter the failing exporter.
+
+Call `runtime.shutdown()` during orderly process shutdown. The call is bounded
+and safe to repeat.
+
+The operating policy, workload allowlist, Google Cloud deployment plan, and
+rollback procedure are in
+[`docs/operations/api-v1-observability.md`](docs/operations/api-v1-observability.md)
+and [`deploy/gcp/README.md`](deploy/gcp/README.md).
 
 ## Release workflow
 
-Changes should include a Towncrier fragment in `changelog.d/`. Pull requests
-run changelog, Ruff, and coverage checks. Pushes to `main` run the same gates,
-then publish a versioning commit that builds the changelog and bumps
-`pyproject.toml`. That versioning commit publishes the package to PyPI through
-trusted publishing, creates a matching git tag, and opens a GitHub release.
+Changes include a Towncrier fragment in `changelog.d/`. Pull requests run Ruff,
+tests, and coverage checks. The release workflow builds distributions and
+publishes through PyPI trusted publishing.
 
 ## License
 
-Code in this repository is released under the [MIT License](LICENSE). Original text and figures are released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) with attribution to PolicyEngine. Third-party data and materials keep their own terms.
+Code in this repository is released under the [MIT License](LICENSE). Original
+text and figures are released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+with attribution to PolicyEngine. Third-party materials retain their terms.

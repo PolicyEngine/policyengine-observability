@@ -1,540 +1,857 @@
-"""Public runtime interface and component lifecycle."""
-
 from __future__ import annotations
 
+import inspect
+import logging
+import re
 import threading
 import time
-from collections.abc import AsyncIterator, Iterator
-from enum import Enum
+import uuid
+from collections.abc import Mapping
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from functools import wraps
 from typing import Any
 
-from . import _state
-from ._metrics import MetricRecorder, _NoOpInstrument
-from ._operations import OperationLifecycle
-from ._requests import RequestLifecycle
-from ._state import (
-    OBSERVABILITY_INTERNAL_DISPATCH_HEADER as OBSERVABILITY_INTERNAL_DISPATCH_HEADER,
-)
-from ._state import (
-    REQUEST_ID_HEADER as REQUEST_ID_HEADER,
-)
-from ._state import (
-    TRACEPARENT_HEADER as TRACEPARENT_HEADER,
-)
-from ._state import (
-    ContextState,
-)
-from ._tracing import TraceRecorder
 from .config import ObservabilityConfig
-from .context import OperationObservabilityContext, RequestObservabilityContext
-from .destinations import LogDestinationManager
-from .destinations.base import clamped
-from .logging import (
-    EVENT_LOGGER,
-    INTERNAL_LOGGER,
-    OPERATION_LOGGER,
-    REQUEST_LOGGER,
-    LogEmitter,
-)
-from .segments import SegmentRecorder
+from .delivery import DeliveryManager
+from .diagnostics import Diagnostics
+from .otel import OTelRuntime, SpanHandle, captured_at_is_recent
+from .schema import build_record, normalize_attributes
+
+REQUEST_ID_HEADER = "X-PolicyEngine-Request-Id"
+TRACEPARENT_HEADER = "traceparent"
+TRACESTATE_HEADER = "tracestate"
+
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+@dataclass(slots=True)
+class _RequestState:
+    request_id: str
+    method: str
+    route: str
+    start_time: float
+    span: SpanHandle | None
+    token: Token[Any] | None = None
+    status_code: int | None = None
+    attributes: dict[str, Any] = field(default_factory=dict)
+    error: BaseException | None = None
+    completed: bool = False
+
+
+@dataclass(slots=True)
+class _OperationState:
+    name: str
+    kind: str
+    request_id: str | None
+    start_time: float
+    span: SpanHandle | None
+    token: Token[Any] | None = None
+    attributes: dict[str, Any] = field(default_factory=dict)
+    error: BaseException | None = None
+    completed: bool = False
+
+
+@dataclass(slots=True)
+class _ChildSpanState:
+    name: str
+    start_time: float
+    span: SpanHandle | None
 
 
 class ObservabilityRuntime:
-    def __init__(
-        self,
-        config: ObservabilityConfig,
-        *,
-        segment_registry: type[Enum] | None = None,
-    ) -> None:
+    def __init__(self, config: ObservabilityConfig) -> None:
         self.config = config
-        self.segment_registry = segment_registry
-        self.enabled = config.enabled
-        self.trace = None
-        self.propagate = None
-        self.SpanKind = None
-        self.Status = None
-        self.StatusCode = None
-        self.tracer_provider = None
-        self.meter_provider = None
-        self.tracer = None
-        self.meter = None
-        self.operation_duration = _NoOpInstrument()
-        self.http_duration = _NoOpInstrument()
-        self.segment_duration = _NoOpInstrument()
-        self.calculate_duration = _NoOpInstrument()
-        self.backend_duration = _NoOpInstrument()
-        self.operations = _NoOpInstrument()
-        self.requests = _NoOpInstrument()
-        self.errors = _NoOpInstrument()
-        self.rate_limited = _NoOpInstrument()
-        self.failover_events = _NoOpInstrument()
-        self.active_requests = _NoOpInstrument()
-        self._httpx_instrumented = False
-        self._emitting_internal_error = False
-        self.log_destination_manager = LogDestinationManager(
-            config=config,
-            loggers={
-                "request": REQUEST_LOGGER,
-                "operation": OPERATION_LOGGER,
-                "event": EVENT_LOGGER,
-                "internal": INTERNAL_LOGGER,
-            },
-            serializer=self._json,
-            on_failure=self._handle_destination_failure,
+        self.diagnostics = Diagnostics()
+        self._request_state: ContextVar[_RequestState | None] = ContextVar(
+            f"policyengine_request_{id(self)}", default=None
         )
-        self._context_state = ContextState(self)
-        self._operations = OperationLifecycle(self)
-        self._requests = RequestLifecycle(self)
-        self._segments = SegmentRecorder(self)
-        self._logging = LogEmitter(self)
-        self._metrics = MetricRecorder(self)
-        self._tracing = TraceRecorder(self)
+        self._operation_state: ContextVar[_OperationState | None] = ContextVar(
+            f"policyengine_operation_{id(self)}", default=None
+        )
+        self._shutdown_lock = threading.Lock()
+        self._closed = False
+        self._delivery = self._new_delivery()
+        self._otel = self._new_otel()
+        self.diagnostics.add_listener(self._record_diagnostic_metric)
+        self._logging_handlers: list[
+            tuple[logging.Logger, ObservabilityLogHandler]
+        ] = []
+        for warning in config.diagnostics():
+            self.diagnostics.report("configuration", warning)
+        if config.logging.capture_standard_library:
+            instrument_logging(
+                logging.getLogger(),
+                self,
+                replace=config.logging.replace_existing_handlers,
+            )
 
-    @classmethod
-    def disabled(cls) -> ObservabilityRuntime:
-        return cls(ObservabilityConfig(enabled=False))
+    def _new_delivery(self) -> DeliveryManager:
+        try:
+            return DeliveryManager(self.config, self.diagnostics)
+        except Exception as exc:
+            self.diagnostics.report("delivery.configure", exc)
+            fallback = ObservabilityConfig(
+                service=self.config.service,
+                deployment=self.config.deployment,
+                google_cloud_project_id=self.config.google_cloud_project_id,
+                logging=self.config.logging.__class__(
+                    stdout_enabled=True,
+                    remote=None,
+                ),
+                otel=self.config.otel,
+                limits=self.config.limits,
+                application_attribute_keys=(
+                    self.config.application_attribute_keys
+                ),
+                dispatch_attribute_keys=self.config.dispatch_attribute_keys,
+                metric_attribute_keys=self.config.metric_attribute_keys,
+                sensitive_values=self.config.sensitive_values,
+            )
+            return DeliveryManager(fallback, self.diagnostics)
 
-    def configure(self) -> None:
-        self._configure_loggers()
-        if not self.enabled:
-            return
-        self.log_destination_manager.configure()
-        if not self.config.otel_enabled:
-            return
-        self._configure_otel()
-        if self.config.instrument_httpx:
-            self.instrument_httpx()
+    def _new_otel(self) -> OTelRuntime:
+        try:
+            return OTelRuntime(
+                self.config,
+                self.diagnostics,
+                queue_depth=lambda: self._delivery.queue_depth,
+            )
+        except Exception as exc:
+            self.diagnostics.report("otel.runtime", exc)
+            return OTelRuntime(
+                ObservabilityConfig(
+                    service=self.config.service,
+                    deployment=self.config.deployment,
+                    google_cloud_project_id=(
+                        self.config.google_cloud_project_id
+                    ),
+                    logging=self.config.logging,
+                    otel=self.config.otel.__class__(enabled=False),
+                    limits=self.config.limits,
+                    application_attribute_keys=(
+                        self.config.application_attribute_keys
+                    ),
+                    dispatch_attribute_keys=(
+                        self.config.dispatch_attribute_keys
+                    ),
+                    metric_attribute_keys=self.config.metric_attribute_keys,
+                    sensitive_values=self.config.sensitive_values,
+                ),
+                self.diagnostics,
+                queue_depth=lambda: self._delivery.queue_depth,
+            )
 
-    def current_context(self) -> RequestObservabilityContext | None:
-        return self._context_state.current_context()
+    def _record_diagnostic_metric(self, name: str, value: int) -> None:
+        if "dropped" in name or name.endswith("queue_full"):
+            self._otel.record_dropped(name, value)
+        elif "export_failure" in name:
+            self._otel.record_exporter_failure(name, value)
 
-    def current_operation(self) -> OperationObservabilityContext | None:
-        return self._context_state.current_operation()
-
-    def operation(self, name: str, *, flavor: str | None = None, **attrs: Any):
-        return self._operations.operation(name, flavor=flavor, **attrs)
-
-    def entrypoint(
-        self,
-        name: str | None = None,
-        *,
-        flavor: str | None = None,
-        **attrs: Any,
-    ):
-        return self._operations.entrypoint(name, flavor=flavor, **attrs)
-
-    def start_operation(
+    def operation(
         self,
         name: str,
         *,
-        flavor: str | None = None,
-        parent_context: Any = None,
-        timings: dict[str, float] | None = None,
-        emit_log: bool = True,
-        record_metric: bool = True,
-        **attrs: Any,
-    ) -> dict[str, Any]:
-        return self._operations.start_operation(
-            name,
-            flavor=flavor,
-            parent_context=parent_context,
-            timings=timings,
-            emit_log=emit_log,
-            record_metric=record_metric,
-            **attrs,
+        attributes: Mapping[str, Any] | None = None,
+        remote_context: Mapping[str, Any] | None = None,
+        independent_retry: bool = False,
+        aggregate: bool = False,
+    ) -> _ScopeManager:
+        return _ScopeManager(
+            self,
+            scope_type="operation",
+            name=name,
+            attributes=attributes,
+            remote_context=remote_context,
+            independent_retry=independent_retry,
+            aggregate=aggregate,
         )
 
-    def end_operation(
-        self, handle: dict[str, Any] | None, error: BaseException | None = None
-    ) -> None:
-        return self._operations.end_operation(handle, error)
+    def span(
+        self,
+        name: str,
+        *,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> _ScopeManager:
+        return _ScopeManager(
+            self,
+            scope_type="span",
+            name=name,
+            attributes=attributes,
+        )
 
-    def complete_operation(
-        self, operation: OperationObservabilityContext
-    ) -> None:
-        return self._operations.complete_operation(operation)
+    def _scope_copy(self, manager: _ScopeManager) -> _ScopeManager:
+        return _ScopeManager(
+            self,
+            scope_type=manager.scope_type,
+            name=manager.name,
+            attributes=manager.attributes,
+            remote_context=manager.remote_context,
+            independent_retry=manager.independent_retry,
+            aggregate=manager.aggregate,
+        )
 
     def begin_request(
-        self, context: RequestObservabilityContext, *, carrier: Any = None
-    ) -> None:
-        return self._requests.begin_request(context, carrier=carrier)
-
-    def _begin_request_operation(self, *args: Any, **kwargs: Any) -> Any:
-        return self._requests._begin_request_operation(*args, **kwargs)
-
-    def finish_request(self, status_code: int) -> dict[str, str]:
-        return self._requests.finish_request(status_code)
-
-    def prepare_response(self, status_code: int) -> dict[str, str]:
-        return self._requests.prepare_response(status_code)
-
-    def complete_request(self, status_code: int | None = None) -> None:
-        return self._requests.complete_request(status_code)
-
-    def update_request_route(
-        self, *, route: str | None = None, endpoint: str | None = None
-    ) -> None:
-        return self._requests.update_request_route(
-            route=route, endpoint=endpoint
-        )
-
-    def teardown_request(self, exc: BaseException | None = None) -> None:
-        return self._requests.teardown_request(exc)
-
-    def set_attribute(self, key: str, value: Any) -> None:
-        return self._requests.set_attribute(key, value)
-
-    def segment(self, name: Any, **attrs: Any) -> Iterator[Any]:
-        return self._segments.segment(name, **attrs)
-
-    def _segment_context(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._segment_context(*args, **kwargs)
-
-    def asegment(self, name: Any, **attrs: Any) -> AsyncIterator[Any]:
-        return self._segments.asegment(name, **attrs)
-
-    def collect_timings(self, name: str = "operation", **attrs: Any):
-        return self._operations.collect_timings(name, **attrs)
-
-    def start_scope(
         self,
-        timings: dict[str, float],
         *,
-        name: str = "operation",
-        parent_context: Any = None,
-        **attrs: Any,
-    ) -> dict[str, Any]:
-        return self._operations.start_scope(
-            timings, name=name, parent_context=parent_context, **attrs
+        headers: Mapping[str, str],
+        method: str,
+        route: str,
+    ) -> str:
+        request_id = _request_id(_header_value(headers, REQUEST_ID_HEADER))
+        try:
+            parent = self._otel.extract(headers)
+            span = self._otel.start_span(
+                f"{method.upper()} {route}",
+                kind=_span_kind("SERVER"),
+                parent_context=parent,
+                attributes={
+                    "http.request.method": method.upper(),
+                    "http.route": route,
+                },
+            )
+            state = _RequestState(
+                request_id=request_id,
+                method=method.upper(),
+                route=route,
+                start_time=time.perf_counter(),
+                span=span,
+            )
+            state.token = self._request_state.set(state)
+        except Exception as exc:
+            self.diagnostics.report("request.begin", exc)
+        return request_id
+
+    def update_request_route(self, route: str) -> None:
+        state = self._request_state.get()
+        if state is None or state.completed:
+            return
+        state.route = route
+        self._otel.set_span_attributes({"http.route": route})
+
+    def response_headers(self) -> dict[str, str]:
+        state = self._request_state.get()
+        if state is None:
+            return {}
+        headers = {REQUEST_ID_HEADER: state.request_id}
+        carrier: dict[str, str] = {}
+        self._otel.inject(carrier)
+        if TRACEPARENT_HEADER in carrier:
+            headers[TRACEPARENT_HEADER] = carrier[TRACEPARENT_HEADER]
+        return headers
+
+    def end_request(
+        self,
+        *,
+        status_code: int | None,
+        error: BaseException | None = None,
+    ) -> None:
+        state = self._request_state.get()
+        if state is None or state.completed:
+            return
+        state.completed = True
+        state.status_code = status_code
+        state.error = error
+        duration = max(0.0, time.perf_counter() - state.start_time)
+        outcome = _outcome(status_code, error)
+        metric_values = self._metric_base()
+        metric_values.update(
+            {
+                "http.route": state.route,
+                "http.request.method": state.method,
+                "http.response.status_code_class": _status_class(status_code),
+                "operation.kind": "request",
+                "outcome": outcome,
+            }
+        )
+        self._otel.set_span_attributes(
+            {
+                "http.route": state.route,
+                "http.response.status_code": status_code or 0,
+                "policyengine.request.id": state.request_id,
+                "policyengine.outcome": outcome,
+            }
+        )
+        context = {
+            "request.id": state.request_id,
+            "http.request.method": state.method,
+            "http.route": state.route,
+            "http.response.status_code": status_code,
+            "duration_ms": round(duration * 1_000, 3),
+            "outcome": outcome,
+            **self._otel.current_correlation(),
+        }
+        self._emit_record(
+            severity="ERROR" if outcome == "error" else "INFO",
+            event_name="request.completed",
+            context=context,
+            attributes=state.attributes,
+            error=error,
+        )
+        self._otel.record_request(duration, metric_values)
+        if error is not None:
+            self._otel.record_error(metric_values)
+        self._otel.end_span(state.span, error)
+        self._reset_request(state)
+
+    def set_context(self, **attributes: Any) -> None:
+        safe, omitted = normalize_attributes(
+            attributes,
+            self.config,
+            allowed_keys=(
+                self.config.application_attribute_keys
+                | self.config.dispatch_attribute_keys
+            ),
+        )
+        request = self._request_state.get()
+        operation = self._operation_state.get()
+        target = operation or request
+        if target is not None:
+            target.attributes.update(safe)
+        if safe:
+            self._otel.set_span_attributes(safe)
+        if omitted:
+            self.diagnostics.increment("attributes.omitted", omitted)
+
+    def event(
+        self,
+        name: str,
+        *,
+        severity: str = "INFO",
+        attributes: Mapping[str, Any] | None = None,
+    ) -> None:
+        self._emit_record(
+            severity=severity,
+            event_name=name,
+            context=self._active_context_fields(),
+            attributes=attributes,
         )
 
-    def annotate(
-        self, handle: dict[str, Any] | None = None, **attrs: Any
-    ) -> None:
-        return self._operations.annotate(handle, **attrs)
-
-    def end_scope(
-        self, handle: dict[str, Any] | None, error: BaseException | None = None
-    ) -> None:
-        return self._operations.end_scope(handle, error)
-
-    def mark(self, key: str, ms: float) -> None:
-        return self._operations.mark(key, ms)
-
-    def mark_ttft(self, key: str = "ttft_ms") -> None:
-        return self._operations.mark_ttft(key)
-
-    def mark_ttft_attribute(self, key: str = "ttft_ms") -> None:
-        return self._operations.mark_ttft_attribute(key)
-
-    def record_error(
+    def log(
         self,
-        exc: BaseException,
+        message: str,
+        *,
+        severity: str = "INFO",
+        attributes: Mapping[str, Any] | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self._emit_record(
+            severity=severity,
+            message=message,
+            context=self._active_context_fields(),
+            attributes=attributes,
+            error=error,
+        )
+
+    def record_exception(
+        self,
+        error: Exception,
         *,
         handled: bool,
         status_code: int | None = None,
-        include_stack: bool = True,
     ) -> None:
-        return self._logging.record_error(
-            exc,
-            handled=handled,
-            status_code=status_code,
-            include_stack=include_stack,
+        request = self._request_state.get()
+        operation = self._operation_state.get()
+        if request is not None:
+            request.error = error
+            if status_code is not None:
+                request.status_code = status_code
+        if operation is not None:
+            operation.error = error
+        context = {
+            **self._active_context_fields(),
+            "error.handled": handled,
+        }
+        if status_code is not None:
+            context["http.response.status_code"] = status_code
+        self._emit_record(
+            severity="ERROR",
+            event_name="exception.recorded",
+            context=context,
+            error=error,
+        )
+        self._otel.record_error(
+            {
+                **self._metric_base(),
+                "operation.kind": "handled" if handled else "unhandled",
+                "outcome": "error",
+            }
         )
 
-    def record_event(self, event: str, **fields: Any) -> None:
-        return self._logging.record_event(event, **fields)
-
-    def traceparent_header(self) -> str | None:
-        return self._tracing.traceparent_header()
-
-    def capture_context(self):
-        return self._tracing.capture_context()
-
-    def emit_request_log(self, context: RequestObservabilityContext) -> None:
-        return self._logging.emit_request_log(context)
-
-    def emit_operation_log(
-        self, operation: OperationObservabilityContext
-    ) -> None:
-        return self._logging.emit_operation_log(operation)
-
-    def record_operation_metric(
-        self, duration_seconds: float, attributes: dict[str, str]
-    ) -> None:
-        return self._metrics.record_operation_metric(
-            duration_seconds, attributes
+    def capture_context(self) -> dict[str, str]:
+        carrier: dict[str, str] = {}
+        self._otel.inject(carrier)
+        captured: dict[str, str] = {
+            key: value
+            for key, value in carrier.items()
+            if key.lower() in {TRACEPARENT_HEADER, TRACESTATE_HEADER}
+        }
+        captured["captured_at"] = (
+            datetime.now(UTC).isoformat().replace("+00:00", "Z")
         )
+        request = self._request_state.get()
+        operation = self._operation_state.get()
+        if request is not None:
+            captured["request_id"] = request.request_id
+        elif operation is not None and operation.request_id:
+            captured["request_id"] = operation.request_id
+        source = operation.attributes if operation is not None else {}
+        if request is not None:
+            source = {**request.attributes, **source}
+        for key in self.config.dispatch_attribute_keys:
+            value = source.get(key)
+            if isinstance(value, (str, int)):
+                captured[key] = str(value)[
+                    : self.config.limits.max_string_length
+                ]
+        return captured
 
-    def record_request_metric(
-        self, duration_seconds: float, attributes: dict[str, str]
-    ) -> None:
-        return self._metrics.record_request_metric(
-            duration_seconds, attributes
-        )
-
-    def record_segment_metric(
-        self,
-        segment: str,
-        duration_seconds: float,
-        attributes: dict[str, str],
-        *,
-        backend_segment: bool = False,
-    ) -> None:
-        return self._metrics.record_segment_metric(
-            segment,
-            duration_seconds,
-            attributes,
-            backend_segment=backend_segment,
-        )
-
-    def record_error_metric(self, attributes: dict[str, str]) -> None:
-        return self._metrics.record_error_metric(attributes)
-
-    def record_rate_limited_metric(self, attributes: dict[str, str]) -> None:
-        return self._metrics.record_rate_limited_metric(attributes)
-
-    def record_failover_event_metric(self, attributes: dict[str, str]) -> None:
-        return self._metrics.record_failover_event_metric(attributes)
-
-    def record_active_request(
-        self, delta: int, attributes: dict[str, str]
-    ) -> None:
-        return self._metrics.record_active_request(delta, attributes)
-
-    def instrument_fastapi(self, app: Any) -> None:
-        return self._tracing.instrument_fastapi(app)
-
-    def instrument_httpx(self) -> None:
-        return self._tracing.instrument_httpx()
+    def inject_http_headers(self, headers: dict[str, str]) -> None:
+        self._otel.inject(headers)
+        if REQUEST_ID_HEADER not in headers:
+            request = self._request_state.get()
+            operation = self._operation_state.get()
+            request_id = (
+                request.request_id
+                if request is not None
+                else operation.request_id
+                if operation is not None
+                else None
+            )
+            if request_id:
+                headers[REQUEST_ID_HEADER] = request_id
 
     def shutdown(self) -> None:
-        budget = clamped(
-            self.config.shutdown_timeout_seconds,
-            low=0.0,
-            high=60.0,
-            default=ObservabilityConfig.shutdown_timeout_seconds,
-        )
-        providers = [
-            ("trace", self.tracer_provider),
-            ("metrics", self.meter_provider),
-        ]
-        providers = [
-            (name, provider)
-            for name, provider in providers
-            if provider is not None
-        ]
-        # Destination close is inherently deadline-bounded, so it runs
-        # inline and first, with a deadline that leaves room for the
-        # provider flush when there is one. Everything below fits inside
-        # the one shutdown budget by construction.
-        started = time.monotonic()
-        try:
-            self.log_destination_manager.close(
-                budget / 2 if providers else budget
+        with self._shutdown_lock:
+            if self._closed:
+                return
+            self._closed = True
+            timeout = max(0.0, self.config.limits.shutdown_timeout_seconds)
+            self._delivery.close(timeout)
+            _run_bounded(
+                lambda: self._otel.shutdown(timeout),
+                timeout,
+                self.diagnostics,
+                "otel.shutdown_deadline",
             )
-        except BaseException as exc:
-            self.log_observability_failure("logging.destination_close", exc)
-        if not providers:
-            return
-        remaining = max(0.0, budget - (time.monotonic() - started))
+            self._remove_logging_handlers()
 
-        def flush() -> None:
-            for name, provider in providers:
-                try:
-                    provider.shutdown()
-                except BaseException as exc:
-                    self.log_observability_failure(
-                        f"otel.{name}_shutdown",
-                        exc,
-                    )
-
-        thread = threading.Thread(
-            target=flush,
-            name="policyengine-otel-shutdown",
-            daemon=True,
-        )
-        thread.start()
-        thread.join(timeout=remaining)
-        if thread.is_alive():
-            self.log_observability_failure(
-                "otel.shutdown_timeout",
-                TimeoutError("OpenTelemetry shutdown timed out."),
-                timeout_seconds=remaining,
+    def restart_after_snapshot(self) -> None:
+        with self._shutdown_lock:
+            timeout = min(
+                max(0.0, self.config.limits.shutdown_timeout_seconds), 1.0
             )
+            try:
+                self._delivery.close(timeout)
+            except Exception as exc:
+                self.diagnostics.report("snapshot.delivery_close", exc)
+            self._delivery = self._new_delivery()
+            self._otel = self._new_otel()
+            self._closed = False
 
-    def shutdown_tracing(self) -> None:
-        self.shutdown()
+    def _start_operation(
+        self,
+        name: str,
+        attributes: Mapping[str, Any] | None,
+        remote_context: Mapping[str, Any] | None,
+        independent_retry: bool,
+        aggregate: bool,
+    ) -> _OperationState:
+        safe, omitted = normalize_attributes(
+            attributes,
+            self.config,
+            allowed_keys=(
+                self.config.application_attribute_keys
+                | self.config.dispatch_attribute_keys
+            ),
+        )
+        if omitted:
+            self.diagnostics.increment("attributes.omitted", omitted)
+        parent = None
+        links: list[Any] = []
+        request_id: str | None = None
+        if remote_context:
+            request_id = _valid_request_id(remote_context.get("request_id"))
+            carrier = {
+                key: str(value)
+                for key, value in remote_context.items()
+                if key.lower() in {TRACEPARENT_HEADER, TRACESTATE_HEADER}
+            }
+            extracted = self._otel.extract(carrier)
+            direct = (
+                not independent_retry
+                and not aggregate
+                and captured_at_is_recent(
+                    remote_context.get("captured_at"),
+                    self.config.limits.async_parent_max_age_seconds,
+                )
+            )
+            if direct:
+                parent = extracted
+            else:
+                link = self._otel.link(self._otel.remote_span_context(carrier))
+                if link is not None:
+                    links.append(link)
+                parent = self._otel.empty_context()
+        active_request = self._request_state.get()
+        if request_id is None and active_request is not None:
+            request_id = active_request.request_id
+        span = self._otel.start_span(
+            name,
+            kind=_span_kind("CONSUMER") if remote_context else None,
+            attributes={
+                "operation.name": name,
+                "operation.kind": "operation",
+                **safe,
+            },
+            parent_context=parent,
+            links=links,
+        )
+        state = _OperationState(
+            name=name,
+            kind="operation",
+            request_id=request_id,
+            start_time=time.perf_counter(),
+            span=span,
+            attributes=safe,
+        )
+        state.token = self._operation_state.set(state)
+        return state
 
-    def restart_log_destinations(self) -> None:
-        """Close and rebuild log destinations from configuration.
-
-        Call ONLY from single-threaded lifecycle moments — a
-        post-snapshot-restore hook, a post-fork hook, before serving
-        traffic. There is deliberately no locking here: under that
-        contract there is no concurrency, and a violated contract costs
-        at most a counted drop into a closing destination.
-
-        A no-op when observability is disabled, mirroring configure():
-        the kill switch must hold across forks and snapshot restores.
-        """
-        if not self.enabled:
-            return
-        self.log_destination_manager.configure()
-
-    def log_observability_failure(
-        self, operation: str, exc: BaseException, **fields: Any
+    def _finish_operation(
+        self,
+        state: _OperationState | None,
+        error: BaseException | None,
     ) -> None:
-        return self._logging.log_observability_failure(
-            operation, exc, **fields
+        if state is None or state.completed:
+            return
+        state.completed = True
+        state.error = error or state.error
+        duration = max(0.0, time.perf_counter() - state.start_time)
+        outcome = "error" if state.error is not None else "success"
+        context = {
+            "operation.name": state.name,
+            "operation.kind": state.kind,
+            "request.id": state.request_id,
+            "duration_ms": round(duration * 1_000, 3),
+            "outcome": outcome,
+            **self._otel.current_correlation(),
+        }
+        self._emit_record(
+            severity="ERROR" if state.error is not None else "INFO",
+            event_name="operation.completed",
+            context=context,
+            attributes=state.attributes,
+            error=state.error,
+        )
+        metrics = {
+            **self._metric_base(),
+            "operation.name": state.name,
+            "operation.kind": state.kind,
+            "outcome": outcome,
+        }
+        self._otel.record_operation(duration, metrics)
+        if state.error is not None:
+            self._otel.record_error(metrics)
+        self._otel.end_span(state.span, state.error)
+        if state.token is not None:
+            try:
+                self._operation_state.reset(state.token)
+            except Exception as exc:
+                self.diagnostics.report("operation.context_reset", exc)
+
+    def _start_child_span(
+        self,
+        name: str,
+        attributes: Mapping[str, Any] | None,
+    ) -> _ChildSpanState:
+        safe, omitted = normalize_attributes(
+            attributes,
+            self.config,
+            allowed_keys=(
+                self.config.application_attribute_keys
+                | self.config.dispatch_attribute_keys
+            ),
+        )
+        if omitted:
+            self.diagnostics.increment("attributes.omitted", omitted)
+        return _ChildSpanState(
+            name=name,
+            start_time=time.perf_counter(),
+            span=self._otel.start_span(name, attributes=safe),
         )
 
-    def _configure_loggers(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._configure_loggers(*args, **kwargs)
+    def _finish_child_span(
+        self,
+        state: _ChildSpanState | None,
+        error: BaseException | None,
+    ) -> None:
+        if state is None:
+            return
+        self._otel.end_span(state.span, error)
 
-    def _emit_structured_log(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._emit_structured_log(*args, **kwargs)
+    def _active_context_fields(self) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        request = self._request_state.get()
+        operation = self._operation_state.get()
+        if request is not None:
+            fields.update(
+                {
+                    "request.id": request.request_id,
+                    "http.request.method": request.method,
+                    "http.route": request.route,
+                }
+            )
+        if operation is not None:
+            fields.update(
+                {
+                    "operation.name": operation.name,
+                    "operation.kind": operation.kind,
+                }
+            )
+            if operation.request_id and "request.id" not in fields:
+                fields["request.id"] = operation.request_id
+        fields.update(self._otel.current_correlation())
+        return fields
 
-    def _handle_destination_failure(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._handle_destination_failure(*args, **kwargs)
+    def _metric_base(self) -> dict[str, Any]:
+        return {
+            "service.name": self.config.service.name,
+            "service.role": self.config.service.role,
+            "deployment.environment.name": (
+                self.config.deployment.environment
+            ),
+            "cloud.platform": self.config.deployment.platform,
+        }
 
-    def _severity_for_log_record(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._severity_for_log_record(*args, **kwargs)
-
-    def _int_or_none(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._int_or_none(*args, **kwargs)
-
-    def _internal_error_payload(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._internal_error_payload(*args, **kwargs)
-
-    def _configure_otel(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._configure_otel(*args, **kwargs)
-
-    def _add_trace_exporter(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._add_trace_exporter(*args, **kwargs)
-
-    def _metric_reader(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._metric_reader(*args, **kwargs)
-
-    def _configure_instruments(self, *args: Any, **kwargs: Any) -> Any:
-        return self._metrics._configure_instruments(*args, **kwargs)
-
-    def _instrument(self, *args: Any, **kwargs: Any) -> Any:
-        return self._metrics._instrument(*args, **kwargs)
-
-    def _start_request_span(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._start_request_span(*args, **kwargs)
-
-    def _close_request_span(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._close_request_span(*args, **kwargs)
-
-    def _safe_span(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._safe_span(*args, **kwargs)
-
-    def _start_span(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._start_span(*args, **kwargs)
-
-    def _end_span(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._end_span(*args, **kwargs)
-
-    def _start_segment_tree_node(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._start_segment_tree_node(*args, **kwargs)
-
-    def _finish_segment_tree_node(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._finish_segment_tree_node(*args, **kwargs)
-
-    def _reset_segment_tree_stack(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._reset_segment_tree_stack(*args, **kwargs)
-
-    def _segment_tree_owner(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._segment_tree_owner(*args, **kwargs)
-
-    def _safe_segment_tree_attrs(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._safe_segment_tree_attrs(*args, **kwargs)
-
-    def _record_segment_flat_timing(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._record_segment_flat_timing(*args, **kwargs)
-
-    def _record_segment_safely(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._record_segment_safely(*args, **kwargs)
-
-    def _record_timing(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._record_timing(*args, **kwargs)
-
-    def _segment_span_attributes(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._segment_span_attributes(*args, **kwargs)
-
-    def _span_name(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._span_name(*args, **kwargs)
-
-    def _start_implicit_operation(self, *args: Any, **kwargs: Any) -> Any:
-        return self._operations._start_implicit_operation(*args, **kwargs)
-
-    def _coerce_segment(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._coerce_segment(*args, **kwargs)
-
-    def _set_current_span_attributes(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._set_current_span_attributes(*args, **kwargs)
-
-    def _current_span(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._current_span(*args, **kwargs)
-
-    def _trace_ids(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._trace_ids(*args, **kwargs)
-
-    def _extract_context(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._extract_context(*args, **kwargs)
-
-    def _record_exception_on_span(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._record_exception_on_span(*args, **kwargs)
-
-    def _add_span_event(self, *args: Any, **kwargs: Any) -> Any:
-        return self._tracing._add_span_event(*args, **kwargs)
-
-    def _close_active_request(self, *args: Any, **kwargs: Any) -> Any:
-        return self._requests._close_active_request(*args, **kwargs)
-
-    def _reset_request_operation_context(
-        self, *args: Any, **kwargs: Any
-    ) -> Any:
-        return self._requests._reset_request_operation_context(*args, **kwargs)
-
-    def _reset_request_context(self, *args: Any, **kwargs: Any) -> Any:
-        return self._requests._reset_request_context(*args, **kwargs)
-
-    def _safe_perf_counter(self, *args: Any, **kwargs: Any) -> Any:
-        return self._segments._safe_perf_counter(*args, **kwargs)
-
-    def _safe_str(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._safe_str(*args, **kwargs)
-
-    def _safe_traceback(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._safe_traceback(*args, **kwargs)
-
-    def _json(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._json(*args, **kwargs)
-
-    def _write_stderr(self, *args: Any, **kwargs: Any) -> Any:
-        return self._logging._write_stderr(*args, **kwargs)
-
-
-_RUNTIME = ObservabilityRuntime(ObservabilityConfig())
-
-
-def set_observability_runtime(runtime: ObservabilityRuntime) -> None:
-    global _RUNTIME
-    _RUNTIME = runtime
-    for context_var in (
-        _state._REQUEST_CONTEXT,
-        _state._OPERATION_CONTEXT,
-        _state._TIMINGS,
-        _state._TURN_START,
-    ):
+    def _emit_record(self, **kwargs: Any) -> None:
         try:
-            context_var.set(None)
-        except BaseException:
-            continue
+            self._delivery.emit(build_record(self.config, **kwargs))
+        except Exception as exc:
+            self.diagnostics.report("record.emit", exc)
+
+    def _reset_request(self, state: _RequestState) -> None:
+        if state.token is None:
+            return
+        try:
+            self._request_state.reset(state.token)
+        except Exception as exc:
+            self.diagnostics.report("request.context_reset", exc)
+
+    def _register_logging_handler(
+        self,
+        logger: logging.Logger,
+        handler: ObservabilityLogHandler,
+    ) -> None:
+        self._logging_handlers.append((logger, handler))
+
+    def _remove_logging_handlers(self) -> None:
+        for logger, handler in self._logging_handlers:
+            try:
+                logger.removeHandler(handler)
+            except Exception as exc:
+                self.diagnostics.report("logging.handler_remove", exc)
+        self._logging_handlers.clear()
 
 
-def observability_runtime() -> ObservabilityRuntime:
-    return _RUNTIME
+class _ScopeManager:
+    def __init__(
+        self,
+        runtime: ObservabilityRuntime,
+        *,
+        scope_type: str,
+        name: str,
+        attributes: Mapping[str, Any] | None,
+        remote_context: Mapping[str, Any] | None = None,
+        independent_retry: bool = False,
+        aggregate: bool = False,
+    ) -> None:
+        self.runtime = runtime
+        self.scope_type = scope_type
+        self.name = str(name)
+        self.attributes = attributes
+        self.remote_context = remote_context
+        self.independent_retry = independent_retry
+        self.aggregate = aggregate
+        self.state: _OperationState | _ChildSpanState | None = None
+
+    def __enter__(self) -> Any:
+        try:
+            if self.scope_type == "operation":
+                self.state = self.runtime._start_operation(
+                    self.name,
+                    self.attributes,
+                    self.remote_context,
+                    self.independent_retry,
+                    self.aggregate,
+                )
+            else:
+                self.state = self.runtime._start_child_span(
+                    self.name, self.attributes
+                )
+        except Exception as exc:
+            self.runtime.diagnostics.report(
+                f"{self.scope_type}.start", exc, name=self.name
+            )
+            self.state = None
+        return self.state
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        try:
+            if self.scope_type == "operation":
+                self.runtime._finish_operation(self.state, exc)  # type: ignore[arg-type]
+            else:
+                self.runtime._finish_child_span(self.state, exc)  # type: ignore[arg-type]
+        except Exception as observability_error:
+            self.runtime.diagnostics.report(
+                f"{self.scope_type}.finish",
+                observability_error,
+                name=self.name,
+            )
+        return False
+
+    async def __aenter__(self) -> Any:
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        return self.__exit__(exc_type, exc, traceback)
+
+    def __call__(self, function: Any) -> Any:
+        if inspect.iscoroutinefunction(function):
+
+            @wraps(function)
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                async with self.runtime._scope_copy(self):
+                    return await function(*args, **kwargs)
+
+            return async_wrapper
+
+        @wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with self.runtime._scope_copy(self):
+                return function(*args, **kwargs)
+
+        return wrapper
+
+
+class ObservabilityLogHandler(logging.Handler):
+    _IGNORED_PREFIXES = (
+        "google.",
+        "grpc",
+        "opentelemetry.",
+        "policyengine_observability.",
+    )
+
+    def __init__(self, runtime: ObservabilityRuntime) -> None:
+        super().__init__(level=runtime.config.logging.minimum_severity)
+        self.runtime = runtime
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name.startswith(self._IGNORED_PREFIXES):
+            return
+        try:
+            attributes = getattr(record, "policyengine_attributes", None)
+            error = record.exc_info[1] if record.exc_info else None
+            self.runtime.log(
+                record.getMessage(),
+                severity=record.levelname,
+                attributes=attributes
+                if isinstance(attributes, Mapping)
+                else None,
+                error=error,
+            )
+        except Exception as exc:
+            self.runtime.diagnostics.report("logging.handler_emit", exc)
+
+
+def instrument_logging(
+    logger: logging.Logger,
+    runtime: ObservabilityRuntime,
+    *,
+    replace: bool = False,
+) -> ObservabilityLogHandler:
+    for handler in logger.handlers:
+        if (
+            isinstance(handler, ObservabilityLogHandler)
+            and handler.runtime is runtime
+        ):
+            return handler
+    if replace:
+        logger.handlers.clear()
+    handler = ObservabilityLogHandler(runtime)
+    logger.addHandler(handler)
+    runtime._register_logging_handler(logger, handler)
+    return handler
+
+
+def configure(config: ObservabilityConfig) -> ObservabilityRuntime:
+    return ObservabilityRuntime(config)
+
+
+def _request_id(value: Any) -> str:
+    return _valid_request_id(value) or str(uuid.uuid4())
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
+
+
+def _valid_request_id(value: Any) -> str | None:
+    if isinstance(value, str) and _REQUEST_ID_PATTERN.fullmatch(value):
+        return value
+    return None
+
+
+def _status_class(status_code: int | None) -> str:
+    if status_code is None or status_code < 100 or status_code > 599:
+        return "unknown"
+    return f"{status_code // 100}xx"
+
+
+def _outcome(status_code: int | None, error: BaseException | None) -> str:
+    if error is not None or (status_code is not None and status_code >= 500):
+        return "error"
+    if status_code is not None and status_code >= 400:
+        return "client_error"
+    return "success"
+
+
+def _span_kind(name: str) -> Any:
+    try:
+        from opentelemetry.trace import SpanKind
+
+        return getattr(SpanKind, name)
+    except Exception:
+        return None
+
+
+def _run_bounded(
+    function: Any,
+    timeout_seconds: float,
+    diagnostics: Diagnostics,
+    diagnostic_name: str,
+) -> None:
+    completed = threading.Event()
+
+    def run() -> None:
+        try:
+            function()
+        except Exception as exc:
+            diagnostics.report(diagnostic_name, exc)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    completed.wait(max(0.0, timeout_seconds))
+    if not completed.is_set():
+        diagnostics.increment("shutdown.timeout")
+        diagnostics.report(
+            diagnostic_name,
+            "Operation exceeded the configured shutdown deadline.",
+        )
