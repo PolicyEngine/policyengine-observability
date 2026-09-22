@@ -13,6 +13,7 @@ from conftest import make_config, make_runtime, records
 
 from policyengine_observability import (
     REQUEST_ID_HEADER,
+    ConfigurationError,
     LoggingConfig,
     OTelConfig,
     configure,
@@ -347,42 +348,28 @@ def test_shutdown_contains_otel_coordinator_failure(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("logging_timeout", "otel_timeout", "expected_logging", "expected_otel"),
+    ("logging_timeout", "otel_timeout"),
     [
-        ("invalid", float("inf"), 2.0, 3.0),
-        (-1.0, 100.0, 0.0, 60.0),
+        ("invalid", float("inf")),
+        (-1.0, 100.0),
     ],
 )
-def test_shutdown_timeout_configuration_is_safely_bounded(
+def test_invalid_shutdown_timeout_configuration_is_rejected(
     logging_timeout,
     otel_timeout,
-    expected_logging,
-    expected_otel,
 ) -> None:
-    observed, _output = make_runtime(
-        logging=LoggingConfig(shutdown_timeout_seconds=logging_timeout),
-        otel=OTelConfig(
-            enabled=False,
-            shutdown_timeout_seconds=otel_timeout,
-        ),
-    )
-    observed_timeouts: list[tuple[str, float]] = []
+    with pytest.raises(ConfigurationError) as raised:
+        make_runtime(
+            logging=LoggingConfig(shutdown_timeout_seconds=logging_timeout),
+            otel=OTelConfig(
+                enabled=False,
+                shutdown_timeout_seconds=otel_timeout,
+            ),
+        )
 
-    class OTel:
-        def shutdown(self, timeout: float) -> None:
-            observed_timeouts.append(("otel", timeout))
-
-    observed._delivery.close = lambda timeout: observed_timeouts.append(
-        ("logging", timeout)
-    )
-    observed._otel = OTel()
-
-    observed.shutdown()
-
-    assert observed_timeouts == [
-        ("logging", expected_logging),
-        ("otel", expected_otel),
-    ]
+    message = str(raised.value)
+    assert "logging.shutdown_timeout_seconds" in message
+    assert "otel.shutdown_timeout_seconds" in message
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")

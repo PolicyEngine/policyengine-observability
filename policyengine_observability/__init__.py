@@ -2,6 +2,7 @@
 
 from .adapters import instrument_fastapi, instrument_flask
 from .config import (
+    ConfigurationError,
     DeploymentIdentity,
     LoggingConfig,
     ObservabilityConfig,
@@ -38,6 +39,7 @@ __all__ = [
     "TRACEPARENT_HEADER",
     "TRACESTATE_HEADER",
     "CustomLogDestination",
+    "ConfigurationError",
     "DeploymentIdentity",
     "GoogleCloudLogDestination",
     "GoogleCloudLogFormatter",

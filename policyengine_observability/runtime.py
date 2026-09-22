@@ -64,6 +64,7 @@ class _ChildSpanState:
 
 class ObservabilityRuntime:
     def __init__(self, config: ObservabilityConfig) -> None:
+        config.validate()
         self.config = config
         self.diagnostics = Diagnostics()
         self._request_state: ContextVar[_RequestState | None] = ContextVar(
@@ -83,11 +84,14 @@ class ObservabilityRuntime:
         for warning in config.diagnostics():
             self.diagnostics.report("configuration", warning)
         if config.logging.capture_standard_library:
-            instrument_logging(
-                logging.getLogger(),
-                self,
-                replace=config.logging.replace_existing_handlers,
-            )
+            try:
+                instrument_logging(
+                    logging.getLogger(),
+                    self,
+                    replace=config.logging.replace_existing_handlers,
+                )
+            except Exception as exc:
+                self.diagnostics.report("logging.handler_install", exc)
 
     def _new_delivery(self) -> DeliveryManager:
         try:
@@ -802,10 +806,16 @@ def instrument_logging(
             and handler.runtime is runtime
         ):
             return handler
-    if replace:
-        logger.handlers.clear()
     handler = ObservabilityLogHandler(runtime)
-    logger.addHandler(handler)
+    previous_handlers = list(logger.handlers)
+    try:
+        if replace:
+            logger.handlers.clear()
+        logger.addHandler(handler)
+    except Exception:
+        if replace:
+            logger.handlers[:] = previous_handlers
+        raise
     runtime._register_logging_handler(logger, handler)
     return handler
 

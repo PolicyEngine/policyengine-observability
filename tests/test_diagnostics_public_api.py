@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 
+import pytest
 from conftest import make_config, make_runtime, records
 
 import policyengine_observability as observability
@@ -102,6 +103,65 @@ def test_automatic_standard_logging_installation(monkeypatch) -> None:
         runtime._delivery._stdout = io.StringIO()
         logging.getLogger("application.auto").warning("automatic")
         assert records(runtime._delivery._stdout)[0]["message"] == "automatic"
+        runtime.shutdown()
+    finally:
+        logger.handlers[:] = original_handlers
+
+
+def test_invalid_automatic_logging_config_preserves_existing_handlers() -> (
+    None
+):
+    logger = logging.getLogger()
+    original_handlers = list(logger.handlers)
+    existing = logging.StreamHandler(io.StringIO())
+    logger.handlers[:] = [existing]
+    try:
+        config = make_config(
+            logging=observability.LoggingConfig(
+                capture_standard_library=True,
+                replace_existing_handlers=True,
+                minimum_severity="INVALID",  # type: ignore[arg-type]
+            )
+        )
+
+        with pytest.raises(
+            observability.ConfigurationError,
+            match="logging.minimum_severity",
+        ):
+            observability.configure(config)
+
+        assert logger.handlers == [existing]
+    finally:
+        logger.handlers[:] = original_handlers
+
+
+def test_automatic_logging_installation_failure_is_nonfatal(
+    monkeypatch,
+) -> None:
+    logger = logging.getLogger()
+    original_handlers = list(logger.handlers)
+    existing = logging.StreamHandler(io.StringIO())
+    logger.handlers[:] = [existing]
+
+    def fail_add_handler(_handler) -> None:
+        raise RuntimeError("logging subsystem rejected handler")
+
+    try:
+        with monkeypatch.context() as logging_failure:
+            logging_failure.setattr(logger, "addHandler", fail_add_handler)
+            runtime = observability.configure(
+                make_config(
+                    logging=observability.LoggingConfig(
+                        capture_standard_library=True,
+                        replace_existing_handlers=True,
+                    )
+                )
+            )
+
+        assert logger.handlers == [existing]
+        assert (
+            runtime.diagnostics.count("failure.logging.handler_install") == 1
+        )
         runtime.shutdown()
     finally:
         logger.handlers[:] = original_handlers

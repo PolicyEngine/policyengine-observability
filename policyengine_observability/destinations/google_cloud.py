@@ -53,12 +53,22 @@ class GoogleCloudLogDestination:
         return _GoogleCloudWriter(self)
 
     def diagnostics(self) -> tuple[str, ...]:
-        if self.project_id.strip() and self.log_name.strip():
-            return ()
-        return (
-            "Google Cloud logging is disabled because project_id or "
-            "log_name is empty.",
-        )
+        errors: list[str] = []
+        if not self.project_id.strip():
+            errors.append("Google Cloud logging requires project_id.")
+        if not self.log_name.strip():
+            errors.append("Google Cloud logging requires log_name.")
+        _timeout = self.write_timeout_seconds
+        if (
+            not isinstance(_timeout, (int, float))
+            or isinstance(_timeout, bool)
+            or not 0.1 <= _timeout <= 60
+        ):
+            errors.append(
+                "Google Cloud logging write_timeout_seconds must be between "
+                "0.1 and 60."
+            )
+        return tuple(errors)
 
 
 class _GoogleCloudWriter:

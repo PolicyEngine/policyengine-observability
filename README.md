@@ -66,6 +66,11 @@ config = ObservabilityConfig(
 runtime = configure(config)
 ```
 
+`configure` validates the complete configuration before it creates workers,
+exporters, or logging handlers. Invalid values raise `ConfigurationError` with
+the fields that must be corrected. Unavailable credentials or destinations
+after successful validation remain nonfatal runtime failures.
+
 The default logging destination is one-line JSON on standard output. An OTel
 runtime without an exporter still creates local trace context for log
 correlation. It does not send traces or metrics remotely.
@@ -294,11 +299,11 @@ def restore_process_state(self):
 ```
 
 Call `runtime.shutdown()` during orderly process shutdown. Logging and OTel
-each use their own timeout. Missing dependencies, invalid configuration,
-credential failures, unavailable destinations, queue saturation, exporter
-errors, and shutdown timeouts produce rate-limited diagnostics on standard
-error. These failures do not change application responses, return values, or
-exceptions.
+each use their own timeout. After configuration validation succeeds, missing
+optional dependencies, credential failures, unavailable destinations, queue
+saturation, exporter errors, and shutdown timeouts produce rate-limited
+diagnostics on standard error. These runtime failures do not change application
+responses, return values, or exceptions.
 
 ## Release workflow
 

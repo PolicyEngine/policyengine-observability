@@ -57,8 +57,9 @@ uv run --extra dev towncrier check --compare-with origin/main
   fields in the configured destination formatter or writer.
 - Keep OTLP transport independent from exporter authentication and allow
   traces and metrics to use different endpoints.
-- Observability failures must fail open: record an internal observability error
-  when practical, but do not break the application operation being observed.
+- Reject invalid configuration before starting runtime components. After
+  successful validation, record runtime failures internally when practical
+  without breaking the application operation being observed.
 - Preserve structured log schemas. Make additive changes when possible; bump
   schema versions for breaking payload changes.
 - Keep metric attributes bounded and low-cardinality. Do not put raw paths,

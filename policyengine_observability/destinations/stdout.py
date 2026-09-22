@@ -46,5 +46,10 @@ class StdoutLogDestination:
     queue_capacity: int = 1
     batch_size: int = 1
 
+    def diagnostics(self) -> tuple[str, ...]:
+        if self.formatter is not None and not callable(self.formatter):
+            return ("Standard-output formatter must be callable.",)
+        return ()
+
     def build_writer(self, context: DestinationBuildContext) -> RecordWriter:
         return _StdoutWriter(context, self.formatter)

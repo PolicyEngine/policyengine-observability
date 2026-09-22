@@ -88,5 +88,17 @@ class CustomLogDestination:
     batch_size: int = 1
     formatter: RecordFormatter | None = None
 
+    def diagnostics(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        if not self.name.strip():
+            errors.append("Custom log destination name must be non-empty.")
+        if not callable(self.writer_factory):
+            errors.append(
+                "Custom log destination writer_factory must be callable."
+            )
+        if self.formatter is not None and not callable(self.formatter):
+            errors.append("Custom log destination formatter must be callable.")
+        return tuple(errors)
+
     def build_writer(self, _context: DestinationBuildContext) -> RecordWriter:
         return _FormattingWriter(self.writer_factory(), self.formatter)
