@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,78 +18,87 @@ JWT_SUBJECT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
 GOOGLE_CREDENTIAL_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
 
 
+@dataclass(frozen=True, slots=True)
+class _EnvironmentSubjectTokenSupplier:
+    env_names: tuple[str, ...]
+
+    def get_subject_token(self, _context: Any, _request: Any) -> str:
+        for name in self.env_names:
+            token = os.getenv(name)
+            if token:
+                return token
+        from google.auth.exceptions import RefreshError
+
+        names = ", ".join(self.env_names)
+        raise RefreshError(f"No workload identity token found in {names}.")
+
+
 def load_google_credentials(
     *,
     credentials_json_env: str = "GCP_CREDENTIALS_JSON",
     application_credentials_env: str = "GOOGLE_APPLICATION_CREDENTIALS",
-    credentials_path: Path | None = None,
     prefer_workload_identity: bool = False,
 ) -> Any | None:
     """Load Google credentials without performing a network request."""
 
     try:
-        path: Path | None = None
         if prefer_workload_identity:
-            path = _materialize_workload_identity_credentials()
-        if path is None:
-            configured_path = os.getenv(application_credentials_env)
-            if configured_path:
-                path = Path(configured_path)
-        if path is None:
-            path = _materialize_json_credentials(
-                credentials_json_env=credentials_json_env,
-                credentials_path=credentials_path,
-            )
-        if path is None and not prefer_workload_identity:
-            path = _materialize_workload_identity_credentials()
-        if path is None:
-            return None
-        return _load_credentials_from_file(path)
+            credentials = _workload_identity_credentials()
+            if credentials is not None:
+                return credentials
+
+        configured_path = os.getenv(application_credentials_env)
+        if configured_path:
+            return _load_credentials_from_file(Path(configured_path))
+
+        credentials_json = os.getenv(credentials_json_env)
+        if credentials_json:
+            return _load_credentials_from_json(credentials_json)
+
+        if not prefer_workload_identity:
+            return _workload_identity_credentials()
+        return None
     except Exception:
         return None
 
 
-def _materialize_json_credentials(
-    *,
-    credentials_json_env: str,
-    credentials_path: Path | None,
-) -> Path | None:
-    credentials_json = os.getenv(credentials_json_env)
-    if not credentials_json:
-        return None
-    json.loads(credentials_json)
-    path = credentials_path or Path(tempfile.gettempdir()).joinpath(
-        "policyengine-observability-gcp.json"
+def _load_credentials_from_json(credentials_json: str) -> Any:
+    import google.auth
+
+    config = json.loads(credentials_json)
+    credentials, _project = google.auth.load_credentials_from_dict(
+        config,
+        scopes=list(GOOGLE_CREDENTIAL_SCOPES),
     )
-    path.write_text(credentials_json)
-    path.chmod(0o600)
-    return path
+    return credentials
 
 
-def _materialize_workload_identity_credentials() -> Path | None:
-    token = os.getenv(OIDC_TOKEN_ENV) or os.getenv(MODAL_IDENTITY_TOKEN_ENV)
+def _workload_identity_credentials() -> Any | None:
+    token_env_names = (OIDC_TOKEN_ENV, MODAL_IDENTITY_TOKEN_ENV)
+    if not any(os.getenv(name) for name in token_env_names):
+        return None
     provider = os.getenv(WORKLOAD_IDENTITY_PROVIDER_ENV)
-    if not token or not provider:
+    if not provider:
         return None
-    directory = Path(tempfile.gettempdir())
-    token_path = directory / "policyengine-observability-oidc.jwt"
-    config_path = directory / "policyengine-observability-wif.json"
-    token_path.write_text(token)
-    token_path.chmod(0o600)
-    config_path.write_text(
-        json.dumps(
-            _external_account_config(
-                provider=provider,
-                token_path=token_path,
-                service_account_email=os.getenv(SERVICE_ACCOUNT_EMAIL_ENV),
-                token_url=(
-                    os.getenv(STS_TOKEN_URL_ENV) or DEFAULT_STS_TOKEN_URL
-                ),
-            )
+
+    from google.auth import identity_pool
+
+    kwargs: dict[str, Any] = {
+        "audience": _workload_identity_audience(provider),
+        "subject_token_type": JWT_SUBJECT_TOKEN_TYPE,
+        "token_url": os.getenv(STS_TOKEN_URL_ENV) or DEFAULT_STS_TOKEN_URL,
+        "subject_token_supplier": _EnvironmentSubjectTokenSupplier(
+            token_env_names
+        ),
+        "scopes": list(GOOGLE_CREDENTIAL_SCOPES),
+    }
+    service_account_email = os.getenv(SERVICE_ACCOUNT_EMAIL_ENV)
+    if service_account_email:
+        kwargs["service_account_impersonation_url"] = (
+            "https://iamcredentials.googleapis.com/v1/projects/-/"
+            f"serviceAccounts/{service_account_email}:generateAccessToken"
         )
-    )
-    config_path.chmod(0o600)
-    return config_path
+    return identity_pool.Credentials(**kwargs)
 
 
 def _load_credentials_from_file(path: Path) -> Any:
@@ -110,31 +119,6 @@ def _load_credentials_from_file(path: Path) -> Any:
         str(path), scopes=scopes
     )
     return credentials
-
-
-def _external_account_config(
-    *,
-    provider: str,
-    token_path: Path,
-    service_account_email: str | None,
-    token_url: str,
-) -> dict[str, object]:
-    config: dict[str, object] = {
-        "type": "external_account",
-        "audience": _workload_identity_audience(provider),
-        "subject_token_type": JWT_SUBJECT_TOKEN_TYPE,
-        "token_url": token_url,
-        "credential_source": {
-            "file": str(token_path),
-            "format": {"type": "text"},
-        },
-    }
-    if service_account_email:
-        config["service_account_impersonation_url"] = (
-            "https://iamcredentials.googleapis.com/v1/projects/-/"
-            f"serviceAccounts/{service_account_email}:generateAccessToken"
-        )
-    return config
 
 
 def _workload_identity_audience(provider: str) -> str:

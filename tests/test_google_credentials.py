@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import json
-import stat
 
 from policyengine_observability import google_credentials
 
 
-def test_missing_and_malformed_credentials_are_nonfatal(
-    monkeypatch, tmp_path
-) -> None:
+def test_missing_and_malformed_credentials_are_nonfatal(monkeypatch) -> None:
     for name in (
         "GCP_CREDENTIALS_JSON",
         "GOOGLE_APPLICATION_CREDENTIALS",
@@ -19,36 +16,38 @@ def test_missing_and_malformed_credentials_are_nonfatal(
         monkeypatch.delenv(name, raising=False)
     assert google_credentials.load_google_credentials() is None
     monkeypatch.setenv("GCP_CREDENTIALS_JSON", "not-json")
-    assert (
-        google_credentials.load_google_credentials(
-            credentials_path=tmp_path / "credentials.json"
-        )
-        is None
-    )
+    assert google_credentials.load_google_credentials() is None
 
 
-def test_json_credentials_are_materialized_with_private_permissions(
-    monkeypatch, tmp_path
-) -> None:
-    path = tmp_path / "credentials.json"
+def test_json_credentials_are_loaded_in_memory(monkeypatch) -> None:
+    import google.auth
+
+    config = {"type": "external_account", "audience": "test"}
     monkeypatch.setenv(
         "GCP_CREDENTIALS_JSON",
-        json.dumps({"type": "external_account", "audience": "test"}),
+        json.dumps(config),
     )
+    calls: dict[str, object] = {}
+    marker = object()
+
+    def load_credentials_from_dict(info, *, scopes):
+        calls["info"] = info
+        calls["scopes"] = scopes
+        return marker, "project"
+
     monkeypatch.setattr(
-        google_credentials,
-        "_load_credentials_from_file",
-        lambda loaded_path: loaded_path,
+        google.auth,
+        "load_credentials_from_dict",
+        load_credentials_from_dict,
     )
-    result = google_credentials.load_google_credentials(credentials_path=path)
-    assert result == path
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert google_credentials.load_google_credentials() is marker
+    assert calls["info"] == config
+    assert calls["scopes"] == list(google_credentials.GOOGLE_CREDENTIAL_SCOPES)
 
 
-def test_modal_workload_identity_configuration(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        google_credentials.tempfile, "gettempdir", lambda: str(tmp_path)
-    )
+def test_modal_workload_identity_configuration(monkeypatch) -> None:
+    from google.auth import identity_pool
+
     monkeypatch.setenv(
         google_credentials.MODAL_IDENTITY_TOKEN_ENV, "signed-test-token"
     )
@@ -60,22 +59,26 @@ def test_modal_workload_identity_configuration(monkeypatch, tmp_path) -> None:
         google_credentials.SERVICE_ACCOUNT_EMAIL_ENV,
         "modal-example@central.iam.gserviceaccount.com",
     )
-    monkeypatch.setattr(
-        google_credentials,
-        "_load_credentials_from_file",
-        lambda path: json.loads(path.read_text()),
-    )
+    calls: dict[str, object] = {}
+
+    def credentials(**kwargs):
+        calls.update(kwargs)
+        return "credentials"
+
+    monkeypatch.setattr(identity_pool, "Credentials", credentials)
     config = google_credentials.load_google_credentials(
         prefer_workload_identity=True
     )
-    assert config["audience"].startswith("//iam.googleapis.com/projects/123")
-    assert (
-        "modal-example@central.iam.gserviceaccount.com"
-        in config["service_account_impersonation_url"]
+    assert config == "credentials"
+    assert str(calls["audience"]).startswith(
+        "//iam.googleapis.com/projects/123"
     )
-    token_path = tmp_path / "policyengine-observability-oidc.jwt"
-    assert token_path.read_text() == "signed-test-token"
-    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+    assert "modal-example@central.iam.gserviceaccount.com" in str(
+        calls["service_account_impersonation_url"]
+    )
+    assert "credential_source" not in calls
+    supplier = calls["subject_token_supplier"]
+    assert supplier.get_subject_token(None, None) == "signed-test-token"
 
 
 def test_existing_credentials_path_is_loaded(monkeypatch, tmp_path) -> None:

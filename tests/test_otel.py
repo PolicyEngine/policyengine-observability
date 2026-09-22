@@ -25,7 +25,6 @@ from policyengine_observability.google_auth import (
     _google_http_session,
     _google_id_token_credentials,
     _workload_identity_audience,
-    _write_subject_token,
 )
 from policyengine_observability.otel import (
     OTelRuntime,
@@ -306,10 +305,8 @@ def test_google_id_token_uses_modal_workload_identity(monkeypatch) -> None:
     calls: dict[str, object] = {}
 
     class Source:
-        @classmethod
-        def from_info(cls, config, scopes):
-            calls["source"] = (config, scopes)
-            return "source-credentials"
+        def __init__(self, **kwargs):
+            calls["source"] = kwargs
 
     class Target:
         def __init__(self, **kwargs):
@@ -324,10 +321,6 @@ def test_google_id_token_uses_modal_workload_identity(monkeypatch) -> None:
     monkeypatch.setattr(
         impersonated_credentials, "IDTokenCredentials", Identity
     )
-    monkeypatch.setattr(
-        "policyengine_observability.google_auth._write_subject_token",
-        lambda token: f"/tmp/{token}",
-    )
     monkeypatch.setenv("MODAL_IDENTITY_TOKEN", "modal-token")
     monkeypatch.setenv(
         "OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER",
@@ -339,9 +332,9 @@ def test_google_id_token_uses_modal_workload_identity(monkeypatch) -> None:
     )
     result = _google_id_token_credentials("https://collector")
     assert isinstance(result, Identity)
-    assert calls["source"][0]["credential_source"]["file"] == (
-        "/tmp/modal-token"
-    )
+    assert "credential_source" not in calls["source"]
+    supplier = calls["source"]["subject_token_supplier"]
+    assert supplier.get_subject_token(None, None) == "modal-token"
     assert calls["identity"]["target_audience"] == "https://collector"
 
 
@@ -361,7 +354,7 @@ def test_google_id_token_falls_back_to_application_credentials(
     assert result[0] == "https://collector"
 
 
-def test_google_transport_helpers(monkeypatch, tmp_path) -> None:
+def test_google_transport_helpers(monkeypatch) -> None:
     import grpc
     from google.auth.transport import grpc as google_grpc
     from google.auth.transport import requests as google_requests
@@ -405,9 +398,6 @@ def test_google_transport_helpers(monkeypatch, tmp_path) -> None:
     assert session.credentials == "token:https://collector"
     assert session.headers == {"x": "y"}
 
-    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
-    path = _write_subject_token("short-lived-token")
-    assert open(path).read() == "short-lived-token"
     assert _workload_identity_audience("projects/123/provider") == (
         "//iam.googleapis.com/projects/123/provider"
     )

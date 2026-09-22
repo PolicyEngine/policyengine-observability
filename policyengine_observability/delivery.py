@@ -26,6 +26,13 @@ class _InlineDestination:
     failures: int = 0
 
 
+@dataclass(slots=True)
+class _WriterCleanup:
+    name: str
+    thread: threading.Thread
+    timeout_reported: bool = False
+
+
 class DeliveryManager:
     """Fan out provider-neutral records to independently isolated writers."""
 
@@ -41,6 +48,8 @@ class DeliveryManager:
         self._stdout = stdout or sys.stdout
         self._inline: list[_InlineDestination] = []
         self._queued: list[_QueuedWriter] = []
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_tasks: list[_WriterCleanup] = []
         self._configure()
 
     def _configure(self) -> None:
@@ -114,7 +123,10 @@ class DeliveryManager:
             self._inline.remove(destination)
         except ValueError:
             return
-        self._close_writer(destination.writer, destination.strategy.name)
+        self._start_writer_cleanup(
+            destination.writer,
+            destination.strategy.name,
+        )
         self.diagnostics.report(
             "logging.destination_disabled",
             RuntimeError(
@@ -144,20 +156,57 @@ class DeliveryManager:
         except (TypeError, ValueError):
             timeout = 2.0
         deadline = time.monotonic() + timeout
-        for destination in tuple(self._queued):
-            destination.close(max(0.0, deadline - time.monotonic()))
-        for destination in tuple(self._inline):
-            self._close_writer(
+        inline = tuple(self._inline)
+        self._inline.clear()
+        for destination in inline:
+            self._start_writer_cleanup(
                 destination.writer,
                 destination.strategy.name,
             )
+        for destination in tuple(self._queued):
+            destination.close(max(0.0, deadline - time.monotonic()))
+        with self._cleanup_lock:
+            cleanup_tasks = tuple(self._cleanup_tasks)
+        for task in cleanup_tasks:
+            task.thread.join(max(0.0, deadline - time.monotonic()))
+            should_report_timeout = False
+            with self._cleanup_lock:
+                if task.thread.is_alive() and not task.timeout_reported:
+                    task.timeout_reported = True
+                    should_report_timeout = True
+            if should_report_timeout:
+                self.diagnostics.increment("logs.shutdown_timeout")
+                self.diagnostics.report(
+                    "logging.shutdown_timeout",
+                    "Log writer cleanup did not stop before its deadline.",
+                    destination=task.name,
+                )
 
-    def _close_writer(self, writer: RecordWriter, name: str) -> None:
+    def _start_writer_cleanup(self, writer: RecordWriter, name: str) -> None:
         close = getattr(writer, "close", None)
         if not callable(close):
             return
+
+        def run() -> None:
+            try:
+                close()
+            except Exception as exc:
+                self.diagnostics.report(
+                    "logging.writer_close", exc, destination=name
+                )
+
+        task = _WriterCleanup(
+            name=name,
+            thread=threading.Thread(
+                target=run,
+                name=f"policyengine-observability-close-{name}",
+                daemon=True,
+            ),
+        )
         try:
-            close()
+            with self._cleanup_lock:
+                task.thread.start()
+                self._cleanup_tasks.append(task)
         except Exception as exc:
             self.diagnostics.report(
                 "logging.writer_close", exc, destination=name

@@ -133,7 +133,9 @@ logging = LoggingConfig(
 The writer implements `write(record)`. It may optionally implement
 `write_many(records)` and `close()`. A separate integration package can also
 provide a class implementing `LogDestinationStrategy`. Network writers should
-always use `delivery="queued"`.
+always use `delivery="queued"`. Cleanup for inline writers runs on daemon
+threads, and orderly shutdown waits for it only within the configured logging
+shutdown timeout.
 
 ## OTLP destinations and authentication
 
@@ -181,6 +183,12 @@ OTEL_EXPORTER_OTLP_METRICS_HEADERS=x-api-key=metric-key
 `POLICYENGINE_OTEL_GOOGLE_AUDIENCE` selects `GoogleIdTokenAuth` for both
 signals. `POLICYENGINE_OTEL_TRACES_GOOGLE_AUDIENCE` and
 `POLICYENGINE_OTEL_METRICS_GOOGLE_AUDIENCE` override it per signal.
+
+Google authentication constructed from `GCP_CREDENTIALS_JSON`,
+`MODAL_IDENTITY_TOKEN`, or `OBSERVABILITY_GOOGLE_OIDC_TOKEN` stays in process
+memory. The package passes credential data and subject tokens directly to
+Google Auth and does not create temporary credential files. A path explicitly
+provided through `GOOGLE_APPLICATION_CREDENTIALS` remains supported.
 
 Applications can share a collector by configuring the same endpoint and
 credentials. Another application can use a separate collector or any

@@ -209,6 +209,117 @@ def test_shutdown_timeout_is_bounded_and_repeatable() -> None:
     release.set()
 
 
+def test_inline_failure_cleanup_does_not_block_emit() -> None:
+    close_started = threading.Event()
+    release = threading.Event()
+
+    class FailingWriter:
+        def write(self, _record: dict) -> None:
+            raise RuntimeError("write failed")
+
+        def close(self) -> None:
+            close_started.set()
+            release.wait(1)
+
+    manager = DeliveryManager(
+        make_config(
+            logging=LoggingConfig(
+                destinations=(
+                    CustomLogDestination(
+                        name="failing-inline",
+                        writer_factory=FailingWriter,
+                        delivery="inline",
+                    ),
+                ),
+            )
+        ),
+        Diagnostics(stderr=io.StringIO()),
+        stdout=io.StringIO(),
+    )
+
+    manager.emit({"sequence": 1})
+    manager.emit({"sequence": 2})
+    before = time.perf_counter()
+    manager.emit({"sequence": 3})
+
+    assert time.perf_counter() - before < 0.1
+    assert close_started.wait(1)
+    release.set()
+    manager.close(1)
+
+
+def test_inline_shutdown_cleanup_is_bounded_and_repeatable() -> None:
+    close_started = threading.Event()
+    release = threading.Event()
+    diagnostics = Diagnostics(stderr=io.StringIO())
+    close_calls = 0
+
+    class BlockingCloseWriter(RecordingWriter):
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+            close_started.set()
+            release.wait(1)
+
+    manager = DeliveryManager(
+        make_config(
+            logging=LoggingConfig(
+                destinations=(
+                    CustomLogDestination(
+                        name="blocking-inline",
+                        writer_factory=BlockingCloseWriter,
+                        delivery="inline",
+                    ),
+                ),
+                shutdown_timeout_seconds=0.01,
+            )
+        ),
+        diagnostics,
+        stdout=io.StringIO(),
+    )
+
+    before = time.perf_counter()
+    manager.close(0.01)
+    manager.close(0.01)
+
+    assert time.perf_counter() - before < 0.2
+    assert close_started.is_set()
+    assert close_calls == 1
+    assert diagnostics.count("logs.shutdown_timeout") == 1
+    release.set()
+
+
+def test_inline_cleanup_failure_is_contained() -> None:
+    close_attempted = threading.Event()
+    diagnostics = Diagnostics(stderr=io.StringIO())
+
+    class FailingCloseWriter(RecordingWriter):
+        def close(self) -> None:
+            close_attempted.set()
+            raise RuntimeError("close failed")
+
+    manager = DeliveryManager(
+        make_config(
+            logging=LoggingConfig(
+                destinations=(
+                    CustomLogDestination(
+                        name="failing-close",
+                        writer_factory=FailingCloseWriter,
+                        delivery="inline",
+                    ),
+                ),
+            )
+        ),
+        diagnostics,
+        stdout=io.StringIO(),
+    )
+
+    manager.close(1)
+
+    assert close_attempted.is_set()
+    assert diagnostics.count("failure.logging.writer_close") == 1
+
+
 def test_google_writer_batches_with_bounded_api_calls(monkeypatch) -> None:
     from google.cloud import logging_v2
 
