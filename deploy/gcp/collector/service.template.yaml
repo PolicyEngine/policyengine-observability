@@ -2,7 +2,7 @@ apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
   name: policyengine-api-v1-otel-collector
-  namespace: "790230211054"
+  namespace: "${OBSERVABILITY_PROJECT_NUMBER}"
   labels:
     cloud.googleapis.com/location: us-central1
   annotations:
@@ -18,10 +18,13 @@ spec:
     spec:
       containerConcurrency: 100
       timeoutSeconds: 30
-      serviceAccountName: policyengine-otel-collector@policyengine-observability.iam.gserviceaccount.com
+      serviceAccountName: policyengine-otel-collector@${OBSERVABILITY_PROJECT_ID}.iam.gserviceaccount.com
       containers:
         - name: collector
-          image: us-central1-docker.pkg.dev/policyengine-observability/observability/otel-collector:0.160.0-api-v1-1
+          image: us-central1-docker.pkg.dev/${OBSERVABILITY_PROJECT_ID}/observability/otel-collector:0.160.0-api-v1-1
+          env:
+            - name: OBSERVABILITY_PROJECT_ID
+              value: ${OBSERVABILITY_PROJECT_ID}
           ports:
             - name: h2c
               containerPort: 8080

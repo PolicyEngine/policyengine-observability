@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import urllib.parse
 import urllib.request
 from typing import Any
 
-PROJECT = "policyengine-observability"
+PROJECT = os.environ.get("OBSERVABILITY_PROJECT_ID", "")
 API_ROOT = f"https://monitoring.googleapis.com/v3/projects/{PROJECT}"
 
 
@@ -158,7 +159,7 @@ POLICIES = [
                 'resource.type="global" AND '
                 'metric.type="logging.googleapis.com/billing/'
                 'log_bucket_monthly_bytes_ingested" AND '
-                'metric.label."log_bucket_id"="policyengine-observability"'
+                f'metric.label."log_bucket_id"="{PROJECT}"'
             ),
             comparison="COMPARISON_GT",
             threshold=10_737_418_240,
@@ -199,6 +200,10 @@ def _request(
 
 
 def main() -> None:
+    if not PROJECT:
+        raise SystemExit(
+            "Missing deployment variable: OBSERVABILITY_PROJECT_ID"
+        )
     token = _token()
     existing: dict[str, str] = {}
     page_token = ""

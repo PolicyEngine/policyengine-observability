@@ -9,6 +9,7 @@ The script never returns or prints the Modal identity token or Google tokens.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import time
@@ -18,18 +19,21 @@ import urllib.request
 
 import modal
 
-PROJECT = "policyengine-observability"
-PROJECT_NUMBER = "790230211054"
 POOL = "modal-api-v1"
 PROVIDER = "modal-api-v1"
-SERVICE_ACCOUNT = "policyengine-api-v1-modal@policyengine-observability.iam.gserviceaccount.com"
-COLLECTOR = "https://policyengine-api-v1-otel-collector-790230211054.us-central1.run.app"
 APP_NAME = os.environ.get(
     "POLICYENGINE_WIF_TEST_APP",
     "policyengine-observability-wif-denied-test",
 )
 
 app = modal.App(APP_NAME)
+
+
+def _required_environment(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise SystemExit(f"Missing deployment variable: {name}")
+    return value
 
 
 def _jwt_claims(token: str) -> dict[str, object]:
@@ -84,13 +88,23 @@ def _error_result(error: urllib.error.HTTPError) -> dict[str, object]:
 
 
 @app.function(timeout=60)
-def verify_identity() -> dict[str, object]:
+def verify_identity(
+    project: str,
+    project_number: str,
+    workspace_id_digest: str,
+) -> dict[str, object]:
+    service_account = (
+        f"policyengine-api-v1-modal@{project}.iam.gserviceaccount.com"
+    )
+    collector = (
+        "https://policyengine-api-v1-otel-collector-"
+        f"{project_number}.us-central1.run.app"
+    )
     identity_token = os.environ["MODAL_IDENTITY_TOKEN"]
     claims = _jwt_claims(identity_token)
     safe_claims = {
         key: claims.get(key)
         for key in (
-            "workspace_id",
             "environment_name",
             "app_name",
             "function_name",
@@ -98,9 +112,14 @@ def verify_identity() -> dict[str, object]:
             "iss",
         )
     }
+    workspace_id = str(claims.get("workspace_id", ""))
+    workspace_id_matches = (
+        hashlib.sha256(workspace_id.encode()).hexdigest()
+        == workspace_id_digest
+    )
     audience = (
         "//iam.googleapis.com/projects/"
-        f"{PROJECT_NUMBER}/locations/global/workloadIdentityPools/{POOL}"
+        f"{project_number}/locations/global/workloadIdentityPools/{POOL}"
         f"/providers/{PROVIDER}"
     )
     try:
@@ -120,13 +139,14 @@ def verify_identity() -> dict[str, object]:
     except urllib.error.HTTPError as error:
         return {
             "claims": safe_claims,
+            "workspace_id_matches": workspace_id_matches,
             "token_exchange": _error_result(error),
         }
 
     federated_token = str(sts_payload["access_token"])
     service_account_url = (
         "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/"
-        f"{SERVICE_ACCOUNT}"
+        f"{service_account}"
     )
     access_status, access_payload = _post_json(
         f"{service_account_url}:generateAccessToken",
@@ -140,12 +160,12 @@ def verify_identity() -> dict[str, object]:
 
     identity_status, identity_payload = _post_json(
         f"{service_account_url}:generateIdToken",
-        {"audience": COLLECTOR, "includeEmail": True},
+        {"audience": collector, "includeEmail": True},
         bearer_token=federated_token,
     )
     collector_identity_token = str(identity_payload["token"])
     collector_request = urllib.request.Request(
-        COLLECTOR,
+        collector,
         headers={"Authorization": f"Bearer {collector_identity_token}"},
     )
     try:
@@ -158,10 +178,10 @@ def verify_identity() -> dict[str, object]:
     logging_status, _ = _post_json(
         "https://logging.googleapis.com/v2/entries:write",
         {
-            "logName": f"projects/{PROJECT}/logs/policyengine-api-v1-modal",
+            "logName": f"projects/{project}/logs/policyengine-api-v1-modal",
             "resource": {
                 "type": "global",
-                "labels": {"project_id": PROJECT},
+                "labels": {"project_id": project},
             },
             "entries": [
                 {
@@ -180,6 +200,7 @@ def verify_identity() -> dict[str, object]:
     )
     return {
         "claims": safe_claims,
+        "workspace_id_matches": workspace_id_matches,
         "token_exchange": {"http_status": 200},
         "service_account_access": {"http_status": access_status},
         "service_account_identity": {"http_status": identity_status},
@@ -191,4 +212,13 @@ def verify_identity() -> dict[str, object]:
 
 @app.local_entrypoint()
 def main() -> None:
-    print(json.dumps(getattr(verify_identity, "remote")(), sort_keys=True))
+    project = _required_environment("OBSERVABILITY_PROJECT_ID")
+    project_number = _required_environment("OBSERVABILITY_PROJECT_NUMBER")
+    workspace_id = _required_environment("MODAL_WORKSPACE_ID")
+    workspace_id_digest = hashlib.sha256(workspace_id.encode()).hexdigest()
+    result = getattr(verify_identity, "remote")(
+        project,
+        project_number,
+        workspace_id_digest,
+    )
+    print(json.dumps(result, sort_keys=True))

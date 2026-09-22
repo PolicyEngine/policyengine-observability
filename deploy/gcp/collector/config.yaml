@@ -12,7 +12,7 @@ processors:
   resource/destination:
     attributes:
       - key: gcp.project_id
-        value: policyengine-observability
+        value: ${env:OBSERVABILITY_PROJECT_ID}
         action: upsert
   tail_sampling:
     decision_wait: 30s

@@ -3,7 +3,7 @@
 ## Scope
 
 The machine-readable workload inventory is
-[`deploy/gcp/workload-inventory.yaml`](../../deploy/gcp/workload-inventory.yaml).
+[`deploy/gcp/workload-inventory.template.yaml`](../../deploy/gcp/workload-inventory.template.yaml).
 Only the listed `policyengine-api`, simulation entry, simulation gateway, and
 versioned simulation executor workloads participate.
 

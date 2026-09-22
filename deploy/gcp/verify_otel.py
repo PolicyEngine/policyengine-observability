@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import secrets
 import subprocess
 import time
@@ -39,7 +40,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-PROJECT = "policyengine-observability"
+PROJECT = os.environ.get("OBSERVABILITY_PROJECT_ID", "")
 METRIC_NAME = "policyengine.verification.counter"
 METRIC_TYPE = f"prometheus.googleapis.com/{METRIC_NAME}/counter"
 
@@ -219,6 +220,10 @@ def _wait_for_storage(
 
 
 def main() -> int:
+    if not PROJECT:
+        raise SystemExit(
+            "Missing deployment variable: OBSERVABILITY_PROJECT_ID"
+        )
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--service-account", required=True)

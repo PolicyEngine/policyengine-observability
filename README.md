@@ -29,6 +29,8 @@ Service and deployment identity are always explicit. Standard OpenTelemetry
 environment variables may supply OTLP transport settings.
 
 ```python
+import os
+
 from policyengine_observability import (
     DeploymentIdentity,
     LoggingConfig,
@@ -38,6 +40,7 @@ from policyengine_observability import (
     configure,
 )
 
+central_project = os.environ["OBSERVABILITY_PROJECT_ID"]
 config = ObservabilityConfig(
     service=ServiceIdentity(
         name="policyengine-api",
@@ -50,7 +53,7 @@ config = ObservabilityConfig(
         platform="google_cloud_run",
         region="us-central1",
     ),
-    google_cloud_project_id="policyengine-observability",
+    google_cloud_project_id=central_project,
     logging=LoggingConfig(shutdown_timeout_seconds=2),
     otel=OTelConfig(
         endpoint="https://COLLECTOR_HOST",
@@ -203,21 +206,24 @@ Modal writes the same JSON immediately to standard output and may also send a
 copy through one bounded background Cloud Logging writer per process:
 
 ```python
+import os
+
 from policyengine_observability import (
     GoogleCloudLoggingConfig,
     LoggingConfig,
 )
 
+central_project = os.environ["OBSERVABILITY_PROJECT_ID"]
 config = ObservabilityConfig.from_env(
     service=service,
     deployment=DeploymentIdentity(
         environment="production",
         platform="modal",
     ),
-    google_cloud_project_id="policyengine-observability",
+    google_cloud_project_id=central_project,
     logging=LoggingConfig(
         remote=GoogleCloudLoggingConfig(
-            project_id="policyengine-observability",
+            project_id=central_project,
             log_name="policyengine-api-v1-modal",
             queue_capacity=1_000,
             batch_size=100,

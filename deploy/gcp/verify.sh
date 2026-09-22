@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project="policyengine-observability"
+: "${OBSERVABILITY_PROJECT_ID:?Missing OBSERVABILITY_PROJECT_ID}"
+: "${API_PROJECT_ID:?Missing API_PROJECT_ID}"
+: "${SIMULATION_ENTRY_PROJECT_ID:?Missing SIMULATION_ENTRY_PROJECT_ID}"
+
+project="${OBSERVABILITY_PROJECT_ID}"
 region="us-central1"
 collector="policyengine-api-v1-otel-collector"
 
-gcloud logging buckets describe policyengine-observability \
+gcloud logging buckets describe "${OBSERVABILITY_PROJECT_ID}" \
   --location=global \
   --project="${project}" \
   --format='value(name,retentionDays,analyticsEnabled)'
@@ -26,14 +30,14 @@ log_writers="$(
     --filter='bindings.role=roles/logging.logWriter' \
     --format='value(bindings.members)'
 )"
-expected_log_writer='serviceAccount:policyengine-api-v1-modal@policyengine-observability.iam.gserviceaccount.com'
+expected_log_writer="serviceAccount:policyengine-api-v1-modal@${OBSERVABILITY_PROJECT_ID}.iam.gserviceaccount.com"
 if [[ "${log_writers}" != "${expected_log_writer}" ]]; then
   echo "Unexpected project-level Cloud Logging writers: ${log_writers}" >&2
   exit 1
 fi
 
 gcloud logging views get-iam-policy _AllLogs \
-  --bucket=policyengine-observability \
+  --bucket="${OBSERVABILITY_PROJECT_ID}" \
   --location=global \
   --project="${project}" \
   --format=json
@@ -44,7 +48,7 @@ gcloud iam workload-identity-pools providers describe modal-api-v1 \
   --project="${project}" \
   --format='yaml(state,attributeCondition,attributeMapping,oidc)'
 
-for source_project in policyengine-api policyengine-simulation-entry; do
+for source_project in "${API_PROJECT_ID}" "${SIMULATION_ENTRY_PROJECT_ID}"; do
   gcloud logging sinks describe api-v1-central-observability \
     --project="${source_project}" \
     --format='yaml(destination,filter,writerIdentity)'

@@ -151,7 +151,7 @@
               {
                 "timeSeriesQuery": {
                   "timeSeriesFilter": {
-                    "filter": "resource.type=\"global\" AND metric.type=\"logging.googleapis.com/billing/log_bucket_bytes_ingested\" AND metric.label.\"log_bucket_id\"=\"policyengine-observability\"",
+                    "filter": "resource.type=\"global\" AND metric.type=\"logging.googleapis.com/billing/log_bucket_bytes_ingested\" AND metric.label.\"log_bucket_id\"=\"${OBSERVABILITY_PROJECT_ID}\"",
                     "aggregation": {
                       "alignmentPeriod": "3600s",
                       "perSeriesAligner": "ALIGN_SUM",

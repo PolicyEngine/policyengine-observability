@@ -1,9 +1,11 @@
 # Google Cloud deployment plan
 
 This directory defines the centralized API v1 observability resources in the
-`policyengine-observability` project. The workload boundary is defined in
-[`workload-inventory.yaml`](workload-inventory.yaml). Applications absent from
-that inventory receive no credentials or destination permissions.
+project selected by `OBSERVABILITY_PROJECT_ID`. The workload boundary is
+defined in
+[`workload-inventory.template.yaml`](workload-inventory.template.yaml).
+Applications absent from that inventory receive no credentials or destination
+permissions.
 
 These files are a reviewable deployment plan. Applying them changes live IAM,
 Cloud Logging routing, Cloud Run, and monitoring resources and therefore
@@ -15,11 +17,12 @@ requires an operator-approved deployment window.
 | --- | --- |
 | `collector/config.yaml` | OTLP gRPC receiver, bounded processors, and Google Telemetry API exporter for traces and metrics |
 | `collector/Dockerfile` | Google-built OTel Collector 0.160.0 plus the reviewed configuration |
-| `collector/service.yaml` | Authenticated Cloud Run collector with fixed CPU, memory, concurrency, health checks, and scaling bounds |
-| `log-routing.yaml` | Exact Cloud Run source sinks, restricted Modal direct-log sink, and `_Default` duplicate exclusion |
-| `iam.yaml` | Collector and Modal service accounts, Cloud Run invokers, and a dedicated Modal API v1 identity provider |
-| `dashboard.json` | Initial request, latency, error, dropped-item, and exporter-failure dashboard |
-| `alerts.yaml` | Initial alert policy inputs |
+| `collector/service.template.yaml` | Authenticated Cloud Run collector with fixed CPU, memory, concurrency, health checks, and scaling bounds |
+| `log-routing.template.yaml` | Exact Cloud Run source sinks, restricted Modal direct-log sink, and `_Default` duplicate exclusion |
+| `iam.template.yaml` | Collector and Modal service accounts, Cloud Run invokers, and a dedicated Modal API v1 identity provider |
+| `dashboard.template.json` | Initial request, latency, error, dropped-item, and exporter-failure dashboard |
+| `alerts.template.yaml` | Initial alert policy inputs |
+| `render_deployment.py` | Validates deployment variables and writes private rendered files under `rendered/` |
 | `verify.sh` | Read-only resource and routing checks after deployment |
 
 The collector accepts traces and metrics. Application logs do not enter the
@@ -34,7 +37,41 @@ to receive spans needed for this decision.
 
 ## Deployment order
 
-### 1. Enable services
+### 1. Configure and render deployment values
+
+Configure these GitHub Actions repository variables:
+
+- `OBSERVABILITY_PROJECT_ID`
+- `OBSERVABILITY_PROJECT_NUMBER`
+- `API_PROJECT_ID`
+- `SIMULATION_ENTRY_PROJECT_ID`
+
+Configure `MODAL_WORKSPACE_ID` as a GitHub Actions repository secret. It is
+private deployment metadata and must not be printed by workflows.
+
+Workflows that render or apply the deployment must map the values explicitly:
+
+```yaml
+env:
+  OBSERVABILITY_PROJECT_ID: ${{ vars.OBSERVABILITY_PROJECT_ID }}
+  OBSERVABILITY_PROJECT_NUMBER: ${{ vars.OBSERVABILITY_PROJECT_NUMBER }}
+  API_PROJECT_ID: ${{ vars.API_PROJECT_ID }}
+  SIMULATION_ENTRY_PROJECT_ID: ${{ vars.SIMULATION_ENTRY_PROJECT_ID }}
+  MODAL_WORKSPACE_ID: ${{ secrets.MODAL_WORKSPACE_ID }}
+```
+
+For an operator-run deployment, set the same five values in the local process
+without writing them to a tracked file, then render the templates:
+
+```bash
+.venv/bin/python deploy/gcp/render_deployment.py
+```
+
+The renderer validates every value, reports only variable names, and writes
+files with owner-only permissions under the ignored `deploy/gcp/rendered/`
+directory.
+
+### 2. Enable services
 
 ```bash
 gcloud services enable \
@@ -48,23 +85,23 @@ gcloud services enable \
   sts.googleapis.com \
   telemetry.googleapis.com \
   tracing.googleapis.com \
-  --project=policyengine-observability
+  --project="${OBSERVABILITY_PROJECT_ID}"
 ```
 
-### 2. Create identities
+### 3. Create identities
 
-Create these service accounts in `policyengine-observability`:
+Create these service accounts in the central project:
 
 ```text
-policyengine-otel-collector@policyengine-observability.iam.gserviceaccount.com
-policyengine-api-v1-modal@policyengine-observability.iam.gserviceaccount.com
+policyengine-otel-collector@${OBSERVABILITY_PROJECT_ID}.iam.gserviceaccount.com
+policyengine-api-v1-modal@${OBSERVABILITY_PROJECT_ID}.iam.gserviceaccount.com
 ```
 
-Grant only the roles listed in [`iam.yaml`](iam.yaml). The collector receives
-`roles/telemetry.writer` and `roles/serviceusage.serviceUsageConsumer`. The Modal identity receives
-`roles/logging.logWriter` and collector invocation permission. The four
-existing Cloud Run identities in the inventory receive collector invocation
-permission on the collector service only.
+Grant only the roles listed in the rendered `iam.yaml`. The collector receives
+`roles/telemetry.writer` and `roles/serviceusage.serviceUsageConsumer`. The
+Modal identity receives `roles/logging.logWriter` and collector invocation
+permission. The four existing Cloud Run identities in the inventory receive
+collector invocation permission on the collector service only.
 
 Remove project-level `roles/logging.logWriter` bindings from every identity
 outside this inventory. Source-project logging service agents use conditional
@@ -74,43 +111,43 @@ project-level log writer is present.
 
 Create a separate `modal-api-v1` workload identity pool and provider using the
 issuer, audience, mappings, workspace, environment, and application condition
-in `iam.yaml`. Do not modify the existing `modal/modal` provider during this
-deployment; it belongs to applications excluded from this change. Grant the
-new provider permission to impersonate only the API v1 Modal service account.
+in the rendered `iam.yaml`. Do not modify the existing `modal/modal` provider
+during this deployment; it belongs to applications excluded from this change.
+Grant the new provider permission to impersonate only the API v1 Modal service
+account.
 
 Before enabling the provider, decode one production and one staging Modal
 identity token locally and confirm that `workspace_id`, `environment_name`,
 and `app_name` exactly match the reviewed condition.
 
-### 3. Build and deploy the collector
+### 4. Build and deploy the collector
 
 ```bash
 gcloud artifacts repositories create observability \
   --repository-format=docker \
   --location=us-central1 \
   --immutable-tags \
-  --project=policyengine-observability
+  --project="${OBSERVABILITY_PROJECT_ID}"
 
 gcloud builds submit deploy/gcp/collector \
-  --tag=us-central1-docker.pkg.dev/policyengine-observability/observability/otel-collector:0.160.0-api-v1-1 \
-  --project=policyengine-observability
+  --tag="us-central1-docker.pkg.dev/${OBSERVABILITY_PROJECT_ID}/observability/otel-collector:0.160.0-api-v1-1" \
+  --project="${OBSERVABILITY_PROJECT_ID}"
 
-gcloud run services replace deploy/gcp/collector/service.yaml \
+gcloud run services replace deploy/gcp/rendered/collector/service.yaml \
   --region=us-central1 \
-  --project=policyengine-observability
+  --project="${OBSERVABILITY_PROJECT_ID}"
 ```
 
-Apply `roles/run.invoker` bindings for the five identities listed in
-`iam.yaml`. Do not grant unauthenticated invocation. Record the HTTPS service
-URL as both `OTEL_EXPORTER_OTLP_ENDPOINT` and
+Apply `roles/run.invoker` bindings for the five identities listed in the
+rendered `iam.yaml`. Do not grant unauthenticated invocation. Record the HTTPS
+service URL as both `OTEL_EXPORTER_OTLP_ENDPOINT` and
 `POLICYENGINE_OTEL_GOOGLE_AUDIENCE` in participating service configuration.
 
-### 4. Configure log routing
+### 5. Configure log routing
 
 Create one aggregated sink in each source project using the exact service and
-schema filters in [`log-routing.yaml`](log-routing.yaml). Grant each generated
-sink writer identity `roles/logging.bucketWriter` on the central
-`policyengine-observability` bucket.
+schema filters in the rendered `log-routing.yaml`. Grant each generated sink
+writer identity `roles/logging.bucketWriter` on the central log bucket.
 
 Update `policyengine-observability-app-logs` to the listed direct-log filter.
 Add the listed exclusion to `_Default`; this prevents a direct Modal log from
@@ -120,12 +157,12 @@ Cloud Audit Log exclusions.
 After routing one synthetic record per participating service, confirm each
 `insertId` exists exactly once in the central project.
 
-### 5. Create dashboard and alerts
+### 6. Create dashboard and alerts
 
 ```bash
 gcloud monitoring dashboards create \
-  --config-from-file=deploy/gcp/dashboard.json \
-  --project=policyengine-observability
+  --config-from-file=deploy/gcp/rendered/dashboard.json \
+  --project="${OBSERVABILITY_PROJECT_ID}"
 ```
 
 Create the API-ready alert policies with:
@@ -138,7 +175,7 @@ The script is idempotent by policy display name. It leaves notification-channel
 configuration empty when the project has no channel; add operator-owned channel
 identifiers after creating the relevant email, Slack, or paging destination.
 
-### 6. Verify before consumer deployment
+### 7. Verify before consumer deployment
 
 ```bash
 bash deploy/gcp/verify.sh
@@ -154,8 +191,8 @@ For an operator-run Cloud Run identity check, temporarily grant the operator
 
 ```bash
 .venv/bin/python deploy/gcp/verify_otel.py \
-  --endpoint=https://policyengine-api-v1-otel-collector-790230211054.us-central1.run.app \
-  --service-account=sim-entry-beta-runtime@policyengine-simulation-entry.iam.gserviceaccount.com
+  --endpoint="${POLICYENGINE_OTEL_GOOGLE_AUDIENCE}" \
+  --service-account="sim-entry-beta-runtime@${SIMULATION_ENTRY_PROJECT_ID}.iam.gserviceaccount.com"
 ```
 
 Remove the temporary operator binding immediately after the check. The script
@@ -191,16 +228,16 @@ application deployment.
 The infrastructure portion of this runbook was applied and verified on
 2026-09-22:
 
-- the global `policyengine-observability` log bucket retains records for 30
+- the global central log bucket retains records for 30
   days and has log analytics enabled;
 - exact source-project sinks route the two API services and the two simulation
   entry services to that bucket;
 - the authenticated collector runs in `us-central1` as
   `policyengine-api-v1-otel-collector`;
 - the dedicated `modal-api-v1` identity provider is active with the workspace,
-  environment, and application conditions in `iam.yaml`;
-- the only project-level `roles/logging.logWriter` identity is
-  `policyengine-api-v1-modal`;
+  environment, and application conditions in the rendered `iam.yaml`;
+- the only project-level `roles/logging.logWriter` identity is the API v1
+  Modal service account;
 - the dashboard and six alert policies are present and enabled; and
 - the project currently has no alert notification channel, so the policies
   record incidents without sending email, Slack, or paging notifications.

@@ -36,7 +36,7 @@ policies:
   - display_name: API v1 monthly log ingestion above 10 GiB
     condition_type: metric_threshold
     metric_type: logging.googleapis.com/billing/log_bucket_monthly_bytes_ingested
-    metric_label_log_bucket_id: policyengine-observability
+    metric_label_log_bucket_id: ${OBSERVABILITY_PROJECT_ID}
     comparison: COMPARISON_GT
     threshold: 10737418240
     duration: 0s
