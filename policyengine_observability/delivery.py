@@ -70,7 +70,12 @@ class DeliveryManager:
     def close(self, timeout_seconds: float | None = None) -> None:
         if self._remote is None:
             return
-        self._remote.close(timeout_seconds)
+        timeout = (
+            self.config.logging.shutdown_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        self._remote.close(timeout)
 
     @property
     def remote_enabled(self) -> bool:
@@ -124,7 +129,7 @@ class _QueuedWriter:
     def queue_depth(self) -> int:
         return self._queue.qsize()
 
-    def close(self, timeout_seconds: float | None = None) -> None:
+    def close(self, timeout_seconds: float) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
@@ -132,12 +137,7 @@ class _QueuedWriter:
             self._queue.put_nowait(self._STOP)
         except queue.Full:
             pass
-        timeout = (
-            self.config.close_timeout_seconds
-            if timeout_seconds is None
-            else timeout_seconds
-        )
-        self._thread.join(max(0.0, timeout))
+        self._thread.join(max(0.0, timeout_seconds))
         if self._thread.is_alive():
             self.diagnostics.increment("logs.shutdown_timeout")
             self.diagnostics.report(

@@ -48,6 +48,13 @@ class Diagnostics:
         with self._lock:
             return dict(self._counts)
 
+    def restart_after_process_duplication(self) -> None:
+        """Replace synchronization state inherited across process copying."""
+
+        self._lock = threading.Lock()
+        self._last_report = {}
+        self._counts = Counter()
+
     def report(
         self,
         operation: str,

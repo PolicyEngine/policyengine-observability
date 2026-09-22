@@ -80,6 +80,33 @@ def test_fastapi_lifecycle_and_idempotence() -> None:
     unused.shutdown()
 
 
+def test_fastapi_response_observability_failure_preserves_response(
+    monkeypatch,
+) -> None:
+    runtime, output = make_runtime()
+    app = FastAPI()
+
+    @app.get("/ok")
+    async def ok():
+        return {"status": "ok"}
+
+    def fail_response_headers():
+        raise RuntimeError("response instrumentation failed")
+
+    monkeypatch.setattr(runtime, "response_headers", fail_response_headers)
+    instrument_fastapi(app, runtime)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/ok")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert REQUEST_ID_HEADER not in response.headers
+    assert runtime.diagnostics.count("failure.fastapi.response_headers") == 1
+    assert records(output)[0]["outcome"] == "success"
+    runtime.shutdown()
+
+
 def test_fastapi_error_and_non_http_scope() -> None:
     runtime, output = make_runtime()
     app = FastAPI()

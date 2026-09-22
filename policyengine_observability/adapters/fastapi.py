@@ -56,13 +56,18 @@ class _ObservabilityMiddleware:
             if message.get("type") == "http.response.start":
                 status_code = int(message.get("status") or 0)
                 self._update_route(scope)
-                message = {
-                    **message,
-                    "headers": _merge_headers(
-                        list(message.get("headers") or []),
-                        self.runtime.response_headers(),
-                    ),
-                }
+                try:
+                    message = {
+                        **message,
+                        "headers": _merge_headers(
+                            list(message.get("headers") or []),
+                            self.runtime.response_headers(),
+                        ),
+                    }
+                except Exception as exc:
+                    self.runtime.diagnostics.report(
+                        "fastapi.response_headers", exc
+                    )
             await send(message)
             if message.get("type") == "http.response.body" and not message.get(
                 "more_body", False

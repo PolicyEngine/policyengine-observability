@@ -68,7 +68,6 @@ class GoogleCloudLoggingConfig:
     queue_capacity: int = 1_000
     batch_size: int = 1
     write_timeout_seconds: float = 5.0
-    close_timeout_seconds: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +77,7 @@ class LoggingConfig:
     capture_standard_library: bool = False
     replace_existing_handlers: bool = False
     minimum_severity: int = 20
+    shutdown_timeout_seconds: float = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +96,7 @@ class OTelConfig:
     span_schedule_delay_seconds: float = 5.0
     export_timeout_seconds: float = 5.0
     metric_export_interval_seconds: float = 60.0
+    shutdown_timeout_seconds: float = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +105,6 @@ class TelemetryLimits:
     max_string_length: int = 1_024
     max_error_message_length: int = 2_048
     max_stack_length: int = 16_384
-    shutdown_timeout_seconds: float = 3.0
     async_parent_max_age_seconds: float = 300.0
 
 

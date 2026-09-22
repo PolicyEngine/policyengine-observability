@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import select
+import signal
+import threading
+import time
 
 import pytest
 from conftest import make_config, make_runtime, records
 
 from policyengine_observability import (
     REQUEST_ID_HEADER,
+    LoggingConfig,
+    OTelConfig,
     configure,
     instrument_logging,
 )
@@ -264,6 +271,178 @@ def test_shutdown_is_bounded_repeatable_and_restartable(runtime) -> None:
     assert observed._closed
     observed.restart_after_snapshot()
     assert not observed._closed
+
+
+def test_shutdown_contains_delivery_failure_and_continues_cleanup(
+    monkeypatch,
+) -> None:
+    observed, _output = make_runtime(
+        logging=LoggingConfig(shutdown_timeout_seconds=0.125),
+        otel=OTelConfig(enabled=False, shutdown_timeout_seconds=0.375),
+    )
+    otel_timeouts: list[float] = []
+
+    class OTel:
+        def shutdown(self, timeout: float) -> None:
+            otel_timeouts.append(timeout)
+
+    def fail_close(timeout: float) -> None:
+        assert timeout == 0.125
+        raise RuntimeError("logging close failed")
+
+    logger = logging.getLogger("tests.shutdown.cleanup")
+    logger.handlers.clear()
+    logger.propagate = False
+    handler = instrument_logging(logger, observed)
+    observed._otel = OTel()
+    monkeypatch.setattr(observed._delivery, "close", fail_close)
+
+    observed.shutdown()
+    observed.shutdown()
+
+    assert otel_timeouts == [0.375]
+    assert handler not in logger.handlers
+    assert observed.diagnostics.count("failure.logging.shutdown") == 1
+
+
+def test_shutdown_bounds_otel_with_its_own_timeout() -> None:
+    observed, _output = make_runtime(
+        logging=LoggingConfig(shutdown_timeout_seconds=0),
+        otel=OTelConfig(enabled=False, shutdown_timeout_seconds=0.01),
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingOTel:
+        def shutdown(self, timeout: float) -> None:
+            assert timeout == 0.01
+            started.set()
+            release.wait(1)
+
+    observed._otel = BlockingOTel()
+    before = time.perf_counter()
+    observed.shutdown()
+    elapsed = time.perf_counter() - before
+
+    assert started.is_set()
+    assert elapsed < 0.2
+    assert observed.diagnostics.count("shutdown.timeout") == 1
+    release.set()
+
+
+def test_shutdown_contains_otel_coordinator_failure(monkeypatch) -> None:
+    observed, _output = make_runtime()
+
+    def fail_bounded_shutdown(*_args, **_kwargs) -> None:
+        raise RuntimeError("could not start shutdown worker")
+
+    monkeypatch.setattr(
+        "policyengine_observability.runtime._run_bounded",
+        fail_bounded_shutdown,
+    )
+
+    observed.shutdown()
+
+    assert observed.diagnostics.count("failure.otel.shutdown") == 1
+
+
+@pytest.mark.parametrize(
+    ("logging_timeout", "otel_timeout", "expected_logging", "expected_otel"),
+    [
+        ("invalid", float("inf"), 2.0, 3.0),
+        (-1.0, 100.0, 0.0, 60.0),
+    ],
+)
+def test_shutdown_timeout_configuration_is_safely_bounded(
+    logging_timeout,
+    otel_timeout,
+    expected_logging,
+    expected_otel,
+) -> None:
+    observed, _output = make_runtime(
+        logging=LoggingConfig(shutdown_timeout_seconds=logging_timeout),
+        otel=OTelConfig(
+            enabled=False,
+            shutdown_timeout_seconds=otel_timeout,
+        ),
+    )
+    observed_timeouts: list[tuple[str, float]] = []
+
+    class OTel:
+        def shutdown(self, timeout: float) -> None:
+            observed_timeouts.append(("otel", timeout))
+
+    observed._delivery.close = lambda timeout: observed_timeouts.append(
+        ("logging", timeout)
+    )
+    observed._otel = OTel()
+
+    observed.shutdown()
+
+    assert observed_timeouts == [
+        ("logging", expected_logging),
+        ("otel", expected_otel),
+    ]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_restart_after_snapshot_replaces_inherited_locked_state() -> None:
+    observed, _output = make_runtime()
+    observed._shutdown_lock.acquire()
+    observed.diagnostics._lock.acquire()
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+
+    if child_pid == 0:
+        os.close(read_fd)
+        try:
+            observed.restart_after_snapshot()
+            observed.diagnostics.increment("post_fork")
+            observed.shutdown()
+            os.write(write_fd, b"ok")
+        except BaseException as error:
+            os.write(write_fd, repr(error).encode()[:1_024])
+        finally:
+            os.close(write_fd)
+            os._exit(0)
+
+    os.close(write_fd)
+    result = b""
+    try:
+        readable, _, _ = select.select([read_fd], [], [], 2)
+        if not readable:
+            os.kill(child_pid, signal.SIGKILL)
+            pytest.fail("child blocked on inherited observability state")
+        result = os.read(read_fd, 1_024)
+    finally:
+        observed.diagnostics._lock.release()
+        observed._shutdown_lock.release()
+        os.close(read_fd)
+        os.waitpid(child_pid, 0)
+        observed.shutdown()
+
+    assert result == b"ok"
+
+
+def test_restart_after_snapshot_rebuilds_process_local_components() -> None:
+    observed, _output = make_runtime()
+    observed.diagnostics.increment("before_snapshot")
+    observed.begin_request(
+        headers={REQUEST_ID_HEADER: "snapshotted-request"},
+        method="GET",
+        route="/snapshot",
+    )
+    inherited_delivery = observed._delivery
+    inherited_otel = observed._otel
+
+    observed.restart_after_snapshot()
+
+    assert observed._delivery is not inherited_delivery
+    assert observed._otel is not inherited_otel
+    assert observed.response_headers() == {}
+    assert observed.diagnostics.count("before_snapshot") == 0
+    assert not observed._closed
+    observed.shutdown()
 
 
 def test_local_drop_and_export_diagnostics_increment_otel_metrics() -> None:

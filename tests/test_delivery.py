@@ -42,14 +42,17 @@ def modal_config(**remote_overrides):
         "project_id": "policyengine-observability",
         "queue_capacity": 10,
         "batch_size": 5,
-        "close_timeout_seconds": 0.2,
     }
+    shutdown_timeout_seconds = remote_overrides.pop(
+        "shutdown_timeout_seconds", 0.2
+    )
     remote_values.update(remote_overrides)
     return make_config(
         deployment=DeploymentIdentity("test", "modal"),
         logging=LoggingConfig(
             stdout_enabled=True,
             remote=GoogleCloudLoggingConfig(**remote_values),
+            shutdown_timeout_seconds=shutdown_timeout_seconds,
         ),
     )
 
@@ -197,7 +200,7 @@ def test_shutdown_timeout_is_bounded_and_repeatable() -> None:
             release.wait(1)
 
     manager = DeliveryManager(
-        modal_config(close_timeout_seconds=0.01),
+        modal_config(shutdown_timeout_seconds=0.01),
         diagnostics,
         stdout=io.StringIO(),
         writer_factory=lambda _config: BlockingWriter(),

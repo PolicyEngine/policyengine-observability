@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import re
 import threading
 import time
@@ -427,28 +428,56 @@ class ObservabilityRuntime:
             if self._closed:
                 return
             self._closed = True
-            timeout = max(0.0, self.config.limits.shutdown_timeout_seconds)
-            self._delivery.close(timeout)
-            _run_bounded(
-                lambda: self._otel.shutdown(timeout),
-                timeout,
-                self.diagnostics,
-                "otel.shutdown_deadline",
+            logging_timeout = _bounded_shutdown_timeout(
+                self.config.logging.shutdown_timeout_seconds,
+                default=2.0,
             )
-            self._remove_logging_handlers()
-
-    def restart_after_snapshot(self) -> None:
-        with self._shutdown_lock:
-            timeout = min(
-                max(0.0, self.config.limits.shutdown_timeout_seconds), 1.0
+            otel_timeout = _bounded_shutdown_timeout(
+                self.config.otel.shutdown_timeout_seconds,
+                default=3.0,
             )
             try:
-                self._delivery.close(timeout)
+                try:
+                    self._delivery.close(logging_timeout)
+                except Exception as exc:
+                    self.diagnostics.report("logging.shutdown", exc)
+                try:
+                    _run_bounded(
+                        lambda: self._otel.shutdown(otel_timeout),
+                        otel_timeout,
+                        self.diagnostics,
+                        "otel.shutdown_deadline",
+                    )
+                except Exception as exc:
+                    self.diagnostics.report("otel.shutdown", exc)
+            finally:
+                self._remove_logging_handlers()
+
+    def restart_after_snapshot(self) -> None:
+        """Rebuild process-local state after a fork or snapshot restore.
+
+        Call this only in a single-threaded lifecycle callback before the
+        copied process accepts application work. Inherited workers and locks
+        are abandoned because their owning threads may not exist in the new
+        process.
+        """
+
+        self._shutdown_lock = threading.Lock()
+        self.diagnostics.restart_after_process_duplication()
+        self._request_state = ContextVar(
+            f"policyengine_request_{id(self)}", default=None
+        )
+        self._operation_state = ContextVar(
+            f"policyengine_operation_{id(self)}", default=None
+        )
+        for _logger, handler in self._logging_handlers:
+            try:
+                handler.createLock()
             except Exception as exc:
-                self.diagnostics.report("snapshot.delivery_close", exc)
-            self._delivery = self._new_delivery()
-            self._otel = self._new_otel()
-            self._closed = False
+                self.diagnostics.report("process.logging_handler_lock", exc)
+        self._delivery = self._new_delivery()
+        self._otel = self._new_otel()
+        self._closed = False
 
     def _start_operation(
         self,
@@ -855,3 +884,13 @@ def _run_bounded(
             diagnostic_name,
             "Operation exceeded the configured shutdown deadline.",
         )
+
+
+def _bounded_shutdown_timeout(value: float, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return min(max(parsed, 0.0), 60.0)

@@ -31,12 +31,14 @@ environment variables may supply OTLP transport settings.
 ```python
 from policyengine_observability import (
     DeploymentIdentity,
+    LoggingConfig,
     ObservabilityConfig,
+    OTelConfig,
     ServiceIdentity,
     configure,
 )
 
-config = ObservabilityConfig.from_env(
+config = ObservabilityConfig(
     service=ServiceIdentity(
         name="policyengine-api",
         namespace="policyengine.api-v1",
@@ -49,6 +51,12 @@ config = ObservabilityConfig.from_env(
         region="us-central1",
     ),
     google_cloud_project_id="policyengine-observability",
+    logging=LoggingConfig(shutdown_timeout_seconds=2),
+    otel=OTelConfig(
+        endpoint="https://COLLECTOR_HOST",
+        google_audience="https://COLLECTOR_HOST",
+        shutdown_timeout_seconds=3,
+    ),
 )
 runtime = configure(config)
 ```
@@ -224,8 +232,8 @@ Remote logging starts no client until the background worker receives its first
 record. The calling thread uses `put_nowait`; a full queue drops the newest
 record and records a local counter.
 
-After a Modal memory snapshot restores, rebuild process-local queues, threads,
-credentials, and exporters before accepting work:
+After a Modal memory snapshot restores, rebuild process-local locks, context,
+queues, threads, credentials, and exporters before accepting work:
 
 ```python
 @modal.enter(snap=False)
@@ -241,8 +249,10 @@ invalid configuration, unavailable DNS, denied permissions, collector failure,
 queue saturation, and shutdown timeouts produce rate-limited JSON diagnostics
 on standard error. Those diagnostics do not enter the failing exporter.
 
-Call `runtime.shutdown()` during orderly process shutdown. The call is bounded
-and safe to repeat.
+Call `runtime.shutdown()` during orderly process shutdown. Logging and OTel
+each use the timeout configured on their respective configuration objects. A
+failure in either subsystem is reported locally and does not prevent cleanup
+of the other subsystem. The call is safe to repeat.
 
 The operating policy, workload allowlist, Google Cloud deployment plan, and
 rollback procedure are in
