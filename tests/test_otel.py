@@ -72,6 +72,32 @@ def test_owned_provider_creates_local_spans_metrics_and_resources() -> None:
     runtime.shutdown()
 
 
+def test_sensitive_values_are_redacted_from_span_attributes() -> None:
+    config = make_config(
+        otel=OTelConfig(enabled=True),
+        application_attribute_keys=frozenset({"backend"}),
+        sensitive_values=("secret-value",),
+    )
+    runtime = configure(config)
+    runtime._delivery._stdout = io.StringIO()
+    exporter = InMemorySpanExporter()
+    runtime._otel._tracer_provider.add_span_processor(
+        SimpleSpanProcessor(exporter)
+    )
+
+    with runtime.operation(
+        "simulation.run",
+        attributes={"backend": "prefix-secret-value-suffix"},
+    ):
+        pass
+
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes["backend"] == "prefix-[REDACTED]-suffix"
+    item = records(runtime._delivery._stdout)[0]
+    assert item["attributes"]["backend"] == "prefix-[REDACTED]-suffix"
+    runtime.shutdown()
+
+
 def test_incoming_trace_context_correlates_log_and_response() -> None:
     runtime, exporter = _runtime_with_spans()
     trace_id = "1" * 32

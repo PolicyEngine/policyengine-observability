@@ -4,6 +4,7 @@ import queue
 import sys
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, TextIO
 
@@ -100,7 +101,7 @@ class DeliveryManager:
         disabled: list[_InlineDestination] = []
         for destination in tuple(self._inline):
             try:
-                destination.writer.write(record.copy())
+                destination.writer.write(deepcopy(record))
                 destination.failures = 0
             except Exception as exc:
                 destination.failures += 1
@@ -116,7 +117,7 @@ class DeliveryManager:
         for destination in disabled:
             self._disable_inline(destination)
         for destination in tuple(self._queued):
-            destination.enqueue(record.copy())
+            destination.enqueue(deepcopy(record))
 
     def _disable_inline(self, destination: _InlineDestination) -> None:
         try:

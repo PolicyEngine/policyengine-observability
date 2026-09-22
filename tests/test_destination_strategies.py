@@ -14,6 +14,7 @@ from policyengine_observability import (
     StdoutLogDestination,
 )
 from policyengine_observability.delivery import DeliveryManager
+from policyengine_observability.destinations import DestinationBuildContext
 from policyengine_observability.diagnostics import Diagnostics
 
 
@@ -160,6 +161,76 @@ def test_one_destination_failure_does_not_affect_another_destination() -> None:
     ]
     assert diagnostics.count("logs.export_failure") == 3
     assert diagnostics.count("failure.logging.destination_disabled") == 1
+
+
+def test_formatters_receive_deeply_isolated_records() -> None:
+    formatted = RecordingWriter()
+    unchanged = RecordingWriter()
+    source = {"attributes": {"backend": "original"}}
+
+    def mutate_nested(record: dict) -> dict:
+        record["attributes"]["backend"] = "formatted"
+        return record
+
+    manager = DeliveryManager(
+        make_config(
+            logging=LoggingConfig(
+                destinations=(
+                    CustomLogDestination(
+                        name="formatted",
+                        writer_factory=lambda: formatted,
+                        delivery="inline",
+                        formatter=mutate_nested,
+                    ),
+                    CustomLogDestination(
+                        name="unchanged",
+                        writer_factory=lambda: unchanged,
+                        delivery="inline",
+                    ),
+                )
+            )
+        ),
+        Diagnostics(),
+    )
+
+    manager.emit(source)
+
+    assert formatted.records[0]["attributes"]["backend"] == "formatted"
+    assert unchanged.records[0]["attributes"]["backend"] == "original"
+    assert source["attributes"]["backend"] == "original"
+    manager.close(1)
+
+
+def test_destination_writers_copy_nested_values_before_formatting() -> None:
+    source = {"attributes": {"backend": "original"}}
+
+    def mutate_nested(record: dict) -> dict:
+        record["attributes"]["backend"] = "formatted"
+        return record
+
+    output = io.StringIO()
+    context = DestinationBuildContext(stdout=lambda: output)
+    stdout_writer = StdoutLogDestination(formatter=mutate_nested).build_writer(
+        context
+    )
+    stdout_writer.write(source)
+
+    assert json.loads(output.getvalue())["attributes"]["backend"] == (
+        "formatted"
+    )
+    assert source["attributes"]["backend"] == "original"
+
+    recording = RecordingWriter()
+    custom_writer = CustomLogDestination(
+        name="custom",
+        writer_factory=lambda: recording,
+        delivery="inline",
+        formatter=mutate_nested,
+    ).build_writer(context)
+    custom_writer.write(source)
+
+    assert recording.records[0]["attributes"]["backend"] == "formatted"
+    assert source["attributes"]["backend"] == "original"
 
 
 def test_slow_remote_destination_does_not_delay_another_destination() -> None:

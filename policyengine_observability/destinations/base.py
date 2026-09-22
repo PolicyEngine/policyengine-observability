@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TextIO, runtime_checkable
 
@@ -69,7 +70,7 @@ class _FormattingWriter:
             close()
 
     def _format(self, record: dict[str, Any]) -> dict[str, Any]:
-        value = record.copy()
+        value = deepcopy(record)
         return self._formatter(value) if self._formatter else value
 
 

@@ -49,7 +49,7 @@ def normalize_attributes(
         ):
             omitted += 1
             continue
-        scalar = _normalize_scalar(value, config.limits.max_string_length)
+        scalar = _normalize_scalar(value, config)
         if scalar is None:
             omitted += 1
             continue
@@ -89,7 +89,9 @@ def build_record(
     if event_name:
         record["event.name"] = _limit(event_name, config)
     if message:
-        record["message"] = _redact(_limit(message, config), config)
+        record["message"] = _redact(message, config)[
+            : config.limits.max_string_length
+        ]
 
     for key, value in (context or {}).items():
         if value is not None:
@@ -138,17 +140,17 @@ def _error_fields(
         stack = ""
     return {
         "error.type": type(error).__name__,
-        "error.message": _redact(
-            message[: config.limits.max_error_message_length], config
-        ),
-        "error.stack": _redact(
-            stack[: config.limits.max_stack_length], config
-        ),
+        "error.message": _redact(message, config)[
+            : config.limits.max_error_message_length
+        ],
+        "error.stack": _redact(stack, config)[
+            : config.limits.max_stack_length
+        ],
     }
 
 
 def _normalize_scalar(
-    value: Any, max_length: int
+    value: Any, config: ObservabilityConfig
 ) -> str | int | float | bool | None:
     if value is None:
         return None
@@ -161,7 +163,7 @@ def _normalize_scalar(
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
-        return value[:max_length]
+        return _redact(value, config)[: config.limits.max_string_length]
     return None
 
 

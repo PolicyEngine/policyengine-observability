@@ -104,7 +104,13 @@ logging = LoggingConfig(
 
 The formatter adds Cloud Logging trace-correlation fields only to the output
 it formats. The canonical record retains the portable `trace_id`, `span_id`,
-and `trace_sampled` fields.
+and `trace_sampled` fields. Each destination and formatter receives a deep
+copy of the canonical record, so mutations to nested values remain local to
+that destination.
+
+Configured sensitive values are replaced in messages, exception details, and
+allowlisted string attributes before length limits are applied and before the
+record reaches a logging destination, span, or metric exporter.
 
 Every queued destination has its own bounded queue and worker. A blocked or
 failing destination cannot delay another destination or the application

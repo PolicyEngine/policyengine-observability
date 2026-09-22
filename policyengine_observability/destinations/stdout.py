@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -21,7 +22,7 @@ class _StdoutWriter:
         self._formatter = formatter
 
     def write(self, record: dict[str, Any]) -> None:
-        value = record.copy()
+        value = deepcopy(record)
         if self._formatter is not None:
             value = self._formatter(value)
         print(

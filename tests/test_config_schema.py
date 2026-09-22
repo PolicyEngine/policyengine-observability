@@ -313,9 +313,10 @@ def test_schema_preserves_core_fields_and_namespaces_attributes() -> None:
 
 def test_schema_redacts_and_truncates_errors() -> None:
     config = make_config(
+        application_attribute_keys=frozenset({"backend"}),
         sensitive_values=("secret-value",),
         limits=TelemetryLimits(
-            max_string_length=8,
+            max_string_length=64,
             max_error_message_length=64,
             max_stack_length=100,
         ),
@@ -327,11 +328,31 @@ def test_schema_redacts_and_truncates_errors() -> None:
             config,
             severity="ERROR",
             message="secret-value message",
+            attributes={"backend": "prefix-secret-value-suffix"},
             error=error,
         )
     assert "secret-value" not in str(record)
     assert "[REDACTED]" in str(record)
+    assert record["attributes"]["backend"] == "prefix-[REDACTED]-suffix"
     assert len(record["error.stack"]) <= 100
+
+
+def test_schema_redacts_before_truncating_strings() -> None:
+    config = make_config(
+        application_attribute_keys=frozenset({"backend"}),
+        sensitive_values=("secret-value",),
+        limits=TelemetryLimits(max_string_length=8),
+    )
+
+    record = build_record(
+        config,
+        severity="INFO",
+        message="secret-value",
+        attributes={"backend": "secret-value"},
+    )
+
+    assert record["message"] == "[REDACTE"
+    assert record["attributes"]["backend"] == "[REDACTE"
 
 
 def test_attribute_policy_omits_sensitive_non_scalar_and_nonfinite() -> None:
