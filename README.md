@@ -223,7 +223,10 @@ instrument_fastapi(app, runtime)
 Both adapters extract W3C trace context and
 `X-PolicyEngine-Request-Id`, create one server span, emit one completion
 record, record request metrics, and clear context-local state. Repeated calls
-reuse the first runtime associated with the application.
+reuse the first runtime associated with the application. Install the Flask
+adapter before serving the first request. If Flask rejects callback
+registration, the adapter restores the prior callback registries, leaves the
+application unmarked, reports a local diagnostic, and returns without raising.
 
 ## Application instrumentation
 

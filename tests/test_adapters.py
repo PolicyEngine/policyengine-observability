@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import httpx
+import pytest
 from conftest import make_runtime, records
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -53,6 +55,66 @@ def test_flask_exception_emits_one_error_completion() -> None:
     emitted = records(output)
     assert len(emitted) == 1
     assert emitted[0]["outcome"] == "error"
+    runtime.shutdown()
+
+
+def test_flask_late_installation_is_nonfatal_and_leaves_no_state() -> None:
+    runtime, output = make_runtime()
+    app = Flask(__name__)
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    client = app.test_client()
+    assert client.get("/health").status_code == 200
+    callbacks_before = _flask_callback_snapshot(app)
+
+    assert instrument_flask(app, runtime) is runtime
+
+    assert _flask_callback_snapshot(app) == callbacks_before
+    assert "policyengine_observability" not in app.extensions
+    assert runtime.diagnostics.count("failure.flask.callback_install") == 1
+    assert client.get("/health").status_code == 200
+    assert records(output) == []
+    runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    "registration_name",
+    ("before_request", "after_request", "teardown_request"),
+)
+def test_flask_installation_failure_rolls_back_and_can_retry(
+    monkeypatch, registration_name
+) -> None:
+    runtime, output = make_runtime()
+    app = Flask(__name__)
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    callbacks_before = _flask_callback_snapshot(app)
+    original = getattr(app, registration_name)
+
+    def register_then_fail(callback):
+        original(callback)
+        raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(app, registration_name, register_then_fail)
+
+    assert instrument_flask(app, runtime) is runtime
+    assert _flask_callback_snapshot(app) == callbacks_before
+    assert "policyengine_observability" not in app.extensions
+    assert runtime.diagnostics.count("failure.flask.callback_install") == 1
+
+    monkeypatch.setattr(app, registration_name, original)
+    assert instrument_flask(app, runtime) is runtime
+    response = app.test_client().get("/health")
+
+    assert response.status_code == 200
+    assert REQUEST_ID_HEADER in response.headers
+    assert len(records(output)) == 1
     runtime.shutdown()
 
 
@@ -192,3 +254,19 @@ def test_httpx_client_cannot_be_rebound_to_another_runtime() -> None:
     client.close()
     first.shutdown()
     second.shutdown()
+
+
+def _flask_callback_snapshot(
+    app: Flask,
+) -> dict[str, dict[Any, tuple[Any, ...]]]:
+    return {
+        name: {
+            key: tuple(callbacks)
+            for key, callbacks in getattr(app, name).items()
+        }
+        for name in (
+            "before_request_funcs",
+            "after_request_funcs",
+            "teardown_request_funcs",
+        )
+    }

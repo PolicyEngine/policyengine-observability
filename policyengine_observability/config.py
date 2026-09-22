@@ -264,6 +264,18 @@ class ObservabilityConfig:
             if not isinstance(value, str) or not value.strip():
                 errors.append(f"{key} must be a non-empty string.")
 
+        if not isinstance(self.sensitive_values, tuple):
+            errors.append(
+                "sensitive_values must be a tuple of non-empty strings."
+            )
+        else:
+            for index, value in enumerate(self.sensitive_values):
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"sensitive_values[{index}] must be a non-empty "
+                        "string."
+                    )
+
         _choice_error(
             errors,
             "deployment.platform",

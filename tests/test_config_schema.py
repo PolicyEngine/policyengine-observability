@@ -124,6 +124,26 @@ def test_invalid_nested_limits_are_reported_together() -> None:
         assert field in message
 
 
+@pytest.mark.parametrize(
+    ("sensitive_values", "expected"),
+    [
+        (["secret"], "sensitive_values must be a tuple"),
+        ((123,), r"sensitive_values\[0\] must be a non-empty string"),
+        (("",), r"sensitive_values\[0\] must be a non-empty string"),
+        (("   ",), r"sensitive_values\[0\] must be a non-empty string"),
+    ],
+)
+def test_invalid_sensitive_values_fail_before_runtime_setup(
+    sensitive_values, expected
+) -> None:
+    config = make_config(
+        sensitive_values=sensitive_values,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ConfigurationError, match=expected):
+        configure(config)
+
+
 def test_invalid_destination_strategies_are_reported() -> None:
     class InvalidDestination:
         name = "invalid"
