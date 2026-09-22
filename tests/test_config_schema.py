@@ -7,10 +7,12 @@ from conftest import make_config
 from policyengine_observability import (
     SCHEMA_VERSION,
     DeploymentIdentity,
-    GoogleCloudLoggingConfig,
+    GoogleCloudLogDestination,
+    GoogleCloudLogFormatter,
     LoggingConfig,
     ObservabilityConfig,
     OTelConfig,
+    OTLPExporterConfig,
     ServiceIdentity,
     TelemetryLimits,
 )
@@ -24,7 +26,7 @@ from policyengine_observability.schema import (
 def test_explicit_identity_is_required_by_constructor() -> None:
     config = make_config()
     assert config.identity_complete
-    assert config.service.namespace == "policyengine.api-v1"
+    assert config.service.namespace == "policyengine.test"
     assert config.deployment.platform == "local"
 
 
@@ -33,24 +35,30 @@ def test_incomplete_identity_reports_diagnostics() -> None:
         service=ServiceIdentity("", "", "", ""),
         deployment=DeploymentIdentity("", "other"),
         logging=LoggingConfig(
-            remote=GoogleCloudLoggingConfig(project_id="", log_name="")
+            destinations=(
+                GoogleCloudLogDestination(project_id="", log_name=""),
+            )
         ),
-        otel=OTelConfig(enabled=True, endpoint=None),
+        otel=OTelConfig(enabled=True),
     )
     messages = " ".join(config.diagnostics())
     assert not config.identity_complete
     assert "Missing explicit runtime identity" in messages
-    assert "Remote logging is disabled" in messages
-    assert "no OTLP endpoint" in messages
+    assert "Google Cloud logging is disabled" in messages
+    assert "no trace or metric OTLP endpoint" in messages
 
 
-def test_remote_logging_is_rejected_outside_modal() -> None:
+def test_remote_logging_is_not_selected_from_platform() -> None:
     config = make_config(
         logging=LoggingConfig(
-            remote=GoogleCloudLoggingConfig(project_id="central")
+            destinations=(
+                GoogleCloudLogDestination(
+                    project_id="central", log_name="application"
+                ),
+            )
         )
     )
-    assert "outside Modal" in " ".join(config.diagnostics())
+    assert config.diagnostics() == ()
 
 
 def test_from_env_reads_transport_but_not_identity(monkeypatch) -> None:
@@ -62,7 +70,7 @@ def test_from_env_reads_transport_but_not_identity(monkeypatch) -> None:
     monkeypatch.setenv("OTEL_BSP_MAX_QUEUE_SIZE", "12")
     monkeypatch.setenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "99")
     monkeypatch.setenv("OTEL_BSP_SCHEDULE_DELAY", "2500")
-    monkeypatch.setenv("OTEL_BSP_EXPORT_TIMEOUT", "1500")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "1500")
     monkeypatch.setenv("OTEL_METRIC_EXPORT_INTERVAL", "4000")
     service = ServiceIdentity("svc", "ns", "1", "api")
     deployment = DeploymentIdentity("prod", "google_cloud_run")
@@ -71,16 +79,17 @@ def test_from_env_reads_transport_but_not_identity(monkeypatch) -> None:
     )
     assert config.service is service
     assert config.deployment is deployment
-    assert config.google_cloud_project_id is None
-    assert config.logging.remote is None
-    assert config.otel.endpoint == "https://collector"
-    assert config.otel.protocol == "http/protobuf"
-    assert config.otel.headers == (("x-one", "1"), ("x-two", "2"))
+    assert config.otel.traces == OTLPExporterConfig(
+        endpoint="https://collector",
+        protocol="http/protobuf",
+        headers=(("x-one", "1"), ("x-two", "2")),
+        timeout_seconds=1.5,
+    )
+    assert config.otel.metrics == config.otel.traces
     assert config.otel.sampling_ratio == 0.25
     assert config.otel.span_queue_capacity == 12
     assert config.otel.span_batch_size == 99
     assert config.otel.span_schedule_delay_seconds == 2.5
-    assert config.otel.export_timeout_seconds == 1.5
     assert config.otel.metric_export_interval_seconds == 4.0
 
 
@@ -93,7 +102,8 @@ def test_from_env_invalid_values_are_bounded(monkeypatch) -> None:
         service=ServiceIdentity("svc", "ns", "1", "api"),
         deployment=DeploymentIdentity("dev", "local"),
     )
-    assert config.otel.protocol == "grpc"
+    assert config.otel.traces is None
+    assert config.otel.metrics is None
     assert config.otel.sampling_ratio == 1.0
     assert config.otel.span_queue_capacity == 2_048
     assert not config.otel.enabled
@@ -173,7 +183,7 @@ def test_attribute_count_and_string_length_are_bounded() -> None:
     assert omitted == 1
 
 
-def test_google_trace_correlation_uses_central_project() -> None:
+def test_google_trace_correlation_is_not_in_canonical_record() -> None:
     record = build_record(
         make_config(),
         severity="INFO",
@@ -184,11 +194,15 @@ def test_google_trace_correlation_uses_central_project() -> None:
             "trace_sampled": True,
         },
     )
-    assert record["logging.googleapis.com/trace"] == (
-        "projects/policyengine-observability/traces/" + "a" * 32
+    assert "logging.googleapis.com/trace" not in record
+    assert "logging.googleapis.com/spanId" not in record
+    assert "logging.googleapis.com/trace_sampled" not in record
+    formatted = GoogleCloudLogFormatter("central-project")(record)
+    assert formatted["logging.googleapis.com/trace"] == (
+        "projects/central-project/traces/" + "a" * 32
     )
-    assert record["logging.googleapis.com/spanId"] == "b" * 16
-    assert record["logging.googleapis.com/trace_sampled"] is True
+    assert formatted["logging.googleapis.com/spanId"] == "b" * 16
+    assert formatted["logging.googleapis.com/trace_sampled"] is True
 
 
 def test_metric_attributes_use_separate_allowlist() -> None:

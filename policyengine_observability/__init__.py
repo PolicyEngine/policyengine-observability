@@ -3,13 +3,23 @@
 from .adapters import instrument_fastapi, instrument_flask
 from .config import (
     DeploymentIdentity,
-    GoogleCloudLoggingConfig,
     LoggingConfig,
     ObservabilityConfig,
     OTelConfig,
+    OTLPAuthentication,
+    OTLPExporterConfig,
     ServiceIdentity,
     TelemetryLimits,
 )
+from .destinations import (
+    CustomLogDestination,
+    GoogleCloudLogDestination,
+    GoogleCloudLogFormatter,
+    LogDestinationStrategy,
+    RecordWriter,
+    StdoutLogDestination,
+)
+from .google_auth import GoogleIdTokenAuth
 from .integrations import instrument_httpx
 from .runtime import (
     REQUEST_ID_HEADER,
@@ -27,15 +37,23 @@ __all__ = [
     "SCHEMA_VERSION",
     "TRACEPARENT_HEADER",
     "TRACESTATE_HEADER",
+    "CustomLogDestination",
     "DeploymentIdentity",
-    "GoogleCloudLoggingConfig",
+    "GoogleCloudLogDestination",
+    "GoogleCloudLogFormatter",
+    "GoogleIdTokenAuth",
+    "LogDestinationStrategy",
     "LoggingConfig",
+    "OTLPAuthentication",
+    "OTLPExporterConfig",
     "OTelConfig",
     "ObservabilityConfig",
     "ObservabilityLogHandler",
     "ObservabilityRuntime",
+    "RecordWriter",
     "ServiceIdentity",
     "TelemetryLimits",
+    "StdoutLogDestination",
     "configure",
     "instrument_fastapi",
     "instrument_flask",

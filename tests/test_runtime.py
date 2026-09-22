@@ -199,7 +199,7 @@ def test_two_runtimes_keep_identity_and_context_separate() -> None:
     first, first_output = make_runtime()
     second_config = make_config(
         service=make_config().service.__class__(
-            "second-api", "policyengine.api-v1", "1", "worker"
+            "second-api", "policyengine.test", "1", "worker"
         )
     )
     second = configure(second_config)

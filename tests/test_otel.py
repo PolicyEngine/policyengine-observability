@@ -13,28 +13,35 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 
-from policyengine_observability import OTelConfig, configure
+from policyengine_observability import (
+    GoogleIdTokenAuth,
+    OTelConfig,
+    OTLPExporterConfig,
+    configure,
+)
 from policyengine_observability.diagnostics import Diagnostics
+from policyengine_observability.google_auth import (
+    _google_grpc_credentials,
+    _google_http_session,
+    _google_id_token_credentials,
+    _workload_identity_audience,
+    _write_subject_token,
+)
 from policyengine_observability.otel import (
     OTelRuntime,
     SpanHandle,
     _build_metric_exporter,
     _build_span_exporter,
     _exporter_kwargs,
-    _google_grpc_credentials,
-    _google_http_session,
-    _google_id_token_credentials,
     _http_signal_endpoint,
     _lazy_metric_exporter_class,
     _LazySpanExporter,
-    _workload_identity_audience,
-    _write_subject_token,
     captured_at_is_recent,
 )
 
 
 def _runtime_with_spans():
-    config = make_config(otel=OTelConfig(enabled=True, endpoint=None))
+    config = make_config(otel=OTelConfig(enabled=True))
     runtime = configure(config)
     runtime._delivery._stdout = io.StringIO()
     exporter = InMemorySpanExporter()
@@ -80,7 +87,7 @@ def test_incoming_trace_context_correlates_log_and_response() -> None:
     runtime.end_request(status_code=200)
     item = records(runtime._delivery._stdout)[0]
     assert item["trace_id"] == trace_id
-    assert item["logging.googleapis.com/trace"].endswith(trace_id)
+    assert "logging.googleapis.com/trace" not in item
     span = exporter.get_finished_spans()[0]
     assert span.parent.span_id == int(parent_id, 16)
     runtime.shutdown()
@@ -242,18 +249,18 @@ def test_otlp_exporter_builders_apply_protocol_endpoint_and_timeout(
     monkeypatch.setattr(
         http_metric, "OTLPMetricExporter", constructor("http-metric")
     )
-    grpc = OTelConfig(
+    grpc = OTLPExporterConfig(
         endpoint="collector:4317",
         protocol="grpc",
         headers=(("x-test", "value"),),
-        export_timeout_seconds=2,
+        timeout_seconds=2,
     )
     assert _build_span_exporter(grpc) == "grpc-span"
     assert _build_metric_exporter(grpc) == "grpc-metric"
-    http = OTelConfig(
+    http = OTLPExporterConfig(
         endpoint="https://collector/",
         protocol="http/protobuf",
-        export_timeout_seconds=3,
+        timeout_seconds=3,
     )
     assert _build_span_exporter(http) == "http-span"
     assert _build_metric_exporter(http) == "http-metric"
@@ -267,25 +274,25 @@ def test_google_exporter_kwargs_select_protocol_credentials(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "policyengine_observability.otel._google_grpc_credentials",
+        "policyengine_observability.google_auth._google_grpc_credentials",
         lambda audience: f"grpc:{audience}",
     )
     monkeypatch.setattr(
-        "policyengine_observability.otel._google_http_session",
+        "policyengine_observability.google_auth._google_http_session",
         lambda audience, headers: (audience, dict(headers)),
     )
     grpc = _exporter_kwargs(
-        OTelConfig(
+        OTLPExporterConfig(
             endpoint="collector:4317",
-            google_audience="https://collector",
+            auth=GoogleIdTokenAuth("https://collector"),
         )
     )
     assert grpc["credentials"] == "grpc:https://collector"
     http = _exporter_kwargs(
-        OTelConfig(
+        OTLPExporterConfig(
             endpoint="https://collector",
             protocol="http/protobuf",
-            google_audience="https://collector",
+            auth=GoogleIdTokenAuth("https://collector"),
             headers=(("x", "y"),),
         )
     )
@@ -318,13 +325,13 @@ def test_google_id_token_uses_modal_workload_identity(monkeypatch) -> None:
         impersonated_credentials, "IDTokenCredentials", Identity
     )
     monkeypatch.setattr(
-        "policyengine_observability.otel._write_subject_token",
+        "policyengine_observability.google_auth._write_subject_token",
         lambda token: f"/tmp/{token}",
     )
     monkeypatch.setenv("MODAL_IDENTITY_TOKEN", "modal-token")
     monkeypatch.setenv(
         "OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER",
-        "projects/123/providers/api-v1",
+        "projects/123/providers/example",
     )
     monkeypatch.setenv(
         "OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL",
@@ -360,7 +367,7 @@ def test_google_transport_helpers(monkeypatch, tmp_path) -> None:
     from google.auth.transport import requests as google_requests
 
     monkeypatch.setattr(
-        "policyengine_observability.otel._google_id_token_credentials",
+        "policyengine_observability.google_auth._google_id_token_credentials",
         lambda audience: f"token:{audience}",
     )
     monkeypatch.setattr(

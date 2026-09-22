@@ -16,6 +16,7 @@ from typing import Any
 
 from .config import ObservabilityConfig
 from .delivery import DeliveryManager
+from .destinations import StdoutLogDestination
 from .diagnostics import Diagnostics
 from .otel import OTelRuntime, SpanHandle, captured_at_is_recent
 from .schema import build_record, normalize_attributes
@@ -96,10 +97,8 @@ class ObservabilityRuntime:
             fallback = ObservabilityConfig(
                 service=self.config.service,
                 deployment=self.config.deployment,
-                google_cloud_project_id=self.config.google_cloud_project_id,
                 logging=self.config.logging.__class__(
-                    stdout_enabled=True,
-                    remote=None,
+                    destinations=(StdoutLogDestination(),),
                 ),
                 otel=self.config.otel,
                 limits=self.config.limits,
@@ -125,9 +124,6 @@ class ObservabilityRuntime:
                 ObservabilityConfig(
                     service=self.config.service,
                     deployment=self.config.deployment,
-                    google_cloud_project_id=(
-                        self.config.google_cloud_project_id
-                    ),
                     logging=self.config.logging,
                     otel=self.config.otel.__class__(enabled=False),
                     limits=self.config.limits,

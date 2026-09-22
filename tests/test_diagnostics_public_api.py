@@ -24,6 +24,7 @@ REMOVED_NAMES = {
     "end_scope",
     "set_observability_runtime",
     "register_destination",
+    "GoogleCloudLoggingConfig",
 }
 
 
@@ -93,7 +94,6 @@ def test_automatic_standard_logging_installation(monkeypatch) -> None:
     try:
         config = make_config(
             logging=observability.LoggingConfig(
-                stdout_enabled=True,
                 capture_standard_library=True,
                 replace_existing_handlers=True,
             )

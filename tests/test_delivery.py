@@ -8,12 +8,14 @@ import time
 from conftest import make_config
 
 from policyengine_observability import (
+    CustomLogDestination,
     DeploymentIdentity,
-    GoogleCloudLoggingConfig,
+    GoogleCloudLogDestination,
     LoggingConfig,
+    StdoutLogDestination,
 )
-from policyengine_observability.delivery import (
-    DeliveryManager,
+from policyengine_observability.delivery import DeliveryManager
+from policyengine_observability.destinations.google_cloud import (
     _GoogleCloudWriter,
 )
 from policyengine_observability.diagnostics import Diagnostics
@@ -37,21 +39,25 @@ class RecordingWriter:
         self.closed = True
 
 
-def modal_config(**remote_overrides):
-    remote_values = {
-        "project_id": "policyengine-observability",
-        "queue_capacity": 10,
-        "batch_size": 5,
-    }
-    shutdown_timeout_seconds = remote_overrides.pop(
-        "shutdown_timeout_seconds", 0.2
-    )
-    remote_values.update(remote_overrides)
+def queued_config(writer_factory, **overrides):
+    queue_capacity = overrides.pop("queue_capacity", 10)
+    batch_size = overrides.pop("batch_size", 5)
+    shutdown_timeout_seconds = overrides.pop("shutdown_timeout_seconds", 0.2)
+    platform = overrides.pop("platform", "modal")
+    assert not overrides
     return make_config(
-        deployment=DeploymentIdentity("test", "modal"),
+        deployment=DeploymentIdentity("test", platform),
         logging=LoggingConfig(
-            stdout_enabled=True,
-            remote=GoogleCloudLoggingConfig(**remote_values),
+            destinations=(
+                StdoutLogDestination(),
+                CustomLogDestination(
+                    name="recording",
+                    writer_factory=writer_factory,
+                    delivery="queued",
+                    queue_capacity=queue_capacity,
+                    batch_size=batch_size,
+                ),
+            ),
             shutdown_timeout_seconds=shutdown_timeout_seconds,
         ),
     )
@@ -66,56 +72,42 @@ def test_stdout_delivery_is_single_line_json() -> None:
     assert not manager.remote_enabled
 
 
-def test_modal_delivery_writes_stdout_and_uses_lazy_worker() -> None:
+def test_queued_delivery_writes_stdout_and_uses_lazy_worker() -> None:
     output = io.StringIO()
     diagnostics = Diagnostics()
     writer = RecordingWriter()
     factory_calls = 0
 
-    def factory(_config):
+    def factory():
         nonlocal factory_calls
         factory_calls += 1
         return writer
 
     manager = DeliveryManager(
-        modal_config(),
+        queued_config(factory),
         diagnostics,
         stdout=output,
-        writer_factory=factory,
     )
     assert factory_calls == 0
-    manager.emit({"severity": "INFO", "event.name": "modal"})
-    assert json.loads(output.getvalue())["event.name"] == "modal"
+    manager.emit({"severity": "INFO", "event.name": "queued"})
+    assert json.loads(output.getvalue())["event.name"] == "queued"
     assert writer.written.wait(1)
-    assert writer.records[0]["event.name"] == "modal"
+    assert writer.records[0]["event.name"] == "queued"
     assert factory_calls == 1
     manager.close(1)
     assert writer.closed
 
 
-def test_cloud_run_never_creates_direct_writer() -> None:
-    calls = 0
-
-    def factory(_config):
-        nonlocal calls
-        calls += 1
-        return RecordingWriter()
-
+def test_explicit_queued_destination_is_platform_independent() -> None:
+    writer = RecordingWriter()
     manager = DeliveryManager(
-        make_config(
-            deployment=DeploymentIdentity("prod", "google_cloud_run"),
-            logging=LoggingConfig(
-                remote=GoogleCloudLoggingConfig(project_id="central")
-            ),
-        ),
+        queued_config(lambda: writer, platform="google_cloud_run"),
         Diagnostics(),
         stdout=io.StringIO(),
-        writer_factory=factory,
     )
     manager.emit({"event.name": "cloud-run"})
-    manager.close()
-    assert calls == 0
-    assert not manager.remote_enabled
+    assert writer.written.wait(1)
+    manager.close(1)
 
 
 def test_queue_saturation_drops_without_blocking() -> None:
@@ -131,10 +123,13 @@ def test_queue_saturation_drops_without_blocking() -> None:
 
     writer = BlockingWriter()
     manager = DeliveryManager(
-        modal_config(queue_capacity=1, batch_size=1),
+        queued_config(
+            lambda: writer,
+            queue_capacity=1,
+            batch_size=1,
+        ),
         diagnostics,
         stdout=io.StringIO(),
-        writer_factory=lambda _config: writer,
     )
     manager.emit({"sequence": 1})
     assert started.wait(1)
@@ -151,15 +146,14 @@ def test_writer_auth_or_permission_failure_is_nonfatal() -> None:
     diagnostics = Diagnostics()
     attempted = threading.Event()
 
-    def unavailable(_config):
+    def unavailable():
         attempted.set()
         raise PermissionError("denied")
 
     manager = DeliveryManager(
-        modal_config(),
+        queued_config(unavailable),
         diagnostics,
         stdout=io.StringIO(),
-        writer_factory=unavailable,
     )
     manager.emit({"event.name": "survives"})
     assert attempted.wait(1)
@@ -173,16 +167,14 @@ def test_writer_auth_or_permission_failure_is_nonfatal() -> None:
 
 def test_malformed_record_and_closed_queue_are_nonfatal() -> None:
     diagnostics = Diagnostics()
-    output = io.StringIO()
-    manager = DeliveryManager(make_config(), diagnostics, stdout=output)
+    manager = DeliveryManager(make_config(), diagnostics, stdout=io.StringIO())
     manager.emit({"bad": object()})
-    assert diagnostics.count("failure.stdout.write") == 1
+    assert diagnostics.count("logs.export_failure") == 1
 
     remote = DeliveryManager(
-        modal_config(),
+        queued_config(lambda: RecordingWriter()),
         diagnostics,
         stdout=io.StringIO(),
-        writer_factory=lambda _config: RecordingWriter(),
     )
     remote.close(1)
     remote.emit({"event.name": "after-close"})
@@ -200,10 +192,12 @@ def test_shutdown_timeout_is_bounded_and_repeatable() -> None:
             release.wait(1)
 
     manager = DeliveryManager(
-        modal_config(shutdown_timeout_seconds=0.01),
+        queued_config(
+            lambda: BlockingWriter(),
+            shutdown_timeout_seconds=0.01,
+        ),
         diagnostics,
         stdout=io.StringIO(),
-        writer_factory=lambda _config: BlockingWriter(),
     )
     manager.emit({"event.name": "block"})
     assert started.wait(1)
@@ -242,7 +236,7 @@ def test_google_writer_batches_with_bounded_api_calls(monkeypatch) -> None:
             self.closed = False
 
         def logger(self, name):
-            assert name == "policyengine-api-v1-modal"
+            assert name == "application"
             return Logger()
 
         def close(self):
@@ -254,15 +248,19 @@ def test_google_writer_batches_with_bounded_api_calls(monkeypatch) -> None:
         lambda **_kwargs: "credentials",
     )
     writer = _GoogleCloudWriter(
-        GoogleCloudLoggingConfig(project_id="central", write_timeout_seconds=2)
+        GoogleCloudLogDestination(
+            project_id="central",
+            log_name="application",
+            write_timeout_seconds=2,
+        )
     )
     writer.write_many(
         [
             {
                 "severity": "WARNING",
-                "logging.googleapis.com/trace": "projects/central/traces/a",
-                "logging.googleapis.com/spanId": "b",
-                "logging.googleapis.com/trace_sampled": True,
+                "trace_id": "a",
+                "span_id": "b",
+                "trace_sampled": True,
             },
             {"severity": "INFO"},
         ]

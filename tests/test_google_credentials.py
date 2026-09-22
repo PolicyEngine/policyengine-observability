@@ -54,11 +54,11 @@ def test_modal_workload_identity_configuration(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setenv(
         google_credentials.WORKLOAD_IDENTITY_PROVIDER_ENV,
-        "projects/123/locations/global/workloadIdentityPools/modal/providers/api-v1",
+        "projects/123/locations/global/workloadIdentityPools/modal/providers/example",
     )
     monkeypatch.setenv(
         google_credentials.SERVICE_ACCOUNT_EMAIL_ENV,
-        "modal-api-v1@central.iam.gserviceaccount.com",
+        "modal-example@central.iam.gserviceaccount.com",
     )
     monkeypatch.setattr(
         google_credentials,
@@ -70,7 +70,7 @@ def test_modal_workload_identity_configuration(monkeypatch, tmp_path) -> None:
     )
     assert config["audience"].startswith("//iam.googleapis.com/projects/123")
     assert (
-        "modal-api-v1@central.iam.gserviceaccount.com"
+        "modal-example@central.iam.gserviceaccount.com"
         in config["service_account_impersonation_url"]
     )
     token_path = tmp_path / "policyengine-observability-oidc.jwt"

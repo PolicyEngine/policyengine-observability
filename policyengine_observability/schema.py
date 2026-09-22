@@ -109,18 +109,6 @@ def build_record(
     if error is not None:
         record.update(_error_fields(error, config))
 
-    trace_id = record.get("trace_id")
-    span_id = record.get("span_id")
-    project_id = config.google_cloud_project_id
-    if trace_id and project_id:
-        record["logging.googleapis.com/trace"] = (
-            f"projects/{project_id}/traces/{trace_id}"
-        )
-        record["logging.googleapis.com/trace_sampled"] = bool(
-            record.get("trace_sampled", False)
-        )
-    if span_id:
-        record["logging.googleapis.com/spanId"] = span_id
     return record
 
 

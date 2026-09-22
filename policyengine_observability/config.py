@@ -2,32 +2,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Literal, cast
+from typing import Any, Literal, Protocol, cast
+
+from .destinations import LogDestinationStrategy, StdoutLogDestination
 
 Platform = Literal["google_cloud_run", "modal", "local", "other"]
 OTLPProtocol = Literal["grpc", "http/protobuf"]
 ProviderMode = Literal["owned", "external"]
 
-DEFAULT_APPLICATION_ATTRIBUTE_KEYS = frozenset(
-    {
-        "auth_result",
-        "backend",
-        "country_id",
-        "job_type",
-        "model_version",
-        "requested_version",
-        "resolved_channel",
-        "simulation_year",
-    }
-)
+DEFAULT_APPLICATION_ATTRIBUTE_KEYS = frozenset(set())
 
-DEFAULT_DISPATCH_ATTRIBUTE_KEYS = frozenset(
-    {
-        "job_id",
-        "run_id",
-        "simulation_id",
-    }
-)
+DEFAULT_DISPATCH_ATTRIBUTE_KEYS = frozenset(set())
 
 DEFAULT_METRIC_ATTRIBUTE_KEYS = frozenset(
     {
@@ -62,39 +47,46 @@ class DeploymentIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class GoogleCloudLoggingConfig:
-    project_id: str
-    log_name: str = "policyengine-api-v1-modal"
-    queue_capacity: int = 1_000
-    batch_size: int = 1
-    write_timeout_seconds: float = 5.0
-
-
-@dataclass(frozen=True, slots=True)
 class LoggingConfig:
-    stdout_enabled: bool = True
-    remote: GoogleCloudLoggingConfig | None = None
+    destinations: tuple[LogDestinationStrategy, ...] = field(
+        default_factory=lambda: (StdoutLogDestination(),)
+    )
     capture_standard_library: bool = False
     replace_existing_handlers: bool = False
     minimum_severity: int = 20
     shutdown_timeout_seconds: float = 2.0
 
 
+class OTLPAuthentication(Protocol):
+    """Adds authentication-specific arguments to an OTLP exporter."""
+
+    def exporter_kwargs(
+        self,
+        *,
+        protocol: OTLPProtocol,
+        headers: dict[str, str],
+    ) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OTLPExporterConfig:
+    endpoint: str
+    protocol: OTLPProtocol = "grpc"
+    headers: tuple[tuple[str, str], ...] = ()
+    auth: OTLPAuthentication | None = None
+    timeout_seconds: float = 5.0
+
+
 @dataclass(frozen=True, slots=True)
 class OTelConfig:
     enabled: bool = True
-    traces_enabled: bool = True
-    metrics_enabled: bool = True
-    endpoint: str | None = None
-    protocol: OTLPProtocol = "grpc"
-    headers: tuple[tuple[str, str], ...] = ()
-    google_audience: str | None = None
+    traces: OTLPExporterConfig | None = None
+    metrics: OTLPExporterConfig | None = None
     provider_mode: ProviderMode = "owned"
     sampling_ratio: float = 1.0
     span_queue_capacity: int = 2_048
     span_batch_size: int = 512
     span_schedule_delay_seconds: float = 5.0
-    export_timeout_seconds: float = 5.0
     metric_export_interval_seconds: float = 60.0
     shutdown_timeout_seconds: float = 3.0
 
@@ -112,7 +104,6 @@ class TelemetryLimits:
 class ObservabilityConfig:
     service: ServiceIdentity
     deployment: DeploymentIdentity
-    google_cloud_project_id: str | None = None
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     otel: OTelConfig = field(default_factory=OTelConfig)
     limits: TelemetryLimits = field(default_factory=TelemetryLimits)
@@ -130,7 +121,6 @@ class ObservabilityConfig:
         service: ServiceIdentity,
         deployment: DeploymentIdentity,
         logging: LoggingConfig | None = None,
-        google_cloud_project_id: str | None = None,
         limits: TelemetryLimits | None = None,
         application_attribute_keys: frozenset[str] | None = None,
         dispatch_attribute_keys: frozenset[str] | None = None,
@@ -143,28 +133,37 @@ class ObservabilityConfig:
         inferred from ambient platform or Google Cloud variables.
         """
 
-        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-        protocol = os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc").strip()
-        if protocol not in {"grpc", "http/protobuf"}:
-            protocol = "grpc"
+        common_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+        common_protocol = _protocol(
+            os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+        )
+        common_headers = os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+        common_audience = os.getenv("POLICYENGINE_OTEL_GOOGLE_AUDIENCE")
+        traces = _exporter_from_env(
+            signal="traces",
+            enabled=os.getenv("OTEL_TRACES_EXPORTER", "otlp") != "none",
+            common_endpoint=common_endpoint,
+            common_protocol=common_protocol,
+            common_headers=common_headers,
+            common_audience=common_audience,
+        )
+        metrics = _exporter_from_env(
+            signal="metrics",
+            enabled=os.getenv("OTEL_METRICS_EXPORTER", "otlp") != "none",
+            common_endpoint=common_endpoint,
+            common_protocol=common_protocol,
+            common_headers=common_headers,
+            common_audience=common_audience,
+        )
 
         return cls(
             service=service,
             deployment=deployment,
-            google_cloud_project_id=google_cloud_project_id,
             logging=logging or LoggingConfig(),
             otel=OTelConfig(
                 enabled=not _env_bool("OTEL_SDK_DISABLED", False),
-                traces_enabled=os.getenv("OTEL_TRACES_EXPORTER", "otlp")
-                != "none",
-                metrics_enabled=os.getenv("OTEL_METRICS_EXPORTER", "otlp")
-                != "none",
-                endpoint=endpoint,
-                protocol=cast(OTLPProtocol, protocol),
-                headers=_parse_headers(
-                    os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "")
-                ),
-                google_audience=os.getenv("POLICYENGINE_OTEL_GOOGLE_AUDIENCE"),
+                traces=traces,
+                metrics=metrics,
                 provider_mode=_provider_mode(
                     os.getenv("POLICYENGINE_OTEL_PROVIDER_MODE", "owned")
                 ),
@@ -189,15 +188,6 @@ class ObservabilityConfig:
                 span_schedule_delay_seconds=(
                     _bounded_float(
                         os.getenv("OTEL_BSP_SCHEDULE_DELAY"),
-                        default=5_000.0,
-                        minimum=1.0,
-                        maximum=60_000.0,
-                    )
-                    / 1_000
-                ),
-                export_timeout_seconds=(
-                    _bounded_float(
-                        os.getenv("OTEL_BSP_EXPORT_TIMEOUT"),
                         default=5_000.0,
                         minimum=1.0,
                         maximum=60_000.0,
@@ -247,23 +237,28 @@ class ObservabilityConfig:
             if not str(value).strip():
                 messages.append(f"Missing explicit runtime identity: {key}")
 
-        remote = self.logging.remote
-        if remote is not None and (
-            not remote.project_id.strip() or not remote.log_name.strip()
+        for destination in self.logging.destinations:
+            validate = getattr(destination, "diagnostics", None)
+            if not callable(validate):
+                continue
+            try:
+                messages.extend(
+                    str(item) for item in cast(tuple[str, ...], validate())
+                )
+            except Exception as exc:
+                messages.append(
+                    "Log destination validation failed for "
+                    f"{getattr(destination, 'name', '<unnamed>')}: {exc}"
+                )
+        if (
+            self.otel.enabled
+            and self.otel.provider_mode == "owned"
+            and self.otel.traces is None
+            and self.otel.metrics is None
         ):
             messages.append(
-                "Remote logging is disabled because its project or log name "
-                "is empty."
-            )
-        if remote is not None and self.deployment.platform != "modal":
-            messages.append(
-                "Direct Cloud Logging is disabled outside Modal; use platform "
-                "standard-output ingestion."
-            )
-        if self.otel.enabled and not self.otel.endpoint:
-            messages.append(
-                "Remote OTel export is disabled because no OTLP endpoint is "
-                "configured."
+                "Remote OTel export is disabled because no trace or metric "
+                "OTLP endpoint is configured."
             )
         return tuple(messages)
 
@@ -291,6 +286,63 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _provider_mode(value: str) -> ProviderMode:
     return "external" if value.strip().lower() == "external" else "owned"
+
+
+def _protocol(value: str) -> OTLPProtocol:
+    normalized = value.strip()
+    if normalized not in {"grpc", "http/protobuf"}:
+        return "grpc"
+    return cast(OTLPProtocol, normalized)
+
+
+def _exporter_from_env(
+    *,
+    signal: Literal["traces", "metrics"],
+    enabled: bool,
+    common_endpoint: str | None,
+    common_protocol: OTLPProtocol,
+    common_headers: str,
+    common_audience: str | None,
+) -> OTLPExporterConfig | None:
+    if not enabled:
+        return None
+    prefix = f"OTEL_EXPORTER_OTLP_{signal.upper()}"
+    endpoint = os.getenv(f"{prefix}_ENDPOINT") or common_endpoint
+    if not endpoint:
+        return None
+    protocol_value = os.getenv(f"{prefix}_PROTOCOL")
+    protocol = (
+        _protocol(protocol_value)
+        if protocol_value is not None
+        else common_protocol
+    )
+    headers_value = os.getenv(f"{prefix}_HEADERS")
+    headers = _parse_headers(
+        headers_value if headers_value is not None else common_headers
+    )
+    audience = (
+        os.getenv(f"POLICYENGINE_OTEL_{signal.upper()}_GOOGLE_AUDIENCE")
+        or common_audience
+    )
+    auth: OTLPAuthentication | None = None
+    if audience:
+        from .google_auth import GoogleIdTokenAuth
+
+        auth = GoogleIdTokenAuth(audience)
+    timeout = _bounded_float(
+        os.getenv(f"{prefix}_TIMEOUT")
+        or os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT"),
+        default=5_000.0,
+        minimum=100.0,
+        maximum=60_000.0,
+    )
+    return OTLPExporterConfig(
+        endpoint=endpoint,
+        protocol=protocol,
+        headers=headers,
+        auth=auth,
+        timeout_seconds=timeout / 1_000,
+    )
 
 
 def _parse_headers(value: str) -> tuple[tuple[str, str], ...]:

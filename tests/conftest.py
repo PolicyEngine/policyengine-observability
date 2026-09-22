@@ -21,7 +21,7 @@ def make_config(**overrides):
     values = {
         "service": ServiceIdentity(
             name="test-api",
-            namespace="policyengine.api-v1",
+            namespace="policyengine.test",
             version="2.3.4",
             role="entry",
         ),
@@ -31,9 +31,12 @@ def make_config(**overrides):
             region="us-central1",
             instance_id="instance-1",
         ),
-        "google_cloud_project_id": "policyengine-observability",
-        "logging": LoggingConfig(stdout_enabled=True),
+        "logging": LoggingConfig(),
         "otel": OTelConfig(enabled=False),
+        "application_attribute_keys": frozenset({"auth_result", "backend"}),
+        "dispatch_attribute_keys": frozenset(
+            {"job_id", "run_id", "simulation_id"}
+        ),
     }
     values.update(overrides)
     return ObservabilityConfig(**values)

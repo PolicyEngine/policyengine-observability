@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
-from urllib.parse import urlparse
 
-from .config import ObservabilityConfig, OTelConfig
+from .config import ObservabilityConfig, OTLPExporterConfig
 from .diagnostics import Diagnostics
 from .schema import metric_attributes
 
@@ -83,7 +81,8 @@ class OTelRuntime:
         resource = Resource.create(self.resource_attributes())
         readers: list[Any] = []
         otel = self.config.otel
-        if otel.endpoint and otel.metrics_enabled:
+        metric_exporter = otel.metrics
+        if metric_exporter is not None:
             from opentelemetry.sdk.metrics.export import (
                 PeriodicExportingMetricReader,
             )
@@ -91,7 +90,7 @@ class OTelRuntime:
             readers.append(
                 PeriodicExportingMetricReader(
                     _lazy_metric_exporter_class()(
-                        lambda: _build_metric_exporter(otel),
+                        lambda: _build_metric_exporter(metric_exporter),
                         self.diagnostics,
                     ),
                     export_interval_millis=max(
@@ -100,7 +99,7 @@ class OTelRuntime:
                     ),
                     export_timeout_millis=max(
                         1,
-                        otel.export_timeout_seconds * 1_000,
+                        metric_exporter.timeout_seconds * 1_000,
                     ),
                 )
             )
@@ -120,7 +119,8 @@ class OTelRuntime:
             meter_provider=self._meter_provider,
         )
         self._owns_tracer_provider = True
-        if otel.endpoint and otel.traces_enabled:
+        trace_exporter = otel.traces
+        if trace_exporter is not None:
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
             batch_size = min(
@@ -132,7 +132,7 @@ class OTelRuntime:
                     cast(
                         Any,
                         _LazySpanExporter(
-                            lambda: _build_span_exporter(otel),
+                            lambda: _build_span_exporter(trace_exporter),
                             self.diagnostics,
                         ),
                     ),
@@ -144,7 +144,7 @@ class OTelRuntime:
                     ),
                     export_timeout_millis=max(
                         1,
-                        otel.export_timeout_seconds * 1_000,
+                        trace_exporter.timeout_seconds * 1_000,
                     ),
                     meter_provider=self._meter_provider,
                 )
@@ -539,16 +539,14 @@ def _lazy_metric_exporter_class():
     return LazyMetricExporter
 
 
-def _build_span_exporter(config: OTelConfig) -> Any:
+def _build_span_exporter(config: OTLPExporterConfig) -> Any:
     kwargs = _exporter_kwargs(config)
     if config.protocol == "http/protobuf":
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
             OTLPSpanExporter,
         )
 
-        kwargs["endpoint"] = _http_signal_endpoint(
-            config.endpoint or "", "traces"
-        )
+        kwargs["endpoint"] = _http_signal_endpoint(config.endpoint, "traces")
         return OTLPSpanExporter(**kwargs)
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
         OTLPSpanExporter,
@@ -557,16 +555,14 @@ def _build_span_exporter(config: OTelConfig) -> Any:
     return OTLPSpanExporter(**kwargs)
 
 
-def _build_metric_exporter(config: OTelConfig) -> Any:
+def _build_metric_exporter(config: OTLPExporterConfig) -> Any:
     kwargs = _exporter_kwargs(config)
     if config.protocol == "http/protobuf":
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
             OTLPMetricExporter,
         )
 
-        kwargs["endpoint"] = _http_signal_endpoint(
-            config.endpoint or "", "metrics"
-        )
+        kwargs["endpoint"] = _http_signal_endpoint(config.endpoint, "metrics")
         return OTLPMetricExporter(**kwargs)
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
         OTLPMetricExporter,
@@ -575,89 +571,23 @@ def _build_metric_exporter(config: OTelConfig) -> Any:
     return OTLPMetricExporter(**kwargs)
 
 
-def _exporter_kwargs(config: OTelConfig) -> dict[str, Any]:
+def _exporter_kwargs(config: OTLPExporterConfig) -> dict[str, Any]:
     headers = dict(config.headers)
     kwargs: dict[str, Any] = {
         "endpoint": config.endpoint,
         "headers": headers,
-        "timeout": max(0.1, min(config.export_timeout_seconds, 60.0)),
+        "timeout": max(0.1, min(config.timeout_seconds, 60.0)),
     }
-    if config.google_audience:
-        if config.protocol == "grpc":
-            kwargs["credentials"] = _google_grpc_credentials(
-                config.google_audience
+    if config.auth is not None:
+        kwargs.update(
+            config.auth.exporter_kwargs(
+                protocol=config.protocol,
+                headers=headers,
             )
-        else:
-            kwargs["session"] = _google_http_session(
-                config.google_audience,
-                headers,
-            )
+        )
+        if "session" in kwargs:
             kwargs.pop("headers", None)
     return kwargs
-
-
-def _google_id_token_credentials(audience: str) -> Any:
-    from google.auth.transport.requests import Request
-
-    modal_token = os.getenv("MODAL_IDENTITY_TOKEN") or os.getenv(
-        "OBSERVABILITY_GOOGLE_OIDC_TOKEN"
-    )
-    provider = os.getenv("OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER")
-    service_account = os.getenv("OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL")
-    if modal_token and provider and service_account:
-        from google.auth import identity_pool, impersonated_credentials
-
-        source = identity_pool.Credentials.from_info(
-            {
-                "type": "external_account",
-                "audience": _workload_identity_audience(provider),
-                "subject_token_type": ("urn:ietf:params:oauth:token-type:jwt"),
-                "token_url": "https://sts.googleapis.com/v1/token",
-                "credential_source": {
-                    "file": _write_subject_token(modal_token),
-                    "format": {"type": "text"},
-                },
-            },
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
-        target = impersonated_credentials.Credentials(
-            source_credentials=source,
-            target_principal=service_account,
-            target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
-        return impersonated_credentials.IDTokenCredentials(
-            target_credentials=target,
-            target_audience=audience,
-            include_email=True,
-        )
-
-    from google.oauth2.id_token import fetch_id_token_credentials
-
-    return fetch_id_token_credentials(audience, request=Request())
-
-
-def _google_grpc_credentials(audience: str) -> Any:
-    import grpc
-    from google.auth.transport.grpc import AuthMetadataPlugin
-    from google.auth.transport.requests import Request
-
-    plugin = AuthMetadataPlugin(
-        _google_id_token_credentials(audience),
-        Request(),
-        default_host=urlparse(audience).netloc,
-    )
-    return grpc.composite_channel_credentials(
-        grpc.ssl_channel_credentials(),
-        grpc.metadata_call_credentials(plugin),
-    )
-
-
-def _google_http_session(audience: str, headers: Mapping[str, str]) -> Any:
-    from google.auth.transport.requests import AuthorizedSession
-
-    session = AuthorizedSession(_google_id_token_credentials(audience))
-    session.headers.update(headers)
-    return session
 
 
 def _http_signal_endpoint(endpoint: str, signal: str) -> str:
@@ -665,27 +595,6 @@ def _http_signal_endpoint(endpoint: str, signal: str) -> str:
     if value.endswith(f"/v1/{signal}"):
         return value
     return f"{value}/v1/{signal}"
-
-
-def _workload_identity_audience(provider: str) -> str:
-    value = provider.strip()
-    if value.startswith("//iam.googleapis.com/"):
-        return value
-    if value.startswith("projects/"):
-        return f"//iam.googleapis.com/{value}"
-    return value
-
-
-def _write_subject_token(token: str) -> str:
-    import tempfile
-    from pathlib import Path
-
-    path = Path(tempfile.gettempdir()) / (
-        "policyengine-observability-otel-oidc.jwt"
-    )
-    path.write_text(token)
-    path.chmod(0o600)
-    return str(path)
 
 
 def captured_at_is_recent(value: Any, max_age_seconds: float) -> bool:
