@@ -44,7 +44,8 @@ class GoogleCloudLogDestination:
     name: str = "google_cloud"
     delivery: Literal["queued"] = "queued"
 
-    def build_writer(self, _context: DestinationBuildContext) -> RecordWriter:
+    def build_writer(self, context: DestinationBuildContext) -> RecordWriter:
+        del context
         if not self.project_id.strip() or not self.log_name.strip():
             raise ValueError(
                 "Google Cloud project_id and log_name must be non-empty."
