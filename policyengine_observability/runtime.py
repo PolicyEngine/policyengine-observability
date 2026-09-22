@@ -66,7 +66,9 @@ class ObservabilityRuntime:
     def __init__(self, config: ObservabilityConfig) -> None:
         config.validate()
         self.config = config
-        self.diagnostics = Diagnostics()
+        self.diagnostics = Diagnostics(
+            sensitive_values=config.sensitive_values,
+        )
         self._request_state: ContextVar[_RequestState | None] = ContextVar(
             f"policyengine_request_{id(self)}", default=None
         )
@@ -231,6 +233,12 @@ class ObservabilityRuntime:
         state.route = route
         self._otel.set_span_attributes({"http.route": route})
 
+    def update_request_status(self, status_code: int) -> None:
+        state = self._request_state.get()
+        if state is None or state.completed:
+            return
+        state.status_code = status_code
+
     def response_headers(self) -> dict[str, str]:
         state = self._request_state.get()
         if state is None:
@@ -252,16 +260,21 @@ class ObservabilityRuntime:
         if state is None or state.completed:
             return
         state.completed = True
-        state.status_code = status_code
+        resolved_status = (
+            status_code if status_code is not None else state.status_code
+        )
+        state.status_code = resolved_status
         state.error = error
         duration = max(0.0, time.perf_counter() - state.start_time)
-        outcome = _outcome(status_code, error)
+        outcome = _outcome(resolved_status, error)
         metric_values = self._metric_base()
         metric_values.update(
             {
                 "http.route": state.route,
                 "http.request.method": state.method,
-                "http.response.status_code_class": _status_class(status_code),
+                "http.response.status_code_class": _status_class(
+                    resolved_status
+                ),
                 "operation.kind": "request",
                 "outcome": outcome,
             }
@@ -269,7 +282,7 @@ class ObservabilityRuntime:
         self._otel.set_span_attributes(
             {
                 "http.route": state.route,
-                "http.response.status_code": status_code or 0,
+                "http.response.status_code": resolved_status or 0,
                 "policyengine.request.id": state.request_id,
                 "policyengine.outcome": outcome,
             }
@@ -278,7 +291,7 @@ class ObservabilityRuntime:
             "request.id": state.request_id,
             "http.request.method": state.method,
             "http.route": state.route,
-            "http.response.status_code": status_code,
+            "http.response.status_code": resolved_status,
             "duration_ms": round(duration * 1_000, 3),
             "outcome": outcome,
             **self._otel.current_correlation(),
@@ -291,9 +304,13 @@ class ObservabilityRuntime:
             error=error,
         )
         self._otel.record_request(duration, metric_values)
-        if error is not None:
+        if outcome == "error":
             self._otel.record_error(metric_values)
-        self._otel.end_span(state.span, error)
+        self._otel.end_span(
+            state.span,
+            error,
+            failed=outcome == "error",
+        )
         self._reset_request(state)
 
     def set_context(self, **attributes: Any) -> None:

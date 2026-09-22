@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from .config import ObservabilityConfig, OTLPExporterConfig
 from .diagnostics import Diagnostics
-from .schema import metric_attributes
+from .schema import error_fields, metric_attributes
 
 
 @dataclass(slots=True)
@@ -237,15 +237,26 @@ class OTelRuntime:
         self,
         handle: SpanHandle | None,
         error: BaseException | None = None,
+        *,
+        failed: bool = False,
     ) -> None:
         if handle is None:
             return
         try:
-            if error is not None:
+            if error is not None or failed:
                 from opentelemetry.trace import Status, StatusCode
 
-                if isinstance(error, Exception):
-                    handle.span.record_exception(error)
+                if error is not None:
+                    details = error_fields(error, self.config)
+                    handle.span.add_event(
+                        "exception",
+                        attributes={
+                            "exception.type": details["error.type"],
+                            "exception.message": details["error.message"],
+                            "exception.stacktrace": details["error.stack"],
+                            "exception.escaped": False,
+                        },
+                    )
                 handle.span.set_status(Status(StatusCode.ERROR))
             handle.manager.__exit__(
                 type(error) if error is not None else None,
@@ -546,7 +557,10 @@ def _build_span_exporter(config: OTLPExporterConfig) -> Any:
             OTLPSpanExporter,
         )
 
-        kwargs["endpoint"] = _http_signal_endpoint(config.endpoint, "traces")
+        if config.endpoint_mode == "base":
+            kwargs["endpoint"] = _http_signal_endpoint(
+                config.endpoint, "traces"
+            )
         return OTLPSpanExporter(**kwargs)
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
         OTLPSpanExporter,
@@ -562,7 +576,10 @@ def _build_metric_exporter(config: OTLPExporterConfig) -> Any:
             OTLPMetricExporter,
         )
 
-        kwargs["endpoint"] = _http_signal_endpoint(config.endpoint, "metrics")
+        if config.endpoint_mode == "base":
+            kwargs["endpoint"] = _http_signal_endpoint(
+                config.endpoint, "metrics"
+            )
         return OTLPMetricExporter(**kwargs)
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
         OTLPMetricExporter,

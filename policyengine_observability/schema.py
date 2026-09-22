@@ -109,7 +109,7 @@ def build_record(
         record["attributes.omitted_count"] = omitted
 
     if error is not None:
-        record.update(_error_fields(error, config))
+        record.update(error_fields(error, config))
 
     return record
 
@@ -125,7 +125,7 @@ def metric_attributes(
     return normalized
 
 
-def _error_fields(
+def error_fields(
     error: BaseException, config: ObservabilityConfig
 ) -> dict[str, Any]:
     try:

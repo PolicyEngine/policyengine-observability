@@ -9,9 +9,15 @@ from conftest import make_runtime, records
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from flask import Flask
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+from opentelemetry.trace import StatusCode
 
 from policyengine_observability import (
     REQUEST_ID_HEADER,
+    OTelConfig,
     instrument_fastapi,
     instrument_flask,
     instrument_httpx,
@@ -42,7 +48,11 @@ def test_flask_lifecycle_and_idempotence() -> None:
 
 
 def test_flask_exception_emits_one_error_completion() -> None:
-    runtime, output = make_runtime()
+    runtime, output = make_runtime(otel=OTelConfig(enabled=True))
+    exporter = InMemorySpanExporter()
+    runtime._otel._tracer_provider.add_span_processor(
+        SimpleSpanProcessor(exporter)
+    )
     app = Flask(__name__)
 
     @app.get("/fail")
@@ -55,6 +65,32 @@ def test_flask_exception_emits_one_error_completion() -> None:
     emitted = records(output)
     assert len(emitted) == 1
     assert emitted[0]["outcome"] == "error"
+    assert emitted[0]["error.type"] == "ValueError"
+    assert emitted[0]["error.message"] == "route failed"
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.events[0].name == "exception"
+    assert span.events[0].attributes["exception.message"] == "route failed"
+    runtime.shutdown()
+
+
+def test_flask_observes_early_before_request_response() -> None:
+    runtime, output = make_runtime()
+    app = Flask(__name__)
+
+    @app.before_request
+    def reject_request():
+        return {"error": "unauthorized"}, 401
+
+    instrument_flask(app, runtime)
+    response = app.test_client().get("/protected")
+
+    assert response.status_code == 401
+    assert REQUEST_ID_HEADER in response.headers
+    emitted = records(output)
+    assert len(emitted) == 1
+    assert emitted[0]["http.response.status_code"] == 401
+    assert emitted[0]["outcome"] == "client_error"
     runtime.shutdown()
 
 

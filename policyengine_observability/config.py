@@ -9,6 +9,7 @@ from .destinations import LogDestinationStrategy, StdoutLogDestination
 
 Platform = Literal["google_cloud_run", "modal", "local", "other"]
 OTLPProtocol = Literal["grpc", "http/protobuf"]
+OTLPEndpointMode = Literal["base", "signal"]
 ProviderMode = Literal["owned", "external"]
 
 
@@ -83,6 +84,7 @@ class OTLPAuthentication(Protocol):
 class OTLPExporterConfig:
     endpoint: str
     protocol: OTLPProtocol = "grpc"
+    endpoint_mode: OTLPEndpointMode = "base"
     headers: tuple[tuple[str, str], ...] = ()
     auth: OTLPAuthentication | None = None
     timeout_seconds: float = 5.0
@@ -276,6 +278,20 @@ class ObservabilityConfig:
                         "string."
                     )
 
+        for name, values in (
+            ("application_attribute_keys", self.application_attribute_keys),
+            ("dispatch_attribute_keys", self.dispatch_attribute_keys),
+            ("metric_attribute_keys", self.metric_attribute_keys),
+        ):
+            if not isinstance(values, frozenset):
+                errors.append(
+                    f"{name} must be a frozenset of non-empty strings."
+                )
+                continue
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(f"{name} entries must be non-empty strings.")
+
         _choice_error(
             errors,
             "deployment.platform",
@@ -390,6 +406,12 @@ class ObservabilityConfig:
                 exporter.protocol,
                 {"grpc", "http/protobuf"},
             )
+            _choice_error(
+                errors,
+                f"otel.{signal}.endpoint_mode",
+                exporter.endpoint_mode,
+                {"base", "signal"},
+            )
             _number_error(
                 errors,
                 f"otel.{signal}.timeout_seconds",
@@ -492,7 +514,8 @@ def _exporter_from_env(
     if not enabled:
         return None
     prefix = f"OTEL_EXPORTER_OTLP_{signal.upper()}"
-    endpoint = os.getenv(f"{prefix}_ENDPOINT") or common_endpoint
+    signal_endpoint = os.getenv(f"{prefix}_ENDPOINT")
+    endpoint = signal_endpoint or common_endpoint
     if not endpoint:
         return None
     protocol_value = os.getenv(f"{prefix}_PROTOCOL")
@@ -533,6 +556,7 @@ def _exporter_from_env(
     return OTLPExporterConfig(
         endpoint=endpoint,
         protocol=protocol,
+        endpoint_mode="signal" if signal_endpoint else "base",
         headers=headers,
         auth=auth,
         timeout_seconds=timeout / 1_000,
@@ -602,7 +626,7 @@ def _env_int(
 def _choice_error(
     errors: list[str], name: str, value: Any, choices: set[str]
 ) -> None:
-    if value not in choices:
+    if not isinstance(value, str) or value not in choices:
         errors.append(f"{name} must be one of: {', '.join(sorted(choices))}.")
 
 

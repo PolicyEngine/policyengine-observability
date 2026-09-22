@@ -110,7 +110,8 @@ that destination.
 
 Configured sensitive values are replaced in messages, exception details, and
 allowlisted string attributes before length limits are applied and before the
-record reaches a logging destination, span, or metric exporter.
+record reaches a logging destination, span, or metric exporter. This also
+applies to exception events on spans and local internal diagnostics.
 
 Every queued destination has its own bounded queue and worker. A blocked or
 failing destination cannot delay another destination or the application
@@ -162,6 +163,11 @@ otel = OTelConfig(
 )
 ```
 
+For OTLP over HTTP, the default `endpoint_mode="base"` appends
+`/v1/traces` or `/v1/metrics` to the configured endpoint. Set
+`endpoint_mode="signal"` when the endpoint already identifies the exact
+signal route.
+
 For a Google ID-token protected collector, select the authentication strategy
 explicitly:
 
@@ -185,6 +191,10 @@ OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 OTEL_EXPORTER_OTLP_TRACES_HEADERS=x-api-key=trace-key
 OTEL_EXPORTER_OTLP_METRICS_HEADERS=x-api-key=metric-key
 ```
+
+The common HTTP endpoint is treated as a base URL. Signal-specific HTTP
+endpoint variables are passed to the exporter exactly as configured, following
+the OpenTelemetry environment-variable contract.
 
 `POLICYENGINE_OTEL_GOOGLE_AUDIENCE` selects `GoogleIdTokenAuth` for both
 signals. `POLICYENGINE_OTEL_TRACES_GOOGLE_AUDIENCE` and

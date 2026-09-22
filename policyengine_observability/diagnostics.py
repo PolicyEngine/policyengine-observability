@@ -18,9 +18,11 @@ class Diagnostics:
         *,
         interval_seconds: float = 60.0,
         stderr: Any = None,
+        sensitive_values: tuple[str, ...] = (),
     ) -> None:
         self._interval_seconds = max(1.0, interval_seconds)
         self._stderr = stderr or sys.stderr
+        self._sensitive_values = sensitive_values
         self._last_report: dict[str, float] = {}
         self._counts: Counter[str] = Counter()
         self._listeners: list[Callable[[str, int], None]] = []
@@ -79,8 +81,11 @@ class Diagnostics:
             "event.name": "observability.internal_failure",
             "operation": operation,
             "error.type": type(error).__name__,
-            "error.message": _safe_text(error),
-            **{str(key): _safe_scalar(value) for key, value in fields.items()},
+            "error.message": _safe_text(error, self._sensitive_values),
+            **{
+                str(key): _safe_scalar(value, self._sensitive_values)
+                for key, value in fields.items()
+            },
         }
         try:
             print(
@@ -92,14 +97,22 @@ class Diagnostics:
             return
 
 
-def _safe_text(value: Any) -> str:
+def _safe_text(value: Any, sensitive_values: tuple[str, ...]) -> str:
     try:
-        return str(value)[:2_048]
+        text = str(value)
     except Exception:
         return "<unprintable>"
+    for sensitive in sensitive_values:
+        if sensitive:
+            text = text.replace(sensitive, "[REDACTED]")
+    return text[:2_048]
 
 
-def _safe_scalar(value: Any) -> str | int | float | bool | None:
-    if value is None or isinstance(value, (str, int, float, bool)):
+def _safe_scalar(
+    value: Any, sensitive_values: tuple[str, ...]
+) -> str | int | float | bool | None:
+    if isinstance(value, str):
+        return _safe_text(value, sensitive_values)
+    if value is None or isinstance(value, (int, float, bool)):
         return value
-    return _safe_text(value)
+    return _safe_text(value, sensitive_values)

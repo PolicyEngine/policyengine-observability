@@ -48,11 +48,17 @@ def instrument_flask(
 
             if request.url_rule is not None:
                 runtime.update_request_route(request.url_rule.rule)
+        except Exception as exc:
+            runtime.diagnostics.report("flask.request_route", exc)
+        try:
+            runtime.update_request_status(response.status_code)
+        except Exception as exc:
+            runtime.diagnostics.report("flask.request_status", exc)
+        try:
             for key, value in runtime.response_headers().items():
                 response.headers[key] = value
-            runtime.end_request(status_code=response.status_code)
         except Exception as exc:
-            runtime.diagnostics.report("flask.request_finish", exc)
+            runtime.diagnostics.report("flask.response_headers", exc)
         return response
 
     def _close_observed_request(error: BaseException | None) -> None:
@@ -68,7 +74,15 @@ def instrument_flask(
     try:
         snapshots = _snapshot_callback_registries(app)
         app.before_request(_begin_observed_request)
+        _move_callback_to_start(
+            app.before_request_funcs,
+            _begin_observed_request,
+        )
         app.after_request(_finish_observed_request)
+        _move_callback_to_start(
+            app.after_request_funcs,
+            _finish_observed_request,
+        )
         app.teardown_request(_close_observed_request)
         extensions[_EXTENSION_KEY] = runtime
     except Exception as exc:
@@ -86,6 +100,19 @@ def instrument_flask(
         runtime.diagnostics.report("flask.callback_install", exc)
 
     return runtime
+
+
+def _move_callback_to_start(
+    registry: dict[Any, list[Any]], callback: Any
+) -> None:
+    callbacks = registry.get(None)
+    if callbacks is None:
+        raise RuntimeError("Flask did not register the callback.")
+    for index, registered in enumerate(callbacks):
+        if registered is callback:
+            callbacks.insert(0, callbacks.pop(index))
+            return
+    raise RuntimeError("Flask did not register the callback.")
 
 
 def _snapshot_callback_registries(

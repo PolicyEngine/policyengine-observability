@@ -81,6 +81,7 @@ def test_invalid_nested_limits_are_reported_together() -> None:
     exporter = OTLPExporterConfig(
         endpoint="",
         protocol="invalid",  # type: ignore[arg-type]
+        endpoint_mode="invalid",  # type: ignore[arg-type]
         timeout_seconds=0,
     )
     config = make_config(
@@ -117,6 +118,7 @@ def test_invalid_nested_limits_are_reported_together() -> None:
         "otel.shutdown_timeout_seconds",
         "otel.traces.endpoint",
         "otel.traces.protocol",
+        "otel.traces.endpoint_mode",
         "otel.traces.timeout_seconds",
         "limits.max_attributes",
         "limits.async_parent_max_age_seconds",
@@ -141,6 +143,26 @@ def test_invalid_sensitive_values_fail_before_runtime_setup(
     )
 
     with pytest.raises(ConfigurationError, match=expected):
+        configure(config)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("application_attribute_keys", ("backend",)),
+        ("application_attribute_keys", frozenset({""})),
+        ("dispatch_attribute_keys", ["job_id"]),
+        ("dispatch_attribute_keys", frozenset({1})),
+        ("metric_attribute_keys", {"outcome"}),
+        ("metric_attribute_keys", frozenset({"   "})),
+    ],
+)
+def test_invalid_attribute_allowlists_fail_before_runtime_setup(
+    field_name, value
+) -> None:
+    config = make_config(**{field_name: value})
+
+    with pytest.raises(ConfigurationError, match=field_name):
         configure(config)
 
 
@@ -235,6 +257,30 @@ def test_from_env_reads_transport_but_not_identity(monkeypatch) -> None:
     assert config.otel.span_batch_size == 99
     assert config.otel.span_schedule_delay_seconds == 2.5
     assert config.otel.metric_export_interval_seconds == 4.0
+
+
+def test_from_env_marks_signal_specific_endpoints_as_exact(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "https://collector/custom-traces",
+    )
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "https://collector/custom-metrics",
+    )
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+
+    config = ObservabilityConfig.from_env(
+        service=ServiceIdentity("svc", "ns", "1", "api"),
+        deployment=DeploymentIdentity("dev", "local"),
+    )
+
+    assert config.otel.traces is not None
+    assert config.otel.metrics is not None
+    assert config.otel.traces.endpoint_mode == "signal"
+    assert config.otel.metrics.endpoint_mode == "signal"
 
 
 @pytest.mark.parametrize(

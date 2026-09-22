@@ -72,7 +72,7 @@ def test_owned_provider_creates_local_spans_metrics_and_resources() -> None:
     runtime.shutdown()
 
 
-def test_sensitive_values_are_redacted_from_span_attributes() -> None:
+def test_sensitive_values_are_redacted_from_spans_and_logs() -> None:
     config = make_config(
         otel=OTelConfig(enabled=True),
         application_attribute_keys=frozenset({"backend"}),
@@ -85,16 +85,27 @@ def test_sensitive_values_are_redacted_from_span_attributes() -> None:
         SimpleSpanProcessor(exporter)
     )
 
-    with runtime.operation(
-        "simulation.run",
-        attributes={"backend": "prefix-secret-value-suffix"},
-    ):
+    try:
+        with runtime.operation(
+            "simulation.run",
+            attributes={"backend": "prefix-secret-value-suffix"},
+        ):
+            raise ValueError("secret-value operation failed")
+    except ValueError:
         pass
 
     span = exporter.get_finished_spans()[0]
     assert span.attributes["backend"] == "prefix-[REDACTED]-suffix"
+    event = span.events[0]
+    assert event.name == "exception"
+    assert event.attributes["exception.message"] == (
+        "[REDACTED] operation failed"
+    )
+    assert "secret-value" not in event.attributes["exception.stacktrace"]
+    assert "[REDACTED]" in event.attributes["exception.stacktrace"]
     item = records(runtime._delivery._stdout)[0]
     assert item["attributes"]["backend"] == "prefix-[REDACTED]-suffix"
+    assert item["error.message"] == "[REDACTED] operation failed"
     runtime.shutdown()
 
 
@@ -129,6 +140,24 @@ def test_malformed_trace_context_starts_new_trace() -> None:
     span = exporter.get_finished_spans()[0]
     assert span.context.trace_id != 0
     assert span.parent is None
+    runtime.shutdown()
+
+
+def test_server_error_response_sets_span_error_status() -> None:
+    from opentelemetry.trace import StatusCode
+
+    runtime, exporter = _runtime_with_spans()
+    runtime.begin_request(
+        headers={},
+        method="GET",
+        route="/unavailable",
+    )
+
+    runtime.end_request(status_code=503)
+
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.events == ()
     runtime.shutdown()
 
 
@@ -293,6 +322,16 @@ def test_otlp_exporter_builders_apply_protocol_endpoint_and_timeout(
     assert created[3][1]["endpoint"] == "https://collector/v1/metrics"
     assert created[0][1]["headers"] == {"x-test": "value"}
     assert created[0][1]["timeout"] == 2
+
+    exact = OTLPExporterConfig(
+        endpoint="https://collector/custom-signal",
+        protocol="http/protobuf",
+        endpoint_mode="signal",
+    )
+    assert _build_span_exporter(exact) == "http-span"
+    assert _build_metric_exporter(exact) == "http-metric"
+    assert created[4][1]["endpoint"] == "https://collector/custom-signal"
+    assert created[5][1]["endpoint"] == "https://collector/custom-signal"
 
 
 def test_google_exporter_kwargs_select_protocol_credentials(
@@ -487,11 +526,11 @@ def test_otel_end_span_metrics_flush_and_shutdown_fail_open() -> None:
 
     class Span:
         def __init__(self):
-            self.recorded = None
+            self.events = []
             self.status = None
 
-        def record_exception(self, error):
-            self.recorded = error
+        def add_event(self, name, attributes):
+            self.events.append((name, attributes))
 
         def set_status(self, status):
             self.status = status
@@ -507,7 +546,8 @@ def test_otel_end_span_metrics_flush_and_shutdown_fail_open() -> None:
     manager = Manager()
     error = ValueError("application")
     otel.end_span(SpanHandle(manager=manager, span=span), error)
-    assert span.recorded is error
+    assert span.events[0][0] == "exception"
+    assert span.events[0][1]["exception.message"] == "application"
     assert manager.args[1] is error
     otel.end_span(None)
 

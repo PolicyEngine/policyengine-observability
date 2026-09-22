@@ -69,6 +69,26 @@ def test_diagnostics_are_local_rate_limited_and_counted() -> None:
     assert diagnostics.count("dropped") == 3
 
 
+def test_diagnostics_redact_configured_sensitive_values() -> None:
+    output = io.StringIO()
+    diagnostics = Diagnostics(
+        stderr=output,
+        sensitive_values=("secret-value",),
+    )
+
+    diagnostics.report(
+        "export.failed",
+        ValueError("secret-value exporter failure"),
+        destination="prefix-secret-value-suffix",
+    )
+
+    rendered = output.getvalue()
+    item = json.loads(rendered)
+    assert "secret-value" not in rendered
+    assert item["error.message"] == "[REDACTED] exporter failure"
+    assert item["destination"] == "prefix-[REDACTED]-suffix"
+
+
 def test_diagnostic_listener_failure_does_not_escape() -> None:
     diagnostics = Diagnostics(stderr=io.StringIO())
     diagnostics.add_listener(

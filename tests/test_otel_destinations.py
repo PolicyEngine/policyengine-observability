@@ -29,10 +29,12 @@ def test_signal_specific_otlp_environment_configuration(monkeypatch) -> None:
 
     assert config.otel.traces == OTLPExporterConfig(
         endpoint="https://traces",
+        endpoint_mode="signal",
         headers=(("trace-key", "trace-value"),),
     )
     assert config.otel.metrics == OTLPExporterConfig(
         endpoint="https://metrics",
+        endpoint_mode="signal",
         headers=(("metric-key", "metric-value"),),
     )
 
