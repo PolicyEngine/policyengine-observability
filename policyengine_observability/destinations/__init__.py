@@ -1,19 +1,25 @@
-from __future__ import annotations
+"""Logging destination strategies supplied to :class:`LoggingConfig`."""
 
-from .base import LogDestination, normalize_payload
-from .google_cloud_logging import GoogleCloudLoggingDestination
-from .manager import LogDestinationManager
-from .queued import QueuedLogDestination
-from .registry import register_destination
-from .stdout import StdoutJsonDestination, register_stdout_formatter
+from .base import (
+    CustomLogDestination,
+    DestinationBuildContext,
+    LogDestinationStrategy,
+    RecordFormatter,
+    RecordWriter,
+)
+from .google_cloud import (
+    GoogleCloudLogDestination,
+    GoogleCloudLogFormatter,
+)
+from .stdout import StdoutLogDestination
 
 __all__ = [
-    "GoogleCloudLoggingDestination",
-    "LogDestination",
-    "LogDestinationManager",
-    "QueuedLogDestination",
-    "StdoutJsonDestination",
-    "normalize_payload",
-    "register_destination",
-    "register_stdout_formatter",
+    "CustomLogDestination",
+    "DestinationBuildContext",
+    "GoogleCloudLogDestination",
+    "GoogleCloudLogFormatter",
+    "LogDestinationStrategy",
+    "RecordFormatter",
+    "RecordWriter",
+    "StdoutLogDestination",
 ]

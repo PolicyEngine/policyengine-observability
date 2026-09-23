@@ -1,188 +1,346 @@
 # policyengine-observability
 
-Shared PolicyEngine observability runtime for fail-open local timings,
-structured logs, OpenTelemetry traces, and OpenTelemetry metrics.
+`policyengine-observability` provides a shared runtime for structured logs,
+OpenTelemetry traces and metrics, request propagation, and framework request
+instrumentation. Each application owns its service identity, attribute policy,
+logging destinations, OTLP endpoints, and credentials.
 
-The package intentionally keeps framework support in adapters:
+Version 2 uses an explicitly owned runtime. `configure(config)` returns that
+runtime, and every adapter or manual operation receives it. Configuration does
+not select a destination from the deployment platform or contact a remote
+service.
 
-- `policyengine_observability.adapters.flask`
-- `policyengine_observability.adapters.fastapi`
-- `policyengine_observability.integrations.httpx`
+## Install
 
-OpenTelemetry support is installed and enabled by default. Timing and
-structured logging run even without an OTLP collector; when no endpoint is
-configured, spans and metrics stay in-process while logs still receive trace
-context. Set `OTEL_ENABLED=false` to opt out. Configure
-`OTEL_EXPORTER_OTLP_ENDPOINT` to export traces and metrics.
-
-## Log routing profiles
-
-Log routing is owned by this package: consumers set one env var and the
-package expands it into destinations, formats, and transport.
+Install only the integrations used by the service:
 
 ```bash
-OBSERVABILITY_LOG_PROFILE=gcp-agent   # or gcp-direct | plain-sync | auto
+pip install "policyengine-observability[otel,otlp-grpc]"
+pip install "policyengine-observability[flask,httpx,google]"
+pip install "policyengine-observability[fastapi,httpx,google]"
 ```
 
-- `gcp-agent` — google-format stdout only, for platforms whose logging
-  agent ingests stdout (Cloud Run, GKE). Fully synchronous, zero
-  threads; the agent ships lines to Cloud Logging with severity, trace,
-  span, and labels promoted to first-class LogEntry fields.
-- `gcp-direct` — plain stdout (the durable record) plus queued direct
-  Cloud Logging writes, for platforms with no ingesting agent (Modal).
-  Requires a resolvable Google Cloud project; downgrades to `plain-sync`
-  with a warning otherwise.
-- `plain-sync` — plain stdout only, guaranteed zero threads. Local
-  development and the kill switch: setting it disables all background
-  log machinery.
-- `auto` (default) — detects the platform via `OBSERVABILITY_PLATFORM`
-  (`google_cloud_run`/`modal`), then `K_SERVICE`, then Modal env
-  markers; when nothing matches, caller-supplied defaults apply.
+The base package has no required dependencies. OpenTelemetry, OTLP exporters,
+Google authentication and logging, and web frameworks are optional extras and
+are imported only when configured or called.
 
-The granular controls still exist underneath and override the profile's
-expansion when set explicitly:
+## Configure a runtime
+
+Service and deployment identity are explicit. Logging and OTel use separate
+configuration so they can write to different stores.
+
+```python
+from policyengine_observability import (
+    DeploymentIdentity,
+    LoggingConfig,
+    ObservabilityConfig,
+    OTelConfig,
+    OTLPExporterConfig,
+    ServiceIdentity,
+    StdoutLogDestination,
+    configure,
+)
+
+config = ObservabilityConfig(
+    service=ServiceIdentity(
+        name="example-api",
+        namespace="policyengine.example",
+        version="1.2.3",
+        role="api",
+    ),
+    deployment=DeploymentIdentity(
+        environment="production",
+        platform="google_cloud_run",
+        region="us-central1",
+    ),
+    logging=LoggingConfig(
+        destinations=(StdoutLogDestination(),),
+    ),
+    otel=OTelConfig(
+        traces=OTLPExporterConfig(endpoint="collector:4317"),
+        metrics=OTLPExporterConfig(endpoint="collector:4317"),
+    ),
+    application_attribute_keys=frozenset({"country_id", "backend"}),
+    dispatch_attribute_keys=frozenset({"job_id", "run_id"}),
+)
+runtime = configure(config)
+```
+
+`configure` validates the complete configuration before it creates workers,
+exporters, or logging handlers. Invalid values raise `ConfigurationError` with
+the fields that must be corrected. Unavailable credentials or destinations
+after successful validation remain nonfatal runtime failures.
+
+The default logging destination is one-line JSON on standard output. An OTel
+runtime without an exporter still creates local trace context for log
+correlation. It does not send traces or metrics remotely.
+
+## Logging destinations
+
+Application code emits a provider-neutral record. `LoggingConfig` selects one
+or more destination strategies when the runtime starts.
+
+```python
+from policyengine_observability import (
+    GoogleCloudLogDestination,
+    GoogleCloudLogFormatter,
+)
+
+logging = LoggingConfig(
+    destinations=(
+        StdoutLogDestination(
+            formatter=GoogleCloudLogFormatter("trace-project"),
+        ),
+        GoogleCloudLogDestination(
+            project_id="logging-project",
+            log_name="example-api",
+            queue_capacity=1_000,
+            batch_size=100,
+            write_timeout_seconds=5,
+        ),
+    ),
+)
+```
+
+The formatter adds Cloud Logging trace-correlation fields only to the output
+it formats. The canonical record retains the portable `trace_id`, `span_id`,
+and `trace_sampled` fields. Each destination and formatter receives a deep
+copy of the canonical record, so mutations to nested values remain local to
+that destination.
+
+Configured sensitive values are replaced in messages, exception details, and
+allowlisted string attributes before length limits are applied and before the
+record reaches a logging destination, span, or metric exporter. This also
+applies to exception events on spans and local internal diagnostics.
+
+Every queued destination has its own bounded queue and worker. A blocked or
+failing destination cannot delay another destination or the application
+operation that emitted the record. Queue saturation drops the newest record
+and records a local diagnostic.
+
+### Custom destinations
+
+Use `CustomLogDestination` for a writer owned by an application or another
+package:
+
+```python
+from policyengine_observability import CustomLogDestination
+
+logging = LoggingConfig(
+    destinations=(
+        CustomLogDestination(
+            name="internal-log-store",
+            writer_factory=lambda: InternalLogWriter(),
+            delivery="queued",
+        ),
+    ),
+)
+```
+
+The writer implements `write(record)`. It may optionally implement
+`write_many(records)` and `close()`. A separate integration package can also
+provide a class implementing `LogDestinationStrategy`. Network writers should
+always use `delivery="queued"`. Cleanup for inline writers runs on daemon
+threads, and orderly shutdown waits for it only within the configured logging
+shutdown timeout.
+
+## OTLP destinations and authentication
+
+Traces and metrics have independent exporter configurations:
+
+```python
+otel = OTelConfig(
+    traces=OTLPExporterConfig(
+        endpoint="https://trace-collector.example",
+        protocol="http/protobuf",
+        headers=(("x-api-key", "trace-key"),),
+    ),
+    metrics=OTLPExporterConfig(
+        endpoint="metrics-collector.example:4317",
+        protocol="grpc",
+        headers=(("x-api-key", "metric-key"),),
+    ),
+)
+```
+
+For OTLP over HTTP, the default `endpoint_mode="base"` appends
+`/v1/traces` or `/v1/metrics` to the configured endpoint. Set
+`endpoint_mode="signal"` when the endpoint already identifies the exact
+signal route.
+
+For a Google ID-token protected collector, select the authentication strategy
+explicitly:
+
+```python
+from policyengine_observability import GoogleIdTokenAuth
+
+traces = OTLPExporterConfig(
+    endpoint="collector.example:443",
+    auth=GoogleIdTokenAuth("https://collector.example"),
+)
+```
+
+`ObservabilityConfig.from_env` reads the standard common and signal-specific
+OTel settings, including:
 
 ```bash
-OBSERVABILITY_LOG_DESTINATIONS=stdout,google_cloud_logging
-OBSERVABILITY_STDOUT_FORMAT=google
-OBSERVABILITY_GOOGLE_CLOUD_PROJECT=policyengine-api
-OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME=policyengine-observability
+OTEL_EXPORTER_OTLP_ENDPOINT=collector.example:4317
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=trace-collector.example:4317
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=metric-collector.example:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+OTEL_EXPORTER_OTLP_TRACES_HEADERS=x-api-key=trace-key
+OTEL_EXPORTER_OTLP_METRICS_HEADERS=x-api-key=metric-key
 ```
 
-Destinations are named strategies: `stdout` is `inline` (synchronous on
-the caller's thread), and every `remote` strategy — `google_cloud_logging`
-today; future backends register the same way — is automatically wrapped
-in the queued transport below. Google Cloud Logging uses Application
-Default Credentials and requires permission to create log entries,
-typically through `roles/logging.logWriter`.
+The common HTTP endpoint is treated as a base URL. Signal-specific HTTP
+endpoint variables are passed to the exporter exactly as configured, following
+the OpenTelemetry environment-variable contract.
 
-Backends plug in through two top-level hooks, `register_destination`
-(with `transport="inline"|"remote"` and an optional `required_config`
-tuple naming the config fields the strategy needs — profiles that name
-the strategy downgrade gracefully when one is missing) and
-`register_stdout_formatter`. Registration happens at import time, so an
-external backend module must be imported before observability is
-configured. Backend-specific knobs are the strategy's own: the Google
-strategy reads `OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS` itself at
-construction (so it is re-read on `restart_observability()`) rather
-than through a core config field. Name lookups for destinations,
-formatters, and profiles all forgive case, whitespace, and
-hyphen/underscore variance; an unknown format name falls back to plain
-and is reported through the internal-error channel, and a registered
-formatter factory that raises degrades to the built-in plain formatter
-the same way rather than breaking configuration.
+`POLICYENGINE_OTEL_GOOGLE_AUDIENCE` selects `GoogleIdTokenAuth` for both
+signals. `POLICYENGINE_OTEL_TRACES_GOOGLE_AUDIENCE` and
+`POLICYENGINE_OTEL_METRICS_GOOGLE_AUDIENCE` override it per signal.
 
-## Log emission and delivery semantics
+Google authentication constructed from `GCP_CREDENTIALS_JSON`,
+`MODAL_IDENTITY_TOKEN`, or `OBSERVABILITY_GOOGLE_OIDC_TOKEN` stays in process
+memory. The package passes credential data and subject tokens directly to
+Google Auth and does not create temporary credential files. A path explicitly
+provided through `GOOGLE_APPLICATION_CREDENTIALS` remains supported.
 
-Remote destinations never write on a request thread. The log call only
-snapshots the payload, stamps the enqueue time, and appends to a bounded
-in-memory queue (microseconds, never blocks, never raises); a stdlib
-`QueueListener` thread drains the queue and performs the writes, sending
-the enqueue time as the entry timestamp so delayed writes keep their
-event time.
+Applications can share a collector by configuring the same endpoint and
+credentials. Another application can use a separate collector or any
+OTLP-compatible service without changing this package.
 
-Delivery through the queue is best-effort by design — stdout is the
-durable sibling record. When the queue is full the newest record is
-dropped, and drops are counted and reported through the internal-error
-channel (first drop, then every 100th). Write failures are likewise
-reported and the record dropped; there is deliberately no breaker or
-retry queue in the transport. Each Google write carries an explicit
-budget that caps the call and its transient-error retries:
+## Flask and FastAPI
 
-```bash
-OBSERVABILITY_GOOGLE_WRITE_TIMEOUT_SECONDS=10.0
-OBSERVABILITY_LOG_QUEUE_MAXSIZE=1000
-OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS=2.0
+Install a framework adapter once while constructing the application:
+
+```python
+from flask import Flask
+from policyengine_observability import instrument_flask
+
+app = Flask(__name__)
+instrument_flask(app, runtime)
 ```
 
-(The bounded write rebinds the client's private gapic method at
-construction; when that handle is unavailable — HTTP transports,
-injected fakes — the library's ~60s default applies, which is harmless
-off the request path. All numeric knobs are clamped, so `0`, negative,
-or non-finite values can never disable or unbound a mechanism. The
-Google client library's one-time instrumentation diagnostic entry is
-suppressed at construction, so the stream carries only the records the
-service asked to write.)
+```python
+from fastapi import FastAPI
+from policyengine_observability import instrument_fastapi
 
-Shutdown closes log destinations inside the same bounded budget that
-flushes OpenTelemetry (`OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS`); a
-queue that cannot drain before its deadline is abandoned with a report.
-A hard kill loses whatever was still queued. Note the google stdout
-format sets no `time` key: stdout emission is synchronous, so the
-agent's receive time is the correct event time.
-
-Processes that fork or restore from memory snapshots do not preserve
-threads or network clients. Call `restart_observability()` from the
-post-restore or post-fork hook (for example gunicorn `post_fork` when
-using `--preload`, or a Modal post-snapshot hook) — it closes and
-rebuilds destinations from configuration, and must only be called from
-single-threaded lifecycle moments, before serving traffic. It is a
-no-op when observability is disabled, so the kill switch holds across
-forks and restores.
-
-Request and operation logs include two timing views:
-
-- `timings_ms` and `timing_counts` are flat inclusive aggregates by segment
-  name, intended for quick scanning and compatibility with existing log
-  queries.
-- `segment_tree` is an ordered nested view of segment occurrences. Repeated
-  sibling segments are preserved as separate entries, and safe scalar segment
-  attributes are included so callers can distinguish settings such as
-  `simulation_kind=baseline` versus `simulation_kind=reform`.
-
-Core structured log fields take precedence over caller-provided attributes with
-the same keys.
-
-On runtimes that do not provide Application Default Credentials, set
-`GCP_CREDENTIALS_JSON` to a service account JSON document. The Google Cloud
-Logging destination will materialize it into a temporary credentials file and
-pass those credentials directly to the Google client. If the credential
-bootstrap fails, observability fails open and continues without raising into
-application code.
-
-Prefer OIDC-based Workload Identity Federation over long-lived service account
-keys when the runtime can provide an OIDC subject token. Modal injects
-generated identity tokens into Function containers through
-`MODAL_IDENTITY_TOKEN`; other runtimes can provide
-`OBSERVABILITY_GOOGLE_OIDC_TOKEN`. The runtime needs these values:
-
-```bash
-OBSERVABILITY_GOOGLE_OIDC_TOKEN=OIDC_TOKEN_FROM_RUNTIME
-OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER=projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID
-OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL=observability-writer@PROJECT_ID.iam.gserviceaccount.com
-OBSERVABILITY_GOOGLE_CLOUD_PROJECT=PROJECT_ID
+app = FastAPI()
+instrument_fastapi(app, runtime)
 ```
 
-When `MODAL_IDENTITY_TOKEN` or `OBSERVABILITY_GOOGLE_OIDC_TOKEN` is present
-alongside `OBSERVABILITY_GOOGLE_WORKLOAD_IDENTITY_PROVIDER`, the Google Cloud
-Logging destination writes a temporary external-account credential
-configuration and passes those credentials directly to the Cloud Logging
-client. If `OBSERVABILITY_GOOGLE_SERVICE_ACCOUNT_EMAIL` is present, the
-configuration uses service account impersonation. This keeps observability
-credentials separate from any application-level `GOOGLE_APPLICATION_CREDENTIALS`
-or `GCP_CREDENTIALS_JSON` used by the service for other Google clients.
+Both adapters extract W3C trace context and
+`X-PolicyEngine-Request-Id`, create one server span, emit one completion
+record, record request metrics, and clear context-local state. Repeated calls
+reuse the first runtime associated with the application. Install the Flask
+adapter before serving the first request. If Flask rejects callback
+registration, the adapter restores the prior callback registries, leaves the
+application unmarked, reports a local diagnostic, and returns without raising.
 
-The Google Cloud setup needs:
+## Application instrumentation
 
-- A Workload Identity Pool and OIDC provider whose issuer matches Modal's OIDC
-  issuer, `https://oidc.modal.com`.
-- Attribute mapping for the Modal token claims you want to authorize, such as
-  `google.subject=assertion.sub`.
-- A service account with `roles/logging.logWriter` on the log project.
-- An IAM binding granting the workload identity principal
-  `roles/iam.workloadIdentityUser` on that service account.
+The package instruments framework and transport mechanics. Applications own
+the names and boundaries of their domain operations.
 
-For the fixed PolicyEngine Google Cloud destination, see
-[`docs/operations/google-cloud-stage3-runbook.md`](docs/operations/google-cloud-stage3-runbook.md).
+```python
+with runtime.operation(
+    "simulation.run",
+    attributes={"backend": "modal"},
+):
+    with runtime.span("simulation.build"):
+        simulation = build_simulation()
+    result = calculate(simulation)
+```
+
+Operations and spans support synchronous and asynchronous context management
+and decoration:
+
+```python
+@runtime.span("simulation.calculate")
+async def calculate(simulation):
+    return await simulation.calculate()
+```
+
+Function arguments and return values are never captured. The runtime accepts
+only application-configured attribute keys and scalar values.
+
+```python
+runtime.set_context(auth_result="accepted", simulation_id="sim-123")
+runtime.event("simulation.dispatched", attributes={"backend": "modal"})
+
+try:
+    load_result()
+except ValueError as error:
+    runtime.record_exception(error, handled=True)
+```
+
+## Python logging and HTTP propagation
+
+Instrument a specific Python logger or configure root capture explicitly:
+
+```python
+import logging
+from policyengine_observability import instrument_logging
+
+logger = logging.getLogger("policyengine.example")
+instrument_logging(logger, runtime)
+```
+
+Only the supplied HTTPX client is modified:
+
+```python
+import httpx
+from policyengine_observability import instrument_httpx
+
+client = httpx.AsyncClient()
+instrument_httpx(client, runtime)
+```
+
+The request hook injects active W3C context and the PolicyEngine request ID.
+Other clients in the process remain unchanged.
+
+For asynchronous dispatch, serialize the bounded correlation context with the
+job request and restore it around the worker operation:
+
+```python
+request.observability_context = runtime.capture_context()
+
+with runtime.operation(
+    "simulation.run",
+    remote_context=request.observability_context,
+):
+    return run_simulation(request)
+```
+
+## Process restoration and shutdown
+
+After a process image or memory snapshot is restored, rebuild process-local
+locks, context, queues, threads, credentials, and exporters before accepting
+work:
+
+```python
+@modal.enter(snap=False)
+def restore_process_state(self):
+    self.runtime.restart_after_snapshot()
+```
+
+Call `runtime.shutdown()` during orderly process shutdown. Logging and OTel
+each use their own timeout. After configuration validation succeeds, missing
+optional dependencies, credential failures, unavailable destinations, queue
+saturation, exporter errors, and shutdown timeouts produce rate-limited
+diagnostics on standard error. These runtime failures do not change application
+responses, return values, or exceptions.
 
 ## Release workflow
 
-Changes should include a Towncrier fragment in `changelog.d/`. Pull requests
-run changelog, Ruff, and coverage checks. Pushes to `main` run the same gates,
-then publish a versioning commit that builds the changelog and bumps
-`pyproject.toml`. That versioning commit publishes the package to PyPI through
-trusted publishing, creates a matching git tag, and opens a GitHub release.
+Changes include a Towncrier fragment in `changelog.d/`. Pull requests run Ruff,
+tests, type checks, and coverage checks. The release workflow builds
+distributions and publishes through PyPI trusted publishing.
 
 ## License
 
-Code in this repository is released under the [MIT License](LICENSE). Original text and figures are released under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) with attribution to PolicyEngine. Third-party data and materials keep their own terms.
+Code in this repository is released under the [MIT License](LICENSE). Original
+text and figures are released under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) with attribution to
+PolicyEngine. Third-party materials retain their terms.

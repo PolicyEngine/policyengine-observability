@@ -1,132 +1,147 @@
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
-from ..config import ObservabilityConfig
-from ..context import RequestObservabilityContext
-from ..runtime import (
-    OBSERVABILITY_INTERNAL_DISPATCH_HEADER,
-    REQUEST_ID_HEADER,
-    ObservabilityRuntime,
-    set_observability_runtime,
+from ..runtime import ObservabilityRuntime
+
+_EXTENSION_KEY = "policyengine_observability"
+_CALLBACK_REGISTRIES = (
+    "before_request_funcs",
+    "after_request_funcs",
+    "teardown_request_funcs",
 )
+_MISSING = object()
 
 
-class FlaskObservabilityAdapter:
-    def __init__(self, runtime: ObservabilityRuntime) -> None:
-        self.runtime = runtime
+def instrument_flask(
+    app: Any, runtime: ObservabilityRuntime
+) -> ObservabilityRuntime:
+    """Install one request lifecycle integration on a Flask application."""
 
-    def instrument_app(self, app: Any) -> None:
-        if not self.runtime.enabled:
-            return
-        if app.extensions.get("policyengine_observability_adapter"):
-            return
-        app.extensions["policyengine_observability_adapter"] = self
+    try:
+        extensions = app.extensions
+        existing = extensions.get(_EXTENSION_KEY, _MISSING)
+    except Exception as exc:
+        runtime.diagnostics.report("flask.callback_install", exc)
+        return runtime
+    if isinstance(existing, ObservabilityRuntime):
+        return existing
 
-        @app.before_request
-        def _start_observed_request() -> None:
-            self.start_request()
-
-        @app.after_request
-        def _finish_observed_request(response):
-            headers = self.runtime.finish_request(response.status_code)
-            for key, value in headers.items():
-                response.headers[key] = value
-            return response
-
-        @app.teardown_request
-        def _emit_observed_request(exc) -> None:
-            self.runtime.teardown_request(exc)
-
-    def start_request(self) -> None:
+    def _begin_observed_request() -> None:
         try:
             from flask import request
 
-            route = request.url_rule.rule if request.url_rule else request.path
-            request_id = request.headers.get(REQUEST_ID_HEADER) or str(
-                uuid.uuid4()
+            route = (
+                request.url_rule.rule if request.url_rule else "<unmatched>"
             )
-            context = RequestObservabilityContext(
-                config=self.runtime.config,
-                request_id=request_id,
+            runtime.begin_request(
+                headers=dict(request.headers),
                 method=request.method,
                 route=route,
-                path=request.path,
-                endpoint=request.endpoint,
-                query_keys=sorted(request.args.keys()),
-                content_length_bytes=request.content_length,
-                inbound=self._inbound_metadata(request),
-                internal_dispatch=(
-                    request.headers.get(OBSERVABILITY_INTERNAL_DISPATCH_HEADER)
-                    == "1"
-                ),
             )
-            self.runtime.begin_request(context, carrier=request.headers)
-        except BaseException as exc:
-            self.runtime.log_observability_failure("flask.before_request", exc)
+        except Exception as exc:
+            runtime.diagnostics.report("flask.request_begin", exc)
 
-    def _inbound_metadata(self, request) -> dict:
-        forwarded_for = _split_forwarded_for(
-            request.headers.get("X-Forwarded-For")
+    def _finish_observed_request(response: Any) -> Any:
+        try:
+            from flask import request
+
+            if request.url_rule is not None:
+                runtime.update_request_route(request.url_rule.rule)
+        except Exception as exc:
+            runtime.diagnostics.report("flask.request_route", exc)
+        try:
+            runtime.update_request_status(response.status_code)
+        except Exception as exc:
+            runtime.diagnostics.report("flask.request_status", exc)
+        try:
+            for key, value in runtime.response_headers().items():
+                response.headers[key] = value
+        except Exception as exc:
+            runtime.diagnostics.report("flask.response_headers", exc)
+        return response
+
+    def _close_observed_request(error: BaseException | None) -> None:
+        try:
+            runtime.end_request(
+                status_code=500 if error is not None else None,
+                error=error,
+            )
+        except Exception as exc:
+            runtime.diagnostics.report("flask.request_teardown", exc)
+
+    snapshots: dict[str, dict[Any, list[Any]]] | None = None
+    try:
+        snapshots = _snapshot_callback_registries(app)
+        app.before_request(_begin_observed_request)
+        _move_callback_to_start(
+            app.before_request_funcs,
+            _begin_observed_request,
         )
-        x_real_ip = request.headers.get("X-Real-IP")
-        remote_addr = request.remote_addr
-        client_ip = None
-        ip_source = None
-        if forwarded_for:
-            client_ip = forwarded_for[0]
-            ip_source = "x_forwarded_for"
-        elif x_real_ip:
-            client_ip = x_real_ip
-            ip_source = "x_real_ip"
-        elif remote_addr:
-            client_ip = remote_addr
-            ip_source = "remote_addr"
-        metadata = {
-            "ip_source": ip_source,
-            "user_agent": request.headers.get("User-Agent"),
-            "origin": request.headers.get("Origin"),
-            "referer": request.headers.get("Referer"),
-            "host": request.host,
-            "content_length_bytes": request.content_length,
-        }
-        if self.runtime.config.log_raw_ip:
-            metadata["client_ip"] = client_ip
-            metadata["forwarded_for"] = forwarded_for
-            metadata["x_real_ip"] = x_real_ip
-        return metadata
+        app.after_request(_finish_observed_request)
+        _move_callback_to_start(
+            app.after_request_funcs,
+            _finish_observed_request,
+        )
+        app.teardown_request(_close_observed_request)
+        extensions[_EXTENSION_KEY] = runtime
+    except Exception as exc:
+        if snapshots is not None:
+            _restore_callback_registries(app, snapshots, runtime)
+        try:
+            if existing is _MISSING:
+                extensions.pop(_EXTENSION_KEY, None)
+            else:
+                extensions[_EXTENSION_KEY] = existing
+        except Exception as rollback_error:
+            runtime.diagnostics.report(
+                "flask.callback_install_rollback", rollback_error
+            )
+        runtime.diagnostics.report("flask.callback_install", exc)
 
-
-def init_flask_observability(
-    app: Any,
-    *,
-    config: ObservabilityConfig | None = None,
-    runtime: ObservabilityRuntime | None = None,
-    service_name: str,
-    service_role: str = "api",
-    span_prefix: str | None = None,
-    segment_registry=None,
-) -> ObservabilityRuntime:
-    if app.extensions.get("policyengine_observability"):
-        return app.extensions["policyengine_observability"]
-    runtime = runtime or ObservabilityRuntime(
-        config
-        or ObservabilityConfig.from_env(
-            service_name=service_name,
-            service_role=service_role,
-            span_prefix=span_prefix,
-        ),
-        segment_registry=segment_registry,
-    )
-    runtime.configure()
-    app.extensions["policyengine_observability"] = runtime
-    set_observability_runtime(runtime)
-    FlaskObservabilityAdapter(runtime).instrument_app(app)
     return runtime
 
 
-def _split_forwarded_for(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [part.strip() for part in value.split(",") if part.strip()]
+def _move_callback_to_start(
+    registry: dict[Any, list[Any]], callback: Any
+) -> None:
+    callbacks = registry.get(None)
+    if callbacks is None:
+        raise RuntimeError("Flask did not register the callback.")
+    for index, registered in enumerate(callbacks):
+        if registered is callback:
+            callbacks.insert(0, callbacks.pop(index))
+            return
+    raise RuntimeError("Flask did not register the callback.")
+
+
+def _snapshot_callback_registries(
+    app: Any,
+) -> dict[str, dict[Any, list[Any]]]:
+    return {
+        name: {
+            key: list(callbacks)
+            for key, callbacks in getattr(app, name).items()
+        }
+        for name in _CALLBACK_REGISTRIES
+    }
+
+
+def _restore_callback_registries(
+    app: Any,
+    snapshots: dict[str, dict[Any, list[Any]]],
+    runtime: ObservabilityRuntime,
+) -> None:
+    for name, snapshot in snapshots.items():
+        try:
+            registry = getattr(app, name)
+            registry.clear()
+            registry.update(
+                {key: list(callbacks) for key, callbacks in snapshot.items()}
+            )
+        except Exception as exc:
+            runtime.diagnostics.report(
+                "flask.callback_install_rollback",
+                exc,
+                registry=name,
+            )

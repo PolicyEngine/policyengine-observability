@@ -1,326 +1,653 @@
 from __future__ import annotations
 
-import logging
+import math
 import os
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol, cast
 
-# Defaults for the generic queued-transport knobs; the queued destination
-# imports these so a constructor call and an env-configured build can
-# never disagree about what "default" means.
-DEFAULT_LOG_QUEUE_MAXSIZE = 1000
-DEFAULT_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS = 2.0
+from .destinations import LogDestinationStrategy, StdoutLogDestination
 
-DEFAULT_METRIC_ATTRIBUTE_KEYS = (
-    "service.name",
-    "service.role",
-    "deployment.environment",
-    "operation",
-    "flavor",
-    "route",
-    "method",
-    "endpoint",
-    "status_code",
-    "country_id",
-    "backend",
-    "requested_version",
-    "resolved_channel",
-    "auth_result",
-    "segment",
-    "event",
-    "error_type",
-    "model",
-    "tool",
-    "stop_reason",
-    "iteration",
-    "provider",
+Platform = Literal["google_cloud_run", "modal", "local", "other"]
+OTLPProtocol = Literal["grpc", "http/protobuf"]
+OTLPEndpointMode = Literal["base", "signal"]
+ProviderMode = Literal["owned", "external"]
+
+
+class ConfigurationError(ValueError):
+    """Raised before startup when observability configuration is invalid."""
+
+    def __init__(self, errors: tuple[str, ...]) -> None:
+        self.errors = errors
+        details = "\n".join(f"- {error}" for error in errors)
+        super().__init__(f"Invalid observability configuration:\n{details}")
+
+
+DEFAULT_APPLICATION_ATTRIBUTE_KEYS = frozenset(set())
+
+DEFAULT_DISPATCH_ATTRIBUTE_KEYS = frozenset(set())
+
+DEFAULT_METRIC_ATTRIBUTE_KEYS = frozenset(
+    {
+        "service.name",
+        "service.role",
+        "deployment.environment.name",
+        "cloud.platform",
+        "http.route",
+        "http.request.method",
+        "http.response.status_code_class",
+        "operation.name",
+        "operation.kind",
+        "outcome",
+    }
 )
 
 
-def bool_from_env(name: str, default: bool) -> bool:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
+@dataclass(frozen=True, slots=True)
+class ServiceIdentity:
+    name: str
+    namespace: str
+    version: str
+    role: str
 
 
-def csv_from_env(name: str) -> tuple[str, ...]:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return ()
-    return tuple(part.strip() for part in raw_value.split(",") if part.strip())
+@dataclass(frozen=True, slots=True)
+class DeploymentIdentity:
+    environment: str
+    platform: Platform
+    region: str | None = None
+    instance_id: str | None = None
 
 
-def float_from_env(name: str, default: float) -> float:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return float(raw_value)
-    except ValueError:
-        return default
-
-
-def int_from_env(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None:
-        return default
-    try:
-        return int(raw_value)
-    except ValueError:
-        return default
-
-
-def default_environment() -> str:
-    return (
-        os.getenv("OBSERVABILITY_ENVIRONMENT")
-        or os.getenv("DEPLOYMENT_ENVIRONMENT")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENVIRONMENT")
-        or "development"
+@dataclass(frozen=True, slots=True)
+class LoggingConfig:
+    destinations: tuple[LogDestinationStrategy, ...] = field(
+        default_factory=lambda: (StdoutLogDestination(),)
     )
+    capture_standard_library: bool = False
+    replace_existing_handlers: bool = False
+    minimum_severity: int = 20
+    shutdown_timeout_seconds: float = 2.0
 
 
-# A log profile is a named preset expanding to generic routing primitives
-# (a destination-name tuple and a stdout-formatter name). Presets may name
-# strategies; the expansion mechanism knows nothing about any backend.
-LOG_PROFILE_PRESETS: dict[str, tuple[tuple[str, ...], str]] = {
-    # Platforms whose logging agent ingests stdout (Cloud Run, GKE):
-    # agent-native stdout only, fully synchronous, zero threads.
-    "gcp-agent": (("stdout",), "google"),
-    # Platforms with no ingesting agent (Modal): plain stdout as the
-    # durable record plus queued direct Cloud Logging writes.
-    "gcp-direct": (("stdout", "google_cloud_logging"), "plain"),
-    # Local development and the kill switch: plain stdout, zero threads.
-    "plain-sync": (("stdout",), "plain"),
-}
+class OTLPAuthentication(Protocol):
+    """Adds authentication-specific arguments to an OTLP exporter."""
+
+    def exporter_kwargs(
+        self,
+        *,
+        protocol: OTLPProtocol,
+        headers: dict[str, str],
+    ) -> dict[str, Any]: ...
 
 
-def _detect_log_profile() -> str | None:
-    platform = (os.getenv("OBSERVABILITY_PLATFORM") or "").strip().lower()
-    if platform == "google_cloud_run":
-        return "gcp-agent"
-    if platform == "modal":
-        return "gcp-direct"
-    if os.getenv("K_SERVICE"):
-        return "gcp-agent"
-    if os.getenv("MODAL_ENVIRONMENT") or os.getenv("MODAL_TASK_ID"):
-        return "gcp-direct"
-    return None
+@dataclass(frozen=True, slots=True)
+class OTLPExporterConfig:
+    endpoint: str
+    protocol: OTLPProtocol = "grpc"
+    endpoint_mode: OTLPEndpointMode = "base"
+    headers: tuple[tuple[str, str], ...] = ()
+    auth: OTLPAuthentication | None = None
+    timeout_seconds: float = 5.0
 
 
-def _missing_strategy_requirements(
-    destination_names: Sequence[str],
-    resolved_config: Mapping[str, Any],
-) -> list[tuple[str, str]]:
-    """(destination, config field) pairs a preset needs but lacks.
-
-    Strategies declare their requirements at registration
-    (``register_destination(required_config=...)``); this check knows
-    nothing about any backend.
-    """
-    # Imported lazily: the destinations package imports this module, so
-    # a module-level import here would be circular. By the time a config
-    # is resolved the package (and its strategy registrations) is loaded.
-    from .destinations.registry import destination_strategy
-
-    missing: list[tuple[str, str]] = []
-    for name in destination_names:
-        strategy = destination_strategy(name)
-        if strategy is None:
-            continue
-        for field in strategy.required_config:
-            if not resolved_config.get(field):
-                missing.append((name, field))
-    return missing
-
-
-def _resolve_log_profile(
-    raw_profile: str,
-    *,
-    resolved_config: Mapping[str, Any],
-) -> tuple[str, tuple[tuple[str, ...], str] | None, list[str]]:
-    """Resolve a profile name to (name, preset-or-None, warnings).
-
-    ``auto`` without a recognized platform marker resolves to no preset,
-    so caller-supplied defaults keep applying. ``resolved_config``
-    carries the already-resolved config values that registered
-    strategies may declare as requirements.
-    """
-    warnings: list[str] = []
-    # Canonical profile names are hyphenated; accept the same case,
-    # whitespace, and hyphen/underscore variance as destination and
-    # formatter names.
-    profile = raw_profile.strip().lower().replace("_", "-")
-    if profile == "auto":
-        detected = _detect_log_profile()
-        if detected is None:
-            return "auto", None, warnings
-        profile = detected
-    preset = LOG_PROFILE_PRESETS.get(profile)
-    if preset is None:
-        warnings.append(
-            f"Unknown OBSERVABILITY_LOG_PROFILE {raw_profile!r}; "
-            "using plain-sync."
-        )
-        profile = "plain-sync"
-        preset = LOG_PROFILE_PRESETS[profile]
-    missing = _missing_strategy_requirements(preset[0], resolved_config)
-    if missing:
-        requirements = ", ".join(
-            f"{field} (destination {name})" for name, field in missing
-        )
-        warnings.append(
-            f"Log profile {profile} requires {requirements}; using plain-sync."
-        )
-        profile = "plain-sync"
-        preset = LOG_PROFILE_PRESETS[profile]
-    return profile, preset, warnings
-
-
-@dataclass(frozen=True)
-class ObservabilityConfig:
-    service_name: str = "policyengine-service"
-    service_role: str = "api"
-    environment: str = "development"
+@dataclass(frozen=True, slots=True)
+class OTelConfig:
     enabled: bool = True
-    request_logs_enabled: bool = True
-    log_raw_ip: bool = True
-    log_level: int = logging.INFO
-    otel_enabled: bool = True
-    otlp_endpoint: str | None = None
-    otlp_protocol: str = "grpc"
-    span_prefix: str | None = None
-    tracer_name: str | None = None
-    meter_name: str | None = None
+    traces: OTLPExporterConfig | None = None
+    metrics: OTLPExporterConfig | None = None
+    provider_mode: ProviderMode = "owned"
+    sampling_ratio: float = 1.0
+    span_queue_capacity: int = 2_048
+    span_batch_size: int = 512
+    span_schedule_delay_seconds: float = 5.0
+    metric_export_interval_seconds: float = 60.0
     shutdown_timeout_seconds: float = 3.0
-    instrument_fastapi: bool = False
-    instrument_httpx: bool = False
-    metric_attribute_keys: tuple[str, ...] = DEFAULT_METRIC_ATTRIBUTE_KEYS
-    log_destinations: tuple[str, ...] = ("stdout",)
-    google_cloud_project: str | None = None
-    google_cloud_log_name: str = "policyengine-observability"
-    stdout_format: str = "plain"
-    log_queue_maxsize: int = DEFAULT_LOG_QUEUE_MAXSIZE
-    log_queue_close_timeout_seconds: float = (
-        DEFAULT_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class TelemetryLimits:
+    max_attributes: int = 32
+    max_string_length: int = 1_024
+    max_error_message_length: int = 2_048
+    max_stack_length: int = 16_384
+    async_parent_max_age_seconds: float = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class ObservabilityConfig:
+    service: ServiceIdentity
+    deployment: DeploymentIdentity
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    otel: OTelConfig = field(default_factory=OTelConfig)
+    limits: TelemetryLimits = field(default_factory=TelemetryLimits)
+    application_attribute_keys: frozenset[str] = (
+        DEFAULT_APPLICATION_ATTRIBUTE_KEYS
     )
-    log_profile: str = "auto"
-    config_warnings: tuple[str, ...] = ()
+    dispatch_attribute_keys: frozenset[str] = DEFAULT_DISPATCH_ATTRIBUTE_KEYS
+    metric_attribute_keys: frozenset[str] = DEFAULT_METRIC_ATTRIBUTE_KEYS
+    sensitive_values: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
         cls,
         *,
-        service_name: str,
-        service_role: str = "api",
-        enabled_default: bool = True,
-        span_prefix: str | None = None,
-        instrument_fastapi: bool = False,
-        instrument_httpx: bool = False,
-        metric_attribute_keys: Sequence[str] | None = None,
-        extra_metric_attribute_keys: Sequence[str] = (),
-        default_log_destinations: Sequence[str] = ("stdout",),
+        service: ServiceIdentity,
+        deployment: DeploymentIdentity,
+        logging: LoggingConfig | None = None,
+        limits: TelemetryLimits | None = None,
+        application_attribute_keys: frozenset[str] | None = None,
+        dispatch_attribute_keys: frozenset[str] | None = None,
+        metric_attribute_keys: frozenset[str] | None = None,
+        sensitive_values: tuple[str, ...] = (),
     ) -> ObservabilityConfig:
-        level_name = os.getenv("OBSERVABILITY_LOG_LEVEL", "INFO").upper()
-        log_level = getattr(logging, level_name, logging.INFO)
-        otlp_protocol = (
-            os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL")
-            or os.getenv("OBSERVABILITY_OTLP_PROTOCOL")
-            or cls.otlp_protocol
+        """Read standard OTel transport settings with explicit identity.
+
+        Service identity, deployment identity, and log routing are never
+        inferred from ambient platform or Google Cloud variables.
+        """
+
+        common_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+        common_protocol = _protocol(
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc"),
         )
-        env_metric_keys = csv_from_env("OBSERVABILITY_METRIC_ATTRIBUTE_KEYS")
-        env_extra_metric_keys = csv_from_env(
-            "OBSERVABILITY_EXTRA_METRIC_ATTRIBUTE_KEYS"
+        common_headers = os.getenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+        common_audience = os.getenv("POLICYENGINE_OTEL_GOOGLE_AUDIENCE")
+        traces = _exporter_from_env(
+            signal="traces",
+            enabled=_export_enabled("OTEL_TRACES_EXPORTER"),
+            common_endpoint=common_endpoint,
+            common_protocol=common_protocol,
+            common_headers=common_headers,
+            common_audience=common_audience,
         )
-        env_log_destinations = csv_from_env("OBSERVABILITY_LOG_DESTINATIONS")
-        resolved_metric_keys = _dedupe(
-            env_metric_keys
-            or metric_attribute_keys
-            or DEFAULT_METRIC_ATTRIBUTE_KEYS,
-            (*extra_metric_attribute_keys, *env_extra_metric_keys),
+        metrics = _exporter_from_env(
+            signal="metrics",
+            enabled=_export_enabled("OTEL_METRICS_EXPORTER"),
+            common_endpoint=common_endpoint,
+            common_protocol=common_protocol,
+            common_headers=common_headers,
+            common_audience=common_audience,
         )
-        google_cloud_project = (
-            os.getenv("OBSERVABILITY_GOOGLE_CLOUD_PROJECT")
-            or os.getenv("GOOGLE_CLOUD_PROJECT")
-            or os.getenv("GCP_PROJECT")
-            or os.getenv("GCLOUD_PROJECT")
-            or None
+
+        config = cls(
+            service=service,
+            deployment=deployment,
+            logging=logging or LoggingConfig(),
+            otel=OTelConfig(
+                enabled=not _env_bool("OTEL_SDK_DISABLED", False),
+                traces=traces,
+                metrics=metrics,
+                provider_mode=_provider_mode(
+                    os.getenv("POLICYENGINE_OTEL_PROVIDER_MODE", "owned")
+                ),
+                sampling_ratio=_env_float(
+                    "OTEL_TRACES_SAMPLER_ARG",
+                    os.getenv("OTEL_TRACES_SAMPLER_ARG"),
+                    default=1.0,
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
+                span_queue_capacity=_env_int(
+                    "OTEL_BSP_MAX_QUEUE_SIZE",
+                    os.getenv("OTEL_BSP_MAX_QUEUE_SIZE"),
+                    default=2_048,
+                    minimum=1,
+                    maximum=100_000,
+                ),
+                span_batch_size=_env_int(
+                    "OTEL_BSP_MAX_EXPORT_BATCH_SIZE",
+                    os.getenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE"),
+                    default=512,
+                    minimum=1,
+                    maximum=10_000,
+                ),
+                span_schedule_delay_seconds=(
+                    _env_float(
+                        "OTEL_BSP_SCHEDULE_DELAY",
+                        os.getenv("OTEL_BSP_SCHEDULE_DELAY"),
+                        default=5_000.0,
+                        minimum=1.0,
+                        maximum=60_000.0,
+                    )
+                    / 1_000
+                ),
+                metric_export_interval_seconds=(
+                    _env_float(
+                        "OTEL_METRIC_EXPORT_INTERVAL",
+                        os.getenv("OTEL_METRIC_EXPORT_INTERVAL"),
+                        default=60_000.0,
+                        minimum=1_000.0,
+                        maximum=3_600_000.0,
+                    )
+                    / 1_000
+                ),
+            ),
+            limits=limits or TelemetryLimits(),
+            application_attribute_keys=(
+                application_attribute_keys
+                if application_attribute_keys is not None
+                else DEFAULT_APPLICATION_ATTRIBUTE_KEYS
+            ),
+            dispatch_attribute_keys=(
+                dispatch_attribute_keys
+                if dispatch_attribute_keys is not None
+                else DEFAULT_DISPATCH_ATTRIBUTE_KEYS
+            ),
+            metric_attribute_keys=(
+                metric_attribute_keys
+                if metric_attribute_keys is not None
+                else DEFAULT_METRIC_ATTRIBUTE_KEYS
+            ),
+            sensitive_values=sensitive_values,
         )
-        log_profile, preset, profile_warnings = _resolve_log_profile(
-            os.getenv("OBSERVABILITY_LOG_PROFILE") or cls.log_profile,
-            # The values strategies may declare via required_config;
-            # extend as future fields become requirement candidates.
-            resolved_config={"google_cloud_project": google_cloud_project},
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        """Reject invalid configuration before runtime setup has side effects."""
+
+        errors = self.validation_errors()
+        if errors:
+            raise ConfigurationError(errors)
+
+    def validation_errors(self) -> tuple[str, ...]:
+        """Return invalid fields without creating runtime components."""
+
+        errors: list[str] = []
+        identity_values = {
+            "service.name": self.service.name,
+            "service.namespace": self.service.namespace,
+            "service.version": self.service.version,
+            "service.role": self.service.role,
+            "deployment.environment": self.deployment.environment,
+        }
+        for key, value in identity_values.items():
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"{key} must be a non-empty string.")
+
+        if not isinstance(self.sensitive_values, tuple):
+            errors.append(
+                "sensitive_values must be a tuple of non-empty strings."
+            )
+        else:
+            for index, value in enumerate(self.sensitive_values):
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"sensitive_values[{index}] must be a non-empty "
+                        "string."
+                    )
+
+        for name, values in (
+            ("application_attribute_keys", self.application_attribute_keys),
+            ("dispatch_attribute_keys", self.dispatch_attribute_keys),
+            ("metric_attribute_keys", self.metric_attribute_keys),
+        ):
+            if not isinstance(values, frozenset):
+                errors.append(
+                    f"{name} must be a frozenset of non-empty strings."
+                )
+                continue
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(f"{name} entries must be non-empty strings.")
+
+        _choice_error(
+            errors,
+            "deployment.platform",
+            self.deployment.platform,
+            {"google_cloud_run", "modal", "local", "other"},
         )
-        profile_destinations, profile_stdout_format = preset or (None, None)
-        # Explicit granular env vars override the profile's expansion;
-        # the profile overrides caller-supplied defaults.
-        resolved_log_destinations = _dedupe(
-            env_log_destinations
-            or profile_destinations
-            or default_log_destinations
+        if not isinstance(self.logging.minimum_severity, int) or isinstance(
+            self.logging.minimum_severity, bool
+        ):
+            errors.append("logging.minimum_severity must be an integer.")
+        _number_error(
+            errors,
+            "logging.shutdown_timeout_seconds",
+            self.logging.shutdown_timeout_seconds,
+            0,
+            60,
         )
-        resolved_stdout_format = (
-            os.getenv("OBSERVABILITY_STDOUT_FORMAT")
-            or profile_stdout_format
-            or cls.stdout_format
+
+        for destination in self.logging.destinations:
+            try:
+                _choice_error(
+                    errors,
+                    f"logging destination {destination.name!r} delivery",
+                    destination.delivery,
+                    {"inline", "queued"},
+                )
+                _integer_error(
+                    errors,
+                    f"logging destination {destination.name!r} queue_capacity",
+                    destination.queue_capacity,
+                    1,
+                    100_000,
+                )
+                _integer_error(
+                    errors,
+                    f"logging destination {destination.name!r} batch_size",
+                    destination.batch_size,
+                    1,
+                    10_000,
+                )
+                validate = getattr(destination, "diagnostics", None)
+                if callable(validate):
+                    errors.extend(
+                        str(item) for item in cast(tuple[str, ...], validate())
+                    )
+            except Exception as exc:
+                errors.append(
+                    "Invalid log destination strategy "
+                    f"{getattr(destination, 'name', '<unnamed>')}: {exc}"
+                )
+
+        _choice_error(
+            errors,
+            "otel.provider_mode",
+            self.otel.provider_mode,
+            {"owned", "external"},
         )
-        return cls(
-            service_name=os.getenv("OBSERVABILITY_SERVICE_NAME")
-            or os.getenv("OTEL_SERVICE_NAME")
-            or service_name,
-            service_role=service_role,
-            environment=default_environment(),
-            enabled=bool_from_env("OBSERVABILITY_ENABLED", enabled_default),
-            request_logs_enabled=bool_from_env(
-                "OBSERVABILITY_REQUEST_LOGS_ENABLED",
-                True,
-            ),
-            log_raw_ip=bool_from_env("OBSERVABILITY_LOG_RAW_IP", True),
-            log_level=log_level,
-            otel_enabled=bool_from_env("OTEL_ENABLED", cls.otel_enabled),
-            otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
-            otlp_protocol=otlp_protocol,
-            span_prefix=span_prefix,
-            tracer_name=os.getenv("OBSERVABILITY_TRACER_NAME"),
-            meter_name=os.getenv("OBSERVABILITY_METER_NAME"),
-            shutdown_timeout_seconds=float_from_env(
-                "OBSERVABILITY_SHUTDOWN_TIMEOUT_SECONDS",
-                cls.shutdown_timeout_seconds,
-            ),
-            instrument_fastapi=bool_from_env(
-                "OBSERVABILITY_INSTRUMENT_FASTAPI",
-                instrument_fastapi,
-            ),
-            instrument_httpx=bool_from_env(
-                "OBSERVABILITY_INSTRUMENT_HTTPX",
-                instrument_httpx,
-            ),
-            metric_attribute_keys=resolved_metric_keys,
-            log_destinations=resolved_log_destinations,
-            google_cloud_project=google_cloud_project,
-            google_cloud_log_name=(
-                os.getenv("OBSERVABILITY_GOOGLE_CLOUD_LOG_NAME")
-                or cls.google_cloud_log_name
-            ),
-            stdout_format=resolved_stdout_format,
-            log_queue_maxsize=int_from_env(
-                "OBSERVABILITY_LOG_QUEUE_MAXSIZE",
-                cls.log_queue_maxsize,
-            ),
-            log_queue_close_timeout_seconds=float_from_env(
-                "OBSERVABILITY_LOG_QUEUE_CLOSE_TIMEOUT_SECONDS",
-                cls.log_queue_close_timeout_seconds,
-            ),
-            log_profile=log_profile,
-            config_warnings=tuple(profile_warnings),
+        _number_error(
+            errors, "otel.sampling_ratio", self.otel.sampling_ratio, 0, 1
+        )
+        _integer_error(
+            errors,
+            "otel.span_queue_capacity",
+            self.otel.span_queue_capacity,
+            1,
+            100_000,
+        )
+        _integer_error(
+            errors,
+            "otel.span_batch_size",
+            self.otel.span_batch_size,
+            1,
+            10_000,
+        )
+        _number_error(
+            errors,
+            "otel.span_schedule_delay_seconds",
+            self.otel.span_schedule_delay_seconds,
+            0.001,
+            60,
+        )
+        _number_error(
+            errors,
+            "otel.metric_export_interval_seconds",
+            self.otel.metric_export_interval_seconds,
+            1,
+            3_600,
+        )
+        _number_error(
+            errors,
+            "otel.shutdown_timeout_seconds",
+            self.otel.shutdown_timeout_seconds,
+            0,
+            60,
+        )
+        for signal, exporter in (
+            ("traces", self.otel.traces),
+            ("metrics", self.otel.metrics),
+        ):
+            if exporter is None:
+                continue
+            if (
+                not isinstance(exporter.endpoint, str)
+                or not exporter.endpoint.strip()
+            ):
+                errors.append(
+                    f"otel.{signal}.endpoint must be a non-empty string."
+                )
+            _choice_error(
+                errors,
+                f"otel.{signal}.protocol",
+                exporter.protocol,
+                {"grpc", "http/protobuf"},
+            )
+            _choice_error(
+                errors,
+                f"otel.{signal}.endpoint_mode",
+                exporter.endpoint_mode,
+                {"base", "signal"},
+            )
+            _number_error(
+                errors,
+                f"otel.{signal}.timeout_seconds",
+                exporter.timeout_seconds,
+                0.1,
+                60,
+            )
+
+        for name, value in {
+            "limits.max_attributes": self.limits.max_attributes,
+            "limits.max_string_length": self.limits.max_string_length,
+            "limits.max_error_message_length": self.limits.max_error_message_length,
+            "limits.max_stack_length": self.limits.max_stack_length,
+        }.items():
+            _integer_error(errors, name, value, 1, 1_000_000)
+        _number_error(
+            errors,
+            "limits.async_parent_max_age_seconds",
+            self.limits.async_parent_max_age_seconds,
+            0,
+            86_400,
+        )
+        return tuple(errors)
+
+    def diagnostics(self) -> tuple[str, ...]:
+        messages: list[str] = []
+        if (
+            self.otel.enabled
+            and self.otel.provider_mode == "owned"
+            and self.otel.traces is None
+            and self.otel.metrics is None
+        ):
+            messages.append(
+                "Remote OTel export is disabled because no trace or metric "
+                "OTLP endpoint is configured."
+            )
+        return tuple(messages)
+
+    @property
+    def identity_complete(self) -> bool:
+        return not any(
+            not str(value).strip()
+            for value in (
+                self.service.name,
+                self.service.namespace,
+                self.service.version,
+                self.service.role,
+                self.deployment.environment,
+                self.deployment.platform,
+            )
         )
 
 
-def _dedupe(
-    base: Sequence[str],
-    extra: Sequence[str] = (),
-) -> tuple[str, ...]:
-    return tuple(dict.fromkeys((*base, *extra)))
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(
+        (f"{name} must be a boolean value; received {value!r}.",)
+    )
+
+
+def _provider_mode(value: str) -> ProviderMode:
+    normalized = value.strip().lower()
+    if normalized not in {"owned", "external"}:
+        raise ConfigurationError(
+            (f"POLICYENGINE_OTEL_PROVIDER_MODE is invalid: {value!r}.",)
+        )
+    return cast(ProviderMode, normalized)
+
+
+def _protocol(name: str, value: str) -> OTLPProtocol:
+    normalized = value.strip()
+    if normalized not in {"grpc", "http/protobuf"}:
+        raise ConfigurationError((f"{name} is invalid: {value!r}.",))
+    return cast(OTLPProtocol, normalized)
+
+
+def _export_enabled(name: str) -> bool:
+    value = os.getenv(name, "otlp").strip().lower()
+    if value not in {"otlp", "none"}:
+        raise ConfigurationError((f"{name} is invalid: {value!r}.",))
+    return value == "otlp"
+
+
+def _exporter_from_env(
+    *,
+    signal: Literal["traces", "metrics"],
+    enabled: bool,
+    common_endpoint: str | None,
+    common_protocol: OTLPProtocol,
+    common_headers: str,
+    common_audience: str | None,
+) -> OTLPExporterConfig | None:
+    if not enabled:
+        return None
+    prefix = f"OTEL_EXPORTER_OTLP_{signal.upper()}"
+    signal_endpoint = os.getenv(f"{prefix}_ENDPOINT")
+    endpoint = signal_endpoint or common_endpoint
+    if not endpoint:
+        return None
+    protocol_value = os.getenv(f"{prefix}_PROTOCOL")
+    protocol = (
+        _protocol(f"{prefix}_PROTOCOL", protocol_value)
+        if protocol_value is not None
+        else common_protocol
+    )
+    headers_value = os.getenv(f"{prefix}_HEADERS")
+    headers = _parse_headers(
+        f"{prefix}_HEADERS"
+        if headers_value is not None
+        else "OTEL_EXPORTER_OTLP_HEADERS",
+        headers_value if headers_value is not None else common_headers,
+    )
+    audience = (
+        os.getenv(f"POLICYENGINE_OTEL_{signal.upper()}_GOOGLE_AUDIENCE")
+        or common_audience
+    )
+    auth: OTLPAuthentication | None = None
+    if audience:
+        from .google_auth import GoogleIdTokenAuth
+
+        auth = GoogleIdTokenAuth(audience)
+    signal_timeout = os.getenv(f"{prefix}_TIMEOUT")
+    timeout_name = (
+        f"{prefix}_TIMEOUT"
+        if signal_timeout is not None
+        else "OTEL_EXPORTER_OTLP_TIMEOUT"
+    )
+    timeout = _env_float(
+        timeout_name,
+        signal_timeout or os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT"),
+        default=5_000.0,
+        minimum=100.0,
+        maximum=60_000.0,
+    )
+    return OTLPExporterConfig(
+        endpoint=endpoint,
+        protocol=protocol,
+        endpoint_mode="signal" if signal_endpoint else "base",
+        headers=headers,
+        auth=auth,
+        timeout_seconds=timeout / 1_000,
+    )
+
+
+def _parse_headers(name: str, value: str) -> tuple[tuple[str, str], ...]:
+    headers: list[tuple[str, str]] = []
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise ConfigurationError(
+                (f"{name} contains a header without '=': {item!r}.",)
+            )
+        key, header_value = item.split("=", 1)
+        if not key.strip():
+            raise ConfigurationError(
+                (f"{name} contains an empty header name.",)
+            )
+        headers.append((key.strip(), header_value.strip()))
+    return tuple(headers)
+
+
+def _env_float(
+    name: str,
+    value: str | None,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    try:
+        parsed = float(value) if value is not None else default
+    except (TypeError, ValueError):
+        raise ConfigurationError(
+            (f"{name} must be a number; received {value!r}.",)
+        ) from None
+    if not math.isfinite(parsed) or not minimum <= parsed <= maximum:
+        raise ConfigurationError(
+            (f"{name} must be between {minimum} and {maximum}.",)
+        )
+    return parsed
+
+
+def _env_int(
+    name: str,
+    value: str | None,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        raise ConfigurationError(
+            (f"{name} must be an integer; received {value!r}.",)
+        ) from None
+    if not minimum <= parsed <= maximum:
+        raise ConfigurationError(
+            (f"{name} must be between {minimum} and {maximum}.",)
+        )
+    return parsed
+
+
+def _choice_error(
+    errors: list[str], name: str, value: Any, choices: set[str]
+) -> None:
+    if not isinstance(value, str) or value not in choices:
+        errors.append(f"{name} must be one of: {', '.join(sorted(choices))}.")
+
+
+def _number_error(
+    errors: list[str], name: str, value: Any, minimum: float, maximum: float
+) -> None:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or not minimum <= value <= maximum
+    ):
+        errors.append(f"{name} must be between {minimum} and {maximum}.")
+
+
+def _integer_error(
+    errors: list[str], name: str, value: Any, minimum: int, maximum: int
+) -> None:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not minimum <= value <= maximum
+    ):
+        errors.append(f"{name} must be between {minimum} and {maximum}.")

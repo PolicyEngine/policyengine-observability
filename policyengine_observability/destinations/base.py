@@ -1,121 +1,105 @@
 from __future__ import annotations
 
-import inspect
-import math
-from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol
+from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol, TextIO, runtime_checkable
+
+DeliveryMode = Literal["inline", "queued"]
+RecordFormatter = Callable[[dict[str, Any]], dict[str, Any]]
 
 
-class LogDestination(Protocol):
-    name: str
+class RecordWriter(Protocol):
+    """Writes provider-neutral structured records to one destination."""
 
-    def emit(
+    def write(self, record: dict[str, Any]) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class DestinationBuildContext:
+    """Process-local resources available while constructing a writer."""
+
+    stdout: Callable[[], TextIO]
+
+
+@runtime_checkable
+class LogDestinationStrategy(Protocol):
+    """Configuration and factory contract for a logging destination."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def delivery(self) -> DeliveryMode: ...
+
+    @property
+    def queue_capacity(self) -> int: ...
+
+    @property
+    def batch_size(self) -> int: ...
+
+    def build_writer(
+        self, context: DestinationBuildContext
+    ) -> RecordWriter: ...
+
+
+class _FormattingWriter:
+    def __init__(
         self,
-        payload: dict[str, Any],
-        *,
-        log_type: str,
-        severity: str,
+        writer: RecordWriter,
+        formatter: RecordFormatter | None,
     ) -> None:
-        """Write one structured observability payload."""
+        self._writer = writer
+        self._formatter = formatter
 
+    def write(self, record: dict[str, Any]) -> None:
+        self._writer.write(self._format(record))
 
-def normalize_name(name: str) -> str:
-    """Canonical lookup key for registered names.
+    def write_many(self, records: list[dict[str, Any]]) -> None:
+        formatted = [self._format(record) for record in records]
+        write_many = getattr(self._writer, "write_many", None)
+        if callable(write_many):
+            write_many(formatted)
+            return
+        for record in formatted:
+            self._writer.write(record)
 
-    Destination, formatter, and profile lookups all forgive case,
-    surrounding whitespace, and hyphen/underscore variance the same way,
-    so a spelling that works for one registry works for every registry.
-    """
-    return name.strip().lower().replace("-", "_")
-
-
-def accepts_keyword(func: Callable[..., Any], name: str) -> bool:
-    """Whether ``func`` can safely be called with keyword ``name``."""
-    try:
-        parameters = inspect.signature(func).parameters
-    except (TypeError, ValueError):
-        return False
-    if name in parameters:
-        return True
-    return any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
-
-
-def safe_report(
-    on_failure: Callable[..., None],
-    operation: str,
-    exc: BaseException,
-    **fields: Any,
-) -> None:
-    """Report through the internal-error channel; never raises."""
-    try:
-        on_failure(operation, exc, **fields)
-    except Exception:
-        pass
-
-
-def close_destination(
-    destination: LogDestination,
-    *,
-    on_failure: Callable[..., None],
-    deadline_seconds: float | None = None,
-) -> None:
-    """Close a destination if it supports closing; never raises.
-
-    ``close`` is duck-typed with one calling convention everywhere: the
-    deadline is passed only when the signature accepts it, so both
-    ``close(self)`` and ``close(self, deadline_seconds=None)`` work under
-    every close path (manager shutdown, reconfigure, queued drain).
-    """
-    close = getattr(destination, "close", None)
-    if not callable(close):
-        return
-    try:
-        if accepts_keyword(close, "deadline_seconds"):
-            close(deadline_seconds=deadline_seconds)
-        else:
+    def close(self) -> None:
+        close = getattr(self._writer, "close", None)
+        if callable(close):
             close()
-    except Exception as exc:
-        safe_report(
-            on_failure,
-            "logging.destination_close",
-            exc,
-            destination=getattr(destination, "name", None),
-        )
+
+    def _format(self, record: dict[str, Any]) -> dict[str, Any]:
+        value = deepcopy(record)
+        return self._formatter(value) if self._formatter else value
 
 
-def clamped(value: Any, *, low: float, high: float, default: float) -> float:
-    """Coerce a config knob to a finite float within [low, high].
+@dataclass(frozen=True, slots=True)
+class CustomLogDestination:
+    """Adapts an application or third-party writer into the runtime.
 
-    Anything unparseable or non-finite falls back to the default, so a
-    stray env value can never disable or unbound the mechanism it tunes.
+    Queued delivery is the safe default. Use inline delivery only for writers
+    that perform bounded local work and never make network requests.
     """
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(number):
-        return default
-    return min(max(number, low), high)
 
+    name: str
+    writer_factory: Callable[[], RecordWriter]
+    delivery: DeliveryMode = "queued"
+    queue_capacity: int = 1_000
+    batch_size: int = 1
+    formatter: RecordFormatter | None = None
 
-def normalize_payload(value: Any) -> Any:
-    if value is None or isinstance(value, str | bool | int | float):
-        return value
-    if isinstance(value, Mapping):
-        return {
-            str(key): normalize_payload(item) for key, item in value.items()
-        }
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
-        return [normalize_payload(item) for item in value]
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return repr(value)
-    try:
-        return str(value)
-    except BaseException:
-        return f"<unprintable {type(value).__name__}>"
+    def diagnostics(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        if not self.name.strip():
+            errors.append("Custom log destination name must be non-empty.")
+        if not callable(self.writer_factory):
+            errors.append(
+                "Custom log destination writer_factory must be callable."
+            )
+        if self.formatter is not None and not callable(self.formatter):
+            errors.append("Custom log destination formatter must be callable.")
+        return tuple(errors)
+
+    def build_writer(self, _context: DestinationBuildContext) -> RecordWriter:
+        return _FormattingWriter(self.writer_factory(), self.formatter)

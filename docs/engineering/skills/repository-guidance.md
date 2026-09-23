@@ -25,19 +25,18 @@ uv run --extra dev towncrier check --compare-with origin/main
 
 - `policyengine_observability/config.py` resolves environment-driven runtime
   configuration.
-- `policyengine_observability/context.py` defines request and operation log
-  payload structures.
 - `policyengine_observability/runtime.py` preserves the public runtime API,
   configures the components, and coordinates their shutdown.
-- `policyengine_observability/_state.py` owns shared context variables.
-- `policyengine_observability/_operations.py` and `_requests.py` manage
-  operation and request lifecycles, respectively.
-- `policyengine_observability/segments.py` manages segment naming, nesting,
-  and timing.
-- `policyengine_observability/logging.py` emits structured logs and records
-  observability failures without interrupting application operations.
-- `policyengine_observability/_metrics.py` and `_tracing.py` record metrics
-  and manage OpenTelemetry traces, respectively.
+- `policyengine_observability/delivery.py` isolates configured log
+  destinations and gives each remote destination its own bounded queue.
+- `policyengine_observability/destinations/` contains the provider-neutral
+  destination strategy contract and optional built-in destinations.
+- `policyengine_observability/schema.py` builds provider-neutral structured
+  records. Provider fields belong in destination formatters.
+- `policyengine_observability/otel.py` records metrics and traces and exports
+  each enabled signal through its configured OTLP transport.
+- `policyengine_observability/google_auth.py` and
+  `google_credentials.py` contain optional Google authentication strategies.
 - `policyengine_observability/adapters/` contains framework adapters such as
   Flask and FastAPI.
 - `policyengine_observability/integrations/` contains optional integrations
@@ -54,21 +53,26 @@ uv run --extra dev towncrier check --compare-with origin/main
   CLI scripts, and tests.
 - Keep OpenTelemetry optional and lazily imported. Timing and structured
   logging must work without an OTel backend.
-- Observability failures must fail open: record an internal observability error
-  when practical, but do not break the application operation being observed.
+- Keep canonical records free of provider-specific field names. Apply those
+  fields in the configured destination formatter or writer.
+- Keep OTLP transport independent from exporter authentication and allow
+  traces and metrics to use different endpoints.
+- Reject invalid configuration before starting runtime components. After
+  successful validation, record runtime failures internally when practical
+  without breaking the application operation being observed.
 - Preserve structured log schemas. Make additive changes when possible; bump
   schema versions for breaking payload changes.
 - Keep metric attributes bounded and low-cardinality. Do not put raw paths,
   full URLs, request bodies, or unbounded user-provided values into metric
   labels.
-- Keep segment names stable. Prefer registered segment enums in consuming
+- Keep span names stable. Prefer registered span enums in consuming
   applications, while preserving safe string fallback behavior.
 
 ## Testing
 
 Add focused tests for context behavior and failure paths whenever changing
 the runtime or its components. The corresponding `tests/test_runtime_*.py`
-modules cover operations, requests, segments, log emission, and tracing.
+modules cover operations, requests, spans, log emission, and tracing.
 Adapter changes should include framework-level tests that exercise request
 setup, response headers, error paths, and teardown behavior.
 

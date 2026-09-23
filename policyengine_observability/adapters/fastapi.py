@@ -1,302 +1,142 @@
 from __future__ import annotations
 
-import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import parse_qs
 
-from ..config import ObservabilityConfig
-from ..context import RequestObservabilityContext
-from ..runtime import (
-    REQUEST_ID_HEADER,
-    TRACEPARENT_HEADER,
-    ObservabilityRuntime,
-    set_observability_runtime,
-)
+from ..runtime import ObservabilityRuntime
 
-UNMATCHED_ROUTE = "<unmatched>"
+_STATE_KEY = "policyengine_observability"
 
 
-class FastAPIObservabilityAdapter:
-    def __init__(
-        self,
-        runtime: ObservabilityRuntime,
-        *,
-        static_attributes: dict[str, Any] | None = None,
-    ) -> None:
+def instrument_fastapi(
+    app: Any, runtime: ObservabilityRuntime
+) -> ObservabilityRuntime:
+    """Install one request lifecycle integration on a FastAPI application."""
+
+    existing = getattr(app.state, _STATE_KEY, None)
+    if isinstance(existing, ObservabilityRuntime):
+        return existing
+    try:
+        app.add_middleware(_ObservabilityMiddleware, runtime=runtime)
+        setattr(app.state, _STATE_KEY, runtime)
+    except Exception as exc:
+        runtime.diagnostics.report("fastapi.middleware_install", exc)
+    return runtime
+
+
+class _ObservabilityMiddleware:
+    def __init__(self, app: Any, *, runtime: ObservabilityRuntime) -> None:
+        self.app = app
         self.runtime = runtime
-        self.static_attributes = {
-            key: value
-            for key, value in (static_attributes or {}).items()
-            if value is not None
-        }
 
-    def instrument_app(self, app: Any) -> None:
-        if not self.runtime.enabled:
-            return
-        if getattr(app.state, "policyengine_observability_adapter", None):
-            return
-        app.state.policyengine_observability_adapter = self
-        if self.runtime.config.instrument_fastapi:
-            self.runtime.instrument_fastapi(app)
-        try:
-            app.add_middleware(
-                FastAPIObservabilityMiddleware,
-                adapter=self,
-            )
-        except BaseException as exc:
-            self.runtime.log_observability_failure(
-                "fastapi.middleware_install",
-                exc,
-            )
-
-    def start_request(self, scope: dict[str, Any]) -> None:
-        try:
-            headers = _headers_from_scope(scope)
-            path = scope.get("path") or ""
-            route = _route_from_scope(scope) or UNMATCHED_ROUTE
-            endpoint = _endpoint_from_scope(scope)
-            request_id = headers.get(REQUEST_ID_HEADER.lower()) or str(
-                uuid.uuid4()
-            )
-            context = RequestObservabilityContext(
-                config=self.runtime.config,
-                request_id=request_id,
-                method=scope.get("method") or "",
-                route=route,
-                path=path,
-                endpoint=endpoint,
-                query_keys=_query_keys(scope),
-                content_length_bytes=_int_header(
-                    headers.get("content-length")
-                ),
-                inbound=self._inbound_metadata(scope, headers),
-            )
-            self.runtime.begin_request(context, carrier=headers)
-            if self.static_attributes:
-                self.runtime.annotate(**self.static_attributes)
-        except BaseException as exc:
-            self.runtime.log_observability_failure(
-                "fastapi.before_request",
-                exc,
-            )
-
-    def update_resolved_route(self, scope: dict[str, Any]) -> None:
-        route = _route_from_scope(scope)
-        endpoint = _endpoint_from_scope(scope)
-        if route or endpoint:
-            self.runtime.update_request_route(route=route, endpoint=endpoint)
-
-    def _inbound_metadata(
+    async def __call__(
         self,
         scope: dict[str, Any],
-        headers: dict[str, str],
-    ) -> dict[str, Any]:
-        forwarded_for = _split_forwarded_for(headers.get("x-forwarded-for"))
-        x_real_ip = headers.get("x-real-ip")
-        client = scope.get("client") or ()
-        remote_addr = client[0] if client else None
-        client_ip = None
-        ip_source = None
-        if forwarded_for:
-            client_ip = forwarded_for[0]
-            ip_source = "x_forwarded_for"
-        elif x_real_ip:
-            client_ip = x_real_ip
-            ip_source = "x_real_ip"
-        elif remote_addr:
-            client_ip = remote_addr
-            ip_source = "remote_addr"
-        metadata = {
-            "ip_source": ip_source,
-            "user_agent": headers.get("user-agent"),
-            "origin": headers.get("origin"),
-            "referer": headers.get("referer"),
-            "host": headers.get("host"),
-            "content_length_bytes": _int_header(headers.get("content-length")),
-        }
-        if self.runtime.config.log_raw_ip:
-            metadata["client_ip"] = client_ip
-            metadata["forwarded_for"] = forwarded_for
-            metadata["x_real_ip"] = x_real_ip
-        return metadata
-
-
-class FastAPIObservabilityMiddleware:
-    def __init__(
-        self,
-        app: Any,
-        *,
-        adapter: FastAPIObservabilityAdapter,
+        receive: Callable[[], Awaitable[dict[str, Any]]],
+        send: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        self.app = app
-        self.adapter = adapter
-
-    async def __call__(self, scope, receive, send) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
 
-        self.adapter.start_request(scope)
         status_code: int | None = None
+        error: Exception | None = None
         completed = False
+        try:
+            self.runtime.begin_request(
+                headers=_headers_from_scope(scope),
+                method=str(scope.get("method") or ""),
+                route=_route_from_scope(scope) or "<unmatched>",
+            )
+        except Exception as exc:
+            self.runtime.diagnostics.report("fastapi.request_begin", exc)
 
-        async def send_wrapper(message) -> None:
-            nonlocal completed
-            nonlocal status_code
-
-            if message["type"] == "http.response.start":
+        async def send_observed(message: dict[str, Any]) -> None:
+            nonlocal completed, status_code
+            if message.get("type") == "http.response.start":
                 status_code = int(message.get("status") or 0)
-                self.adapter.update_resolved_route(scope)
-                response_headers = self.adapter.runtime.prepare_response(
-                    status_code
-                )
-                if response_headers:
+                self._update_route(scope)
+                try:
                     message = {
                         **message,
-                        "headers": _merge_response_headers(
-                            message.get("headers") or [],
-                            response_headers,
+                        "headers": _merge_headers(
+                            list(message.get("headers") or []),
+                            self.runtime.response_headers(),
                         ),
                     }
-                await send(message)
-                return
-
-            if message["type"] == "http.response.body" and not message.get(
+                except Exception as exc:
+                    self.runtime.diagnostics.report(
+                        "fastapi.response_headers", exc
+                    )
+            await send(message)
+            if message.get("type") == "http.response.body" and not message.get(
                 "more_body", False
             ):
-                try:
-                    await send(message)
-                finally:
-                    completed = True
-                    self.adapter.update_resolved_route(scope)
-                    self.adapter.runtime.complete_request(status_code)
-                    self.adapter.runtime.teardown_request(None)
-                return
-
-            await send(message)
+                self._update_route(scope)
+                self._end(status_code=status_code)
+                completed = True
 
         try:
-            await self.app(scope, receive, send_wrapper)
-        except BaseException as exc:
-            if not completed:
-                error_status = status_code or 500
-                self.adapter.update_resolved_route(scope)
-                self.adapter.runtime.prepare_response(error_status)
-                self.adapter.runtime.complete_request(error_status)
-                self.adapter.runtime.teardown_request(exc)
-                completed = True
+            await self.app(scope, receive, send_observed)
+        except Exception as exc:
+            error = exc
             raise
         finally:
             if not completed:
-                self.adapter.update_resolved_route(scope)
-                self.adapter.runtime.complete_request(status_code)
-                self.adapter.runtime.teardown_request(None)
+                self._update_route(scope)
+                self._end(
+                    status_code=status_code or (500 if error else None),
+                    error=error,
+                )
 
+    def _update_route(self, scope: dict[str, Any]) -> None:
+        try:
+            route = _route_from_scope(scope)
+            if route:
+                self.runtime.update_request_route(route)
+        except Exception as exc:
+            self.runtime.diagnostics.report("fastapi.route_update", exc)
 
-def init_fastapi_observability(
-    app: Any,
-    *,
-    config: ObservabilityConfig | None = None,
-    runtime: ObservabilityRuntime | None = None,
-    service_name: str,
-    service_role: str = "api",
-    span_prefix: str | None = None,
-    segment_registry=None,
-    static_attributes: dict[str, Any] | None = None,
-) -> ObservabilityRuntime:
-    existing = getattr(app.state, "policyengine_observability", None)
-    if existing:
-        return existing
-    runtime = runtime or ObservabilityRuntime(
-        config
-        or ObservabilityConfig.from_env(
-            service_name=service_name,
-            service_role=service_role,
-            span_prefix=span_prefix,
-        ),
-        segment_registry=segment_registry,
-    )
-    runtime.configure()
-    app.state.policyengine_observability = runtime
-    set_observability_runtime(runtime)
-    FastAPIObservabilityAdapter(
-        runtime,
-        static_attributes=static_attributes,
-    ).instrument_app(app)
-    return runtime
+    def _end(
+        self,
+        *,
+        status_code: int | None,
+        error: BaseException | None = None,
+    ) -> None:
+        try:
+            self.runtime.end_request(status_code=status_code, error=error)
+        except Exception as exc:
+            self.runtime.diagnostics.report("fastapi.request_finish", exc)
 
 
 def _headers_from_scope(scope: dict[str, Any]) -> dict[str, str]:
     headers: dict[str, str] = {}
-    for key, value in scope.get("headers") or []:
+    for raw_key, raw_value in scope.get("headers") or []:
         try:
-            header_key = key.decode("latin-1").lower()
-            header_value = value.decode("latin-1")
-        except BaseException:
+            key = raw_key.decode("latin-1").lower()
+            value = raw_value.decode("latin-1")
+        except (AttributeError, UnicodeDecodeError):
             continue
-        if header_key in headers:
-            headers[header_key] = f"{headers[header_key]},{header_value}"
-        else:
-            headers[header_key] = header_value
+        headers[key] = f"{headers[key]},{value}" if key in headers else value
     return headers
 
 
 def _route_from_scope(scope: dict[str, Any]) -> str | None:
-    route = scope.get("route")
-    route_path = getattr(route, "path", None)
-    if route_path:
-        return str(route_path)
-    return None
+    path = getattr(scope.get("route"), "path", None)
+    return str(path) if path else None
 
 
-def _endpoint_from_scope(scope: dict[str, Any]) -> str | None:
-    endpoint = scope.get("endpoint")
-    if endpoint is None:
-        return None
-    endpoint_name = getattr(endpoint, "__name__", None)
-    return endpoint_name or str(endpoint)
-
-
-def _query_keys(scope: dict[str, Any]) -> list[str]:
-    query_string = scope.get("query_string") or b""
-    try:
-        decoded = query_string.decode("latin-1")
-    except AttributeError:
-        decoded = str(query_string)
-    return sorted(parse_qs(decoded, keep_blank_values=True).keys())
-
-
-def _merge_response_headers(
-    existing_headers: list[tuple[bytes, bytes]],
-    headers: dict[str, str],
+def _merge_headers(
+    existing: list[tuple[bytes, bytes]], values: dict[str, str]
 ) -> list[tuple[bytes, bytes]]:
-    response_header_names = {key.lower().encode("latin-1") for key in headers}
+    replacements = {key.lower().encode("latin-1") for key in values}
     merged = [
         (key, value)
-        for key, value in existing_headers
-        if key.lower() not in response_header_names
+        for key, value in existing
+        if key.lower() not in replacements
     ]
     merged.extend(
-        (
-            key.encode("latin-1"),
-            value.encode("latin-1"),
-        )
-        for key, value in headers.items()
-        if key in {REQUEST_ID_HEADER, TRACEPARENT_HEADER}
+        (key.encode("latin-1"), value.encode("latin-1"))
+        for key, value in values.items()
     )
     return merged
-
-
-def _split_forwarded_for(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [part.strip() for part in value.split(",") if part.strip()]
-
-
-def _int_header(value: str | None) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None

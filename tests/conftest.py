@@ -1,41 +1,60 @@
 from __future__ import annotations
 
+import io
+import json
+from collections.abc import Iterator
+
 import pytest
-from fakes import RecordingDestination
 
-from policyengine_observability import _state
-from policyengine_observability.destinations.registry import (
-    _STRATEGIES,
-    register_destination,
+from policyengine_observability import (
+    DeploymentIdentity,
+    LoggingConfig,
+    ObservabilityConfig,
+    OTelConfig,
+    ServiceIdentity,
+    configure,
 )
+from policyengine_observability.runtime import ObservabilityRuntime
 
 
-@pytest.fixture(autouse=True)
-def isolated_observability_context():
-    """Keep tests independent when request and operation tests run in separate files."""
-    variables = (
-        (_state._REQUEST_CONTEXT, None),
-        (_state._OPERATION_CONTEXT, None),
-        (_state._TIMINGS, None),
-        (_state._TURN_START, None),
-        (_state._SEGMENT_STACK, ()),
-    )
-    for variable, default in variables:
-        variable.set(default)
-    try:
-        yield
-    finally:
-        for variable, default in variables:
-            variable.set(default)
+def make_config(**overrides):
+    values = {
+        "service": ServiceIdentity(
+            name="test-api",
+            namespace="policyengine.test",
+            version="2.3.4",
+            role="entry",
+        ),
+        "deployment": DeploymentIdentity(
+            environment="test",
+            platform="local",
+            region="us-central1",
+            instance_id="instance-1",
+        ),
+        "logging": LoggingConfig(),
+        "otel": OTelConfig(enabled=False),
+        "application_attribute_keys": frozenset({"auth_result", "backend"}),
+        "dispatch_attribute_keys": frozenset(
+            {"job_id", "run_id", "simulation_id"}
+        ),
+    }
+    values.update(overrides)
+    return ObservabilityConfig(**values)
+
+
+def make_runtime(**overrides) -> tuple[ObservabilityRuntime, io.StringIO]:
+    output = io.StringIO()
+    runtime = configure(make_config(**overrides))
+    runtime._delivery._stdout = output
+    return runtime, output
+
+
+def records(output: io.StringIO) -> list[dict]:
+    return [json.loads(line) for line in output.getvalue().splitlines()]
 
 
 @pytest.fixture
-def fake_remote_strategy():
-    """Register a fake remote strategy; yields its destination name."""
-    register_destination(
-        "fake-remote",
-        lambda **kwargs: RecordingDestination(),
-        transport="remote",
-    )
-    yield "fake_remote"
-    _STRATEGIES.pop("fake_remote", None)
+def runtime() -> Iterator[tuple[ObservabilityRuntime, io.StringIO]]:
+    value = make_runtime()
+    yield value
+    value[0].shutdown()
