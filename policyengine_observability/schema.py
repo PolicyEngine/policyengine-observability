@@ -43,7 +43,6 @@ def normalize_attributes(
         key = str(raw_key).strip()
         if (
             not key
-            or len(normalized) >= config.limits.max_attributes
             or _prohibited_key(key)
             or (allowed_keys is not None and key not in allowed_keys)
         ):

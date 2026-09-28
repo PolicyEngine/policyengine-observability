@@ -67,8 +67,8 @@ uv run --extra dev towncrier check --compare-with origin/main
   `remote_context`; do not insert it into business request models.
 - Restore only attributes explicitly listed in `dispatch_attribute_keys`.
   Those attributes must remain available to nested dispatches and structured
-  logs, but must not become metric labels unless independently allowlisted in
-  `metric_attribute_keys`.
+  logs and must be attached to nested spans, but must not become metric labels
+  unless independently allowlisted in `metric_attribute_keys`.
 - Let explicitly supplied receiver attributes override matching remote
   attributes. Malformed remote context may reduce telemetry but must not stop
   the observed operation.

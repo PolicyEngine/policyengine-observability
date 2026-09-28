@@ -97,7 +97,6 @@ def test_invalid_nested_limits_are_reported_together() -> None:
             shutdown_timeout_seconds=100,
         ),
         limits=TelemetryLimits(
-            max_attributes=0,
             max_string_length=0,
             max_error_message_length=0,
             max_stack_length=0,
@@ -120,7 +119,6 @@ def test_invalid_nested_limits_are_reported_together() -> None:
         "otel.traces.protocol",
         "otel.traces.endpoint_mode",
         "otel.traces.timeout_seconds",
-        "limits.max_attributes",
         "limits.async_parent_max_age_seconds",
     ):
         assert field in message
@@ -442,16 +440,19 @@ def test_attribute_policy_omits_sensitive_non_scalar_and_nonfinite() -> None:
     assert omitted == 3
 
 
-def test_attribute_count_and_string_length_are_bounded() -> None:
+def test_attribute_count_is_unbounded_and_strings_are_truncated() -> None:
+    keys = frozenset(f"attribute_{index}" for index in range(40))
     config = make_config(
-        application_attribute_keys=frozenset({"one", "two", "three"}),
-        limits=TelemetryLimits(max_attributes=2, max_string_length=3),
+        application_attribute_keys=keys,
+        limits=TelemetryLimits(max_string_length=3),
     )
+    values = {key: "abcdef" for key in keys}
     safe, omitted = normalize_attributes(
-        {"one": "abcdef", "two": 2, "three": 3}, config
+        values,
+        config,
     )
-    assert safe == {"one": "abc", "two": 2}
-    assert omitted == 1
+    assert safe == {key: "abc" for key in keys}
+    assert omitted == 0
 
 
 def test_google_trace_correlation_is_not_in_canonical_record() -> None:

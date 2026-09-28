@@ -230,6 +230,46 @@ def test_remote_operation_restores_dispatch_context() -> None:
     downstream.shutdown()
 
 
+def test_nested_span_inherits_active_dispatch_attributes(monkeypatch) -> None:
+    observability_id = "00000000-0000-4000-8000-000000000001"
+    observed, _output = make_runtime(
+        application_attribute_keys=frozenset({"backend"}),
+        dispatch_attribute_keys=frozenset({"observability_id"}),
+    )
+    child_span_attributes = []
+
+    with observed.operation(
+        "simulation.run",
+        remote_context={
+            "captured_at": "not-a-date",
+            "observability_id": observability_id,
+        },
+    ):
+        monkeypatch.setattr(
+            observed._otel,
+            "start_span",
+            lambda _name, **kwargs: child_span_attributes.append(
+                kwargs["attributes"]
+            ),
+        )
+        with observed.span(
+            "simulation.calculate",
+            attributes={
+                "backend": "modal",
+                "observability_id": "00000000-0000-4000-8000-000000000099",
+            },
+        ):
+            pass
+
+    assert child_span_attributes == [
+        {
+            "backend": "modal",
+            "observability_id": observability_id,
+        }
+    ]
+    observed.shutdown()
+
+
 def test_local_operation_attributes_override_remote_dispatch_values() -> None:
     observed, output = make_runtime(
         dispatch_attribute_keys=frozenset({"job_id"})

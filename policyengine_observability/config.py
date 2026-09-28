@@ -106,7 +106,6 @@ class OTelConfig:
 
 @dataclass(frozen=True, slots=True)
 class TelemetryLimits:
-    max_attributes: int = 32
     max_string_length: int = 1_024
     max_error_message_length: int = 2_048
     max_stack_length: int = 16_384
@@ -421,7 +420,6 @@ class ObservabilityConfig:
             )
 
         for name, value in {
-            "limits.max_attributes": self.limits.max_attributes,
             "limits.max_string_length": self.limits.max_string_length,
             "limits.max_error_message_length": self.limits.max_error_message_length,
             "limits.max_stack_length": self.limits.max_stack_length,

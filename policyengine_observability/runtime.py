@@ -636,6 +636,7 @@ class ObservabilityRuntime:
         )
         if omitted:
             self.diagnostics.increment("attributes.omitted", omitted)
+        safe = {**safe, **self._active_dispatch_attributes()}
         return _ChildSpanState(
             name=name,
             start_time=time.perf_counter(),
