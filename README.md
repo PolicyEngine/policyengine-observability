@@ -60,11 +60,16 @@ config = ObservabilityConfig(
         traces=OTLPExporterConfig(endpoint="collector:4317"),
         metrics=OTLPExporterConfig(endpoint="collector:4317"),
     ),
-    application_attribute_keys=frozenset({"country_id", "backend"}),
     dispatch_attribute_keys=frozenset({"job_id", "run_id"}),
 )
 runtime = configure(config)
 ```
+
+Local logs and spans accept explicitly supplied safe scalar attributes by
+default. Set `application_attribute_keys` to a `frozenset` only when a consumer
+needs a strict local attribute allowlist. Asynchronous context still transports
+only `dispatch_attribute_keys`, and metrics still use their separate
+low-cardinality allowlist.
 
 `configure` validates the complete configuration before it creates workers,
 exporters, or logging handlers. Invalid values raise `ConfigurationError` with

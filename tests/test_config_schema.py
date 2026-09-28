@@ -255,6 +255,7 @@ def test_from_env_reads_transport_but_not_identity(monkeypatch) -> None:
     assert config.otel.span_batch_size == 99
     assert config.otel.span_schedule_delay_seconds == 2.5
     assert config.otel.metric_export_interval_seconds == 4.0
+    assert config.application_attribute_keys is None
 
 
 def test_from_env_marks_signal_specific_endpoints_as_exact(
@@ -373,6 +374,26 @@ def test_schema_preserves_core_fields_and_namespaces_attributes() -> None:
     assert record["attributes"]["service.name"] == "attacker"
     assert record["attributes"]["backend"] == "modal"
     json.dumps(record)
+
+
+def test_default_application_policy_accepts_safe_scalar_attributes() -> None:
+    config = make_config(application_attribute_keys=None)
+    record = build_record(
+        config,
+        severity="INFO",
+        attributes={
+            "new_runtime_detail": "available",
+            "attempt": 3,
+            "authorization": "prohibited",
+            "structured": {"not": "scalar"},
+        },
+    )
+
+    assert record["attributes"] == {
+        "new_runtime_detail": "available",
+        "attempt": 3,
+    }
+    assert record["attributes.omitted_count"] == 2
 
 
 def test_schema_redacts_and_truncates_errors() -> None:

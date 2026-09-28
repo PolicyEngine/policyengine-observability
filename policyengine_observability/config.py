@@ -22,8 +22,6 @@ class ConfigurationError(ValueError):
         super().__init__(f"Invalid observability configuration:\n{details}")
 
 
-DEFAULT_APPLICATION_ATTRIBUTE_KEYS = frozenset(set())
-
 DEFAULT_DISPATCH_ATTRIBUTE_KEYS = frozenset(set())
 
 DEFAULT_METRIC_ATTRIBUTE_KEYS = frozenset(
@@ -119,9 +117,7 @@ class ObservabilityConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     otel: OTelConfig = field(default_factory=OTelConfig)
     limits: TelemetryLimits = field(default_factory=TelemetryLimits)
-    application_attribute_keys: frozenset[str] = (
-        DEFAULT_APPLICATION_ATTRIBUTE_KEYS
-    )
+    application_attribute_keys: frozenset[str] | None = None
     dispatch_attribute_keys: frozenset[str] = DEFAULT_DISPATCH_ATTRIBUTE_KEYS
     metric_attribute_keys: frozenset[str] = DEFAULT_METRIC_ATTRIBUTE_KEYS
     sensitive_values: tuple[str, ...] = ()
@@ -223,11 +219,7 @@ class ObservabilityConfig:
                 ),
             ),
             limits=limits or TelemetryLimits(),
-            application_attribute_keys=(
-                application_attribute_keys
-                if application_attribute_keys is not None
-                else DEFAULT_APPLICATION_ATTRIBUTE_KEYS
-            ),
+            application_attribute_keys=application_attribute_keys,
             dispatch_attribute_keys=(
                 dispatch_attribute_keys
                 if dispatch_attribute_keys is not None
@@ -277,19 +269,18 @@ class ObservabilityConfig:
                         "string."
                     )
 
+        if self.application_attribute_keys is not None:
+            _attribute_key_errors(
+                errors,
+                "application_attribute_keys",
+                self.application_attribute_keys,
+            )
+
         for name, values in (
-            ("application_attribute_keys", self.application_attribute_keys),
             ("dispatch_attribute_keys", self.dispatch_attribute_keys),
             ("metric_attribute_keys", self.metric_attribute_keys),
         ):
-            if not isinstance(values, frozenset):
-                errors.append(
-                    f"{name} must be a frozenset of non-empty strings."
-                )
-                continue
-            for value in values:
-                if not isinstance(value, str) or not value.strip():
-                    errors.append(f"{name} entries must be non-empty strings.")
+            _attribute_key_errors(errors, name, values)
 
         _choice_error(
             errors,
@@ -433,6 +424,14 @@ class ObservabilityConfig:
             86_400,
         )
         return tuple(errors)
+
+    @property
+    def local_attribute_keys(self) -> frozenset[str] | None:
+        """Return the optional strict allowlist for local logs and spans."""
+
+        if self.application_attribute_keys is None:
+            return None
+        return self.application_attribute_keys | self.dispatch_attribute_keys
 
     def diagnostics(self) -> tuple[str, ...]:
         messages: list[str] = []
@@ -619,6 +618,19 @@ def _env_int(
             (f"{name} must be between {minimum} and {maximum}.",)
         )
     return parsed
+
+
+def _attribute_key_errors(
+    errors: list[str],
+    name: str,
+    values: object,
+) -> None:
+    if not isinstance(values, frozenset):
+        errors.append(f"{name} must be a frozenset of non-empty strings.")
+        return
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{name} entries must be non-empty strings.")
 
 
 def _choice_error(

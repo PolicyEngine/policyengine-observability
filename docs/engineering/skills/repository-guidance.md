@@ -69,6 +69,10 @@ uv run --extra dev towncrier check --compare-with origin/main
   Those attributes must remain available to nested dispatches and structured
   logs and must be attached to nested spans, but must not become metric labels
   unless independently allowlisted in `metric_attribute_keys`.
+- Accept explicitly supplied safe scalar attributes in local logs and spans by
+  default. Use `application_attribute_keys` only when a consumer requires a
+  strict local allowlist. Do not use that optional local policy to decide what
+  crosses a process boundary or becomes a metric label.
 - Let explicitly supplied receiver attributes override matching remote
   attributes. Malformed remote context may reduce telemetry but must not stop
   the observed operation.

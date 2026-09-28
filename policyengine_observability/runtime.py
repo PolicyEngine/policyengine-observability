@@ -317,10 +317,7 @@ class ObservabilityRuntime:
         safe, omitted = normalize_attributes(
             attributes,
             self.config,
-            allowed_keys=(
-                self.config.application_attribute_keys
-                | self.config.dispatch_attribute_keys
-            ),
+            allowed_keys=self.config.local_attribute_keys,
         )
         request = self._request_state.get()
         operation = self._operation_state.get()
@@ -507,10 +504,7 @@ class ObservabilityRuntime:
         safe, omitted = normalize_attributes(
             attributes,
             self.config,
-            allowed_keys=(
-                self.config.application_attribute_keys
-                | self.config.dispatch_attribute_keys
-            ),
+            allowed_keys=self.config.local_attribute_keys,
         )
         if omitted:
             self.diagnostics.increment("attributes.omitted", omitted)
@@ -629,10 +623,7 @@ class ObservabilityRuntime:
         safe, omitted = normalize_attributes(
             attributes,
             self.config,
-            allowed_keys=(
-                self.config.application_attribute_keys
-                | self.config.dispatch_attribute_keys
-            ),
+            allowed_keys=self.config.local_attribute_keys,
         )
         if omitted:
             self.diagnostics.increment("attributes.omitted", omitted)

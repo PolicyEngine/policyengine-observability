@@ -99,8 +99,7 @@ def build_record(
     safe_attributes, omitted = normalize_attributes(
         attributes,
         config,
-        allowed_keys=config.application_attribute_keys
-        | config.dispatch_attribute_keys,
+        allowed_keys=config.local_attribute_keys,
     )
     if safe_attributes:
         record["attributes"] = safe_attributes
