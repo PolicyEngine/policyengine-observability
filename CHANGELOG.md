@@ -1,3 +1,10 @@
+## [3.0.1] - 2026-09-28
+
+### Fixed
+
+- Preserve configured dispatch attributes across asynchronous operations, include them in correlated structured logs and nested spans, accept safe scalar application attributes by default, and remove the attribute-count limit.
+
+
 ## [3.0.0] - 2026-09-23
 
 ### Breaking changes
