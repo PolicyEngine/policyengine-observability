@@ -43,7 +43,6 @@ def normalize_attributes(
         key = str(raw_key).strip()
         if (
             not key
-            or len(normalized) >= config.limits.max_attributes
             or _prohibited_key(key)
             or (allowed_keys is not None and key not in allowed_keys)
         ):
@@ -100,8 +99,7 @@ def build_record(
     safe_attributes, omitted = normalize_attributes(
         attributes,
         config,
-        allowed_keys=config.application_attribute_keys
-        | config.dispatch_attribute_keys,
+        allowed_keys=config.local_attribute_keys,
     )
     if safe_attributes:
         record["attributes"] = safe_attributes

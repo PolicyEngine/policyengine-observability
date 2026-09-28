@@ -317,10 +317,7 @@ class ObservabilityRuntime:
         safe, omitted = normalize_attributes(
             attributes,
             self.config,
-            allowed_keys=(
-                self.config.application_attribute_keys
-                | self.config.dispatch_attribute_keys
-            ),
+            allowed_keys=self.config.local_attribute_keys,
         )
         request = self._request_state.get()
         operation = self._operation_state.get()
@@ -507,10 +504,7 @@ class ObservabilityRuntime:
         safe, omitted = normalize_attributes(
             attributes,
             self.config,
-            allowed_keys=(
-                self.config.application_attribute_keys
-                | self.config.dispatch_attribute_keys
-            ),
+            allowed_keys=self.config.local_attribute_keys,
         )
         if omitted:
             self.diagnostics.increment("attributes.omitted", omitted)
@@ -519,6 +513,20 @@ class ObservabilityRuntime:
         request_id: str | None = None
         if remote_context:
             request_id = _valid_request_id(remote_context.get("request_id"))
+            remote_attributes, remote_omitted = normalize_attributes(
+                {
+                    key: remote_context.get(key)
+                    for key in self.config.dispatch_attribute_keys
+                    if key in remote_context
+                },
+                self.config,
+                allowed_keys=self.config.dispatch_attribute_keys,
+            )
+            if remote_omitted:
+                self.diagnostics.increment(
+                    "attributes.omitted", remote_omitted
+                )
+            safe = {**remote_attributes, **safe}
             carrier = {
                 key: str(value)
                 for key, value in remote_context.items()
@@ -615,13 +623,11 @@ class ObservabilityRuntime:
         safe, omitted = normalize_attributes(
             attributes,
             self.config,
-            allowed_keys=(
-                self.config.application_attribute_keys
-                | self.config.dispatch_attribute_keys
-            ),
+            allowed_keys=self.config.local_attribute_keys,
         )
         if omitted:
             self.diagnostics.increment("attributes.omitted", omitted)
+        safe = {**safe, **self._active_dispatch_attributes()}
         return _ChildSpanState(
             name=name,
             start_time=time.perf_counter(),
@@ -661,6 +667,20 @@ class ObservabilityRuntime:
         fields.update(self._otel.current_correlation())
         return fields
 
+    def _active_dispatch_attributes(self) -> dict[str, Any]:
+        attributes: dict[str, Any] = {}
+        request = self._request_state.get()
+        operation = self._operation_state.get()
+        if request is not None:
+            attributes.update(request.attributes)
+        if operation is not None:
+            attributes.update(operation.attributes)
+        return {
+            key: attributes[key]
+            for key in self.config.dispatch_attribute_keys
+            if key in attributes
+        }
+
     def _metric_base(self) -> dict[str, Any]:
         return {
             "service.name": self.config.service.name,
@@ -673,6 +693,15 @@ class ObservabilityRuntime:
 
     def _emit_record(self, **kwargs: Any) -> None:
         try:
+            supplied_attributes = kwargs.get("attributes")
+            kwargs["attributes"] = {
+                **(
+                    dict(supplied_attributes)
+                    if supplied_attributes is not None
+                    else {}
+                ),
+                **self._active_dispatch_attributes(),
+            }
             self._delivery.emit(build_record(self.config, **kwargs))
         except Exception as exc:
             self.diagnostics.report("record.emit", exc)

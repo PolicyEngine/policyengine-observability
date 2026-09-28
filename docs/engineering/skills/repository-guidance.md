@@ -62,6 +62,20 @@ uv run --extra dev towncrier check --compare-with origin/main
   without breaking the application operation being observed.
 - Preserve structured log schemas. Make additive changes when possible; bump
   schema versions for breaking payload changes.
+- Treat `capture_context()` output as transport metadata beside an application
+  payload. Pass it to the receiver's outer `operation` through
+  `remote_context`; do not insert it into business request models.
+- Restore only attributes explicitly listed in `dispatch_attribute_keys`.
+  Those attributes must remain available to nested dispatches and structured
+  logs and must be attached to nested spans, but must not become metric labels
+  unless independently allowlisted in `metric_attribute_keys`.
+- Accept explicitly supplied safe scalar attributes in local logs and spans by
+  default. Use `application_attribute_keys` only when a consumer requires a
+  strict local allowlist. Do not use that optional local policy to decide what
+  crosses a process boundary or becomes a metric label.
+- Let explicitly supplied receiver attributes override matching remote
+  attributes. Malformed remote context may reduce telemetry but must not stop
+  the observed operation.
 - Keep metric attributes bounded and low-cardinality. Do not put raw paths,
   full URLs, request bodies, or unbounded user-provided values into metric
   labels.
@@ -73,6 +87,9 @@ uv run --extra dev towncrier check --compare-with origin/main
 Add focused tests for context behavior and failure paths whenever changing
 the runtime or its components. The corresponding `tests/test_runtime_*.py`
 modules cover operations, requests, spans, log emission, and tracing.
+Remote-context tests must exercise two runtime instances and prove that
+configured dispatch attributes survive capture, restoration, logs, spans, and
+a subsequent capture. Include malformed context and local-override cases.
 Adapter changes should include framework-level tests that exercise request
 setup, response headers, error paths, and teardown behavior.
 

@@ -1,0 +1,1 @@
+Preserve configured dispatch attributes across asynchronous operations, include them in correlated structured logs and nested spans, accept safe scalar application attributes by default, and remove the attribute-count limit.

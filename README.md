@@ -60,11 +60,16 @@ config = ObservabilityConfig(
         traces=OTLPExporterConfig(endpoint="collector:4317"),
         metrics=OTLPExporterConfig(endpoint="collector:4317"),
     ),
-    application_attribute_keys=frozenset({"country_id", "backend"}),
     dispatch_attribute_keys=frozenset({"job_id", "run_id"}),
 )
 runtime = configure(config)
 ```
+
+Local logs and spans accept explicitly supplied safe scalar attributes by
+default. Set `application_attribute_keys` to a `frozenset` only when a consumer
+needs a strict local attribute allowlist. Asynchronous context still transports
+only `dispatch_attribute_keys`, and metrics still use their separate
+low-cardinality allowlist.
 
 `configure` validates the complete configuration before it creates workers,
 exporters, or logging handlers. Invalid values raise `ConfigurationError` with
@@ -300,18 +305,37 @@ instrument_httpx(client, runtime)
 The request hook injects active W3C context and the PolicyEngine request ID.
 Other clients in the process remain unchanged.
 
-For asynchronous dispatch, serialize the bounded correlation context with the
-job request and restore it around the worker operation:
+For asynchronous dispatch, send the bounded observability context as transport
+metadata beside the application payload and restore it around the worker
+operation:
 
 ```python
-request.observability_context = runtime.capture_context()
+observability_context = runtime.capture_context()
+worker.spawn(
+    payload,
+    observability_context=observability_context,
+)
 
-with runtime.operation(
-    "simulation.run",
-    remote_context=request.observability_context,
-):
-    return run_simulation(request)
+def worker(payload, *, observability_context=None):
+    with runtime.operation(
+        "simulation.run",
+        remote_context=observability_context,
+    ):
+        return run_simulation(payload)
 ```
+
+`capture_context()` includes W3C trace context, its capture time, the active
+PolicyEngine request ID, and scalar attributes named by
+`dispatch_attribute_keys`. Starting the remote operation restores only those
+configured dispatch attributes. They remain available to nested
+`capture_context()` calls and are attached to logs and every nested span inside
+the operation. They are never added to metric labels unless separately
+included in `metric_attribute_keys`.
+
+Keep this context separate from the application payload. Invalid or stale
+trace context can reduce correlation, but it does not prevent the observed
+application code from running. A recent direct dispatch continues the trace;
+delayed, retry, and aggregate work starts a trace linked to the dispatch span.
 
 ## Process restoration and shutdown
 

@@ -196,6 +196,118 @@ def test_set_context_and_capture_context_are_allowlisted(runtime) -> None:
     observed.end_request(status_code=202)
 
 
+def test_remote_operation_restores_dispatch_context() -> None:
+    dispatch_keys = frozenset({"job_id", "observability_id"})
+    upstream, _upstream_output = make_runtime(
+        dispatch_attribute_keys=dispatch_keys
+    )
+    downstream, downstream_output = make_runtime(
+        dispatch_attribute_keys=dispatch_keys
+    )
+    upstream.begin_request(
+        headers={REQUEST_ID_HEADER: "request-1"},
+        method="POST",
+        route="/simulation",
+    )
+    upstream.set_context(
+        job_id="job-1",
+        observability_id="00000000-0000-4000-8000-000000000001",
+    )
+
+    remote_context = upstream.capture_context()
+    with downstream.operation("simulation.run", remote_context=remote_context):
+        assert downstream.capture_context()["job_id"] == "job-1"
+        downstream.log("running")
+
+    emitted = records(downstream_output)
+    assert emitted[0]["attributes"] == {
+        "job_id": "job-1",
+        "observability_id": "00000000-0000-4000-8000-000000000001",
+    }
+    assert emitted[1]["attributes"] == emitted[0]["attributes"]
+    upstream.end_request(status_code=202)
+    upstream.shutdown()
+    downstream.shutdown()
+
+
+def test_nested_span_inherits_active_dispatch_attributes(monkeypatch) -> None:
+    observability_id = "00000000-0000-4000-8000-000000000001"
+    observed, _output = make_runtime(
+        application_attribute_keys=frozenset({"backend"}),
+        dispatch_attribute_keys=frozenset({"observability_id"}),
+    )
+    child_span_attributes = []
+
+    with observed.operation(
+        "simulation.run",
+        remote_context={
+            "captured_at": "not-a-date",
+            "observability_id": observability_id,
+        },
+    ):
+        monkeypatch.setattr(
+            observed._otel,
+            "start_span",
+            lambda _name, **kwargs: child_span_attributes.append(
+                kwargs["attributes"]
+            ),
+        )
+        with observed.span(
+            "simulation.calculate",
+            attributes={
+                "backend": "modal",
+                "observability_id": "00000000-0000-4000-8000-000000000099",
+            },
+        ):
+            pass
+
+    assert child_span_attributes == [
+        {
+            "backend": "modal",
+            "observability_id": observability_id,
+        }
+    ]
+    observed.shutdown()
+
+
+def test_local_operation_attributes_override_remote_dispatch_values() -> None:
+    observed, output = make_runtime(
+        dispatch_attribute_keys=frozenset({"job_id"})
+    )
+
+    with observed.operation(
+        "simulation.run",
+        attributes={"job_id": "local-job"},
+        remote_context={
+            "captured_at": "not-a-date",
+            "job_id": "remote-job",
+            "unapproved": "must-not-appear",
+        },
+    ):
+        observed.event("simulation.started")
+
+    emitted = records(output)
+    assert emitted[0]["attributes"] == {"job_id": "local-job"}
+    assert emitted[1]["attributes"] == {"job_id": "local-job"}
+    assert observed.capture_context().get("unapproved") is None
+    observed.shutdown()
+
+
+def test_malformed_remote_context_does_not_change_application_result() -> None:
+    observed, _output = make_runtime()
+
+    @observed.operation(
+        "simulation.run",
+        remote_context=["not", "a", "mapping"],  # type: ignore[arg-type]
+    )
+    def calculate() -> int:
+        return 42
+
+    assert calculate() == 42
+    assert observed.diagnostics.count("failure.operation.start") == 1
+    observed.shutdown()
+
+
 def test_two_runtimes_keep_identity_and_context_separate() -> None:
     first, first_output = make_runtime()
     second_config = make_config(
