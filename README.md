@@ -337,6 +337,33 @@ trace context can reduce correlation, but it does not prevent the observed
 application code from running. A recent direct dispatch continues the trace;
 delayed, retry, and aggregate work starts a trace linked to the dispatch span.
 
+## Process identity
+
+OpenTelemetry resource attributes require `service.instance.id` to identify
+one telemetry-producing process. Deployment revisions identify code shared by
+multiple containers and workers, so they must not be used alone as the process
+identity. Construct the deployment identity after the application process has
+started:
+
+```python
+import os
+
+from policyengine_observability import DeploymentIdentity, process_instance_id
+
+service_name = "example-api"
+deployment = DeploymentIdentity(
+    environment="production",
+    platform="google_cloud_run",
+    region="us-central1",
+    instance_id=process_instance_id(service_name, os.getenv("K_REVISION")),
+)
+```
+
+The helper returns one stable value for a service within the current process.
+It combines the optional platform identifier with a process ID and random UUID,
+so separate workers and containers cannot publish cumulative metrics under the
+same resource identity. A child process receives a new value on its first call.
+
 ## Process restoration and shutdown
 
 After a process image or memory snapshot is restored, rebuild process-local

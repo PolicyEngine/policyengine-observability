@@ -21,6 +21,7 @@ from .destinations import (
     StdoutLogDestination,
 )
 from .google_auth import GoogleIdTokenAuth
+from .identity import process_instance_id
 from .integrations import instrument_httpx
 from .runtime import (
     REQUEST_ID_HEADER,
@@ -61,4 +62,5 @@ __all__ = [
     "instrument_flask",
     "instrument_httpx",
     "instrument_logging",
+    "process_instance_id",
 ]
