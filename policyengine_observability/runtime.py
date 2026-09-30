@@ -548,6 +548,7 @@ class ObservabilityRuntime:
                 if link is not None:
                     links.append(link)
                 parent = self._otel.empty_context()
+        safe = {**safe, **self._active_dispatch_attributes()}
         active_request = self._request_state.get()
         if request_id is None and active_request is not None:
             request_id = active_request.request_id

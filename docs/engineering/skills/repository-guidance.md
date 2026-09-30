@@ -67,8 +67,8 @@ uv run --extra dev towncrier check --compare-with origin/main
   `remote_context`; do not insert it into business request models.
 - Restore only attributes explicitly listed in `dispatch_attribute_keys`.
   Those attributes must remain available to nested dispatches and structured
-  logs and must be attached to nested spans, but must not become metric labels
-  unless independently allowlisted in `metric_attribute_keys`.
+  logs and must be attached to nested operations and spans, but must not become
+  metric labels unless independently allowlisted in `metric_attribute_keys`.
 - Accept explicitly supplied safe scalar attributes in local logs and spans by
   default. Use `application_attribute_keys` only when a consumer requires a
   strict local allowlist. Do not use that optional local policy to decide what

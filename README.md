@@ -328,14 +328,41 @@ def worker(payload, *, observability_context=None):
 PolicyEngine request ID, and scalar attributes named by
 `dispatch_attribute_keys`. Starting the remote operation restores only those
 configured dispatch attributes. They remain available to nested
-`capture_context()` calls and are attached to logs and every nested span inside
-the operation. They are never added to metric labels unless separately
-included in `metric_attribute_keys`.
+`capture_context()` calls and are attached to logs, nested operations, and
+nested spans inside the operation. They are never added to metric labels
+unless separately included in `metric_attribute_keys`.
 
 Keep this context separate from the application payload. Invalid or stale
 trace context can reduce correlation, but it does not prevent the observed
 application code from running. A recent direct dispatch continues the trace;
 delayed, retry, and aggregate work starts a trace linked to the dispatch span.
+
+## Process identity
+
+OpenTelemetry resource attributes require `service.instance.id` to identify
+one telemetry-producing process. Deployment revisions identify code shared by
+multiple containers and workers, so they must not be used alone as the process
+identity. Construct the deployment identity after the application process has
+started:
+
+```python
+import os
+
+from policyengine_observability import DeploymentIdentity, process_instance_id
+
+service_name = "example-api"
+deployment = DeploymentIdentity(
+    environment="production",
+    platform="google_cloud_run",
+    region="us-central1",
+    instance_id=process_instance_id(service_name, os.getenv("K_REVISION")),
+)
+```
+
+The helper returns one stable value for a service within the current process.
+It combines the optional platform identifier with a process ID and random UUID,
+so separate workers and containers cannot publish cumulative metrics under the
+same resource identity. A child process receives a new value on its first call.
 
 ## Process restoration and shutdown
 

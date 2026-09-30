@@ -270,6 +270,62 @@ def test_nested_span_inherits_active_dispatch_attributes(monkeypatch) -> None:
     observed.shutdown()
 
 
+def test_nested_operation_inherits_active_dispatch_attributes(
+    monkeypatch,
+) -> None:
+    observability_id = "00000000-0000-4000-8000-000000000001"
+    observed, output = make_runtime(
+        application_attribute_keys=frozenset({"simulation_role"}),
+        dispatch_attribute_keys=frozenset({"observability_id"}),
+    )
+    operation_span_attributes = []
+
+    with observed.operation(
+        "simulation.run",
+        remote_context={
+            "captured_at": "not-a-date",
+            "observability_id": observability_id,
+        },
+    ):
+        monkeypatch.setattr(
+            observed._otel,
+            "start_span",
+            lambda _name, **kwargs: operation_span_attributes.append(
+                kwargs["attributes"]
+            ),
+        )
+        with observed.operation(
+            "simulation.plan",
+            attributes={
+                "simulation_role": "baseline",
+                "observability_id": "00000000-0000-4000-8000-000000000099",
+            },
+        ):
+            assert observed.capture_context()["observability_id"] == (
+                observability_id
+            )
+
+    emitted = records(output)
+    nested_completion = next(
+        item
+        for item in emitted
+        if item.get("operation.name") == "simulation.plan"
+    )
+    assert nested_completion["attributes"] == {
+        "simulation_role": "baseline",
+        "observability_id": observability_id,
+    }
+    assert operation_span_attributes == [
+        {
+            "operation.name": "simulation.plan",
+            "operation.kind": "operation",
+            "simulation_role": "baseline",
+            "observability_id": observability_id,
+        }
+    ]
+    observed.shutdown()
+
+
 def test_local_operation_attributes_override_remote_dispatch_values() -> None:
     observed, output = make_runtime(
         dispatch_attribute_keys=frozenset({"job_id"})
