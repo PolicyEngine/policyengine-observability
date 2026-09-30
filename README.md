@@ -328,9 +328,9 @@ def worker(payload, *, observability_context=None):
 PolicyEngine request ID, and scalar attributes named by
 `dispatch_attribute_keys`. Starting the remote operation restores only those
 configured dispatch attributes. They remain available to nested
-`capture_context()` calls and are attached to logs and every nested span inside
-the operation. They are never added to metric labels unless separately
-included in `metric_attribute_keys`.
+`capture_context()` calls and are attached to logs, nested operations, and
+nested spans inside the operation. They are never added to metric labels
+unless separately included in `metric_attribute_keys`.
 
 Keep this context separate from the application payload. Invalid or stale
 trace context can reduce correlation, but it does not prevent the observed
