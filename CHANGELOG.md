@@ -1,3 +1,10 @@
+## [3.0.2] - 2026-09-30
+
+### Fixed
+
+- Add process-scoped service instance identities and preserve dispatch attributes on nested operations.
+
+
 ## [3.0.1] - 2026-09-28
 
 ### Fixed
