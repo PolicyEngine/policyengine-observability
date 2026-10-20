@@ -1,3 +1,10 @@
+## [3.0.3] - 2026-10-20
+
+### Fixed
+
+- Keep the exception recorded with `record_exception` on the `request.completed` record and server span when a request ends with an error outcome but no exception is passed to `end_request`, such as a Flask error handler that returns a 500 response. Requests that record a handled exception and return a 2xx or 4xx response keep their outcome and carry no error fields.
+
+
 ## [3.0.2] - 2026-09-30
 
 ### Fixed
