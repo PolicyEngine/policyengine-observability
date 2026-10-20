@@ -172,6 +172,42 @@ def test_request_exception_is_error(runtime) -> None:
     assert emitted[1]["outcome"] == "error"
 
 
+def test_server_error_completion_uses_recorded_exception(runtime) -> None:
+    observed, output = runtime
+    observed.begin_request(headers={}, method="GET", route="/fail")
+    recorded_error = ValueError("recorded by error handler")
+    observed.record_exception(recorded_error, handled=False, status_code=500)
+
+    observed.end_request(status_code=None)
+
+    completion = records(output)[-1]
+    assert completion["event.name"] == "request.completed"
+    assert completion["http.response.status_code"] == 500
+    assert completion["outcome"] == "error"
+    assert completion["severity"] == "ERROR"
+    assert completion["error.type"] == "ValueError"
+    assert completion["error.message"] == "recorded by error handler"
+    assert completion["error.stack"].startswith("ValueError:")
+
+
+def test_explicit_request_error_takes_precedence_over_recorded_exception(
+    runtime,
+) -> None:
+    observed, output = runtime
+    observed.begin_request(headers={}, method="GET", route="/fail")
+    recorded_error = LookupError("recorded by application")
+    observed.record_exception(recorded_error, handled=True, status_code=500)
+    raised_error = RuntimeError("raised to the framework")
+
+    observed.end_request(status_code=500, error=raised_error)
+
+    completion = records(output)[-1]
+    assert completion["event.name"] == "request.completed"
+    assert completion["outcome"] == "error"
+    assert completion["error.type"] == "RuntimeError"
+    assert completion["error.message"] == "raised to the framework"
+
+
 def test_set_context_and_capture_context_are_allowlisted(runtime) -> None:
     observed, _output = runtime
     observed.begin_request(

@@ -264,9 +264,15 @@ class ObservabilityRuntime:
             status_code if status_code is not None else state.status_code
         )
         state.status_code = resolved_status
-        state.error = error
         duration = max(0.0, time.perf_counter() - state.start_time)
         outcome = _outcome(resolved_status, error)
+        if error is None and outcome == "error":
+            # A framework error handler can record the exception and return a
+            # 5xx response, after which the adapter receives no exception. An
+            # exception recorded on a request that ends with a lower status was
+            # handled, so it does not change the outcome or the record.
+            error = state.error
+        state.error = error
         metric_values = self._metric_base()
         metric_values.update(
             {
