@@ -7,6 +7,7 @@ import httpx
 import pytest
 from conftest import make_runtime, records
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from flask import Flask
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -71,6 +72,106 @@ def test_flask_exception_emits_one_error_completion() -> None:
     assert span.status.status_code is StatusCode.ERROR
     assert span.events[0].name == "exception"
     assert span.events[0].attributes["exception.message"] == "route failed"
+    runtime.shutdown()
+
+
+def test_flask_error_handler_exception_is_kept_on_request_completion(
+    monkeypatch,
+) -> None:
+    runtime, output = make_runtime(otel=OTelConfig(enabled=True))
+    exporter = InMemorySpanExporter()
+    runtime._otel._tracer_provider.add_span_processor(
+        SimpleSpanProcessor(exporter)
+    )
+    error_metric_points = _capture_error_metric_points(monkeypatch, runtime)
+    app = Flask(__name__)
+
+    @app.get("/fail")
+    def fail_calculation():
+        raise ValueError("route failed")
+
+    @app.errorhandler(Exception)
+    def handle_unexpected_error(error):
+        runtime.record_exception(error, handled=False, status_code=500)
+        return {"error": "internal"}, 500
+
+    instrument_flask(app, runtime)
+    response = app.test_client().get("/fail")
+
+    assert response.status_code == 500
+    completions = _request_completions(records(output))
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion["http.response.status_code"] == 500
+    assert completion["outcome"] == "error"
+    assert completion["severity"] == "ERROR"
+    assert completion["error.type"] == "ValueError"
+    assert completion["error.message"] == "route failed"
+    assert completion["error.stack"].startswith("Traceback")
+    assert "fail_calculation" in completion["error.stack"]
+    assert "ValueError: route failed" in completion["error.stack"]
+    assert [point["operation.kind"] for point in error_metric_points] == [
+        "unhandled",
+        "request",
+    ]
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.ERROR
+    assert [event.name for event in span.events] == ["exception"]
+    assert span.events[0].attributes["exception.type"] == "ValueError"
+    assert span.events[0].attributes["exception.message"] == "route failed"
+    runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("recorded_status_code", "response_status_code", "expected_outcome"),
+    ((None, 200, "success"), (404, 404, "client_error")),
+)
+def test_flask_handled_exception_does_not_mark_request_failed(
+    monkeypatch,
+    recorded_status_code,
+    response_status_code,
+    expected_outcome,
+) -> None:
+    runtime, output = make_runtime(otel=OTelConfig(enabled=True))
+    exporter = InMemorySpanExporter()
+    runtime._otel._tracer_provider.add_span_processor(
+        SimpleSpanProcessor(exporter)
+    )
+    error_metric_points = _capture_error_metric_points(monkeypatch, runtime)
+    app = Flask(__name__)
+
+    @app.get("/items/<item_id>")
+    def load_item(item_id: str):
+        try:
+            raise LookupError(f"item {item_id} is not cached")
+        except LookupError as error:
+            runtime.record_exception(
+                error,
+                handled=True,
+                status_code=recorded_status_code,
+            )
+        return {"item": item_id}, response_status_code
+
+    instrument_flask(app, runtime)
+    response = app.test_client().get("/items/abc")
+
+    assert response.status_code == response_status_code
+    emitted = records(output)
+    assert [item["event.name"] for item in emitted] == [
+        "exception.recorded",
+        "request.completed",
+    ]
+    completion = emitted[-1]
+    assert completion["http.response.status_code"] == response_status_code
+    assert completion["outcome"] == expected_outcome
+    assert completion["severity"] == "INFO"
+    assert _error_field_names(completion) == []
+    assert [point["operation.kind"] for point in error_metric_points] == [
+        "handled"
+    ]
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.UNSET
+    assert span.events == ()
     runtime.shutdown()
 
 
@@ -223,6 +324,98 @@ def test_fastapi_error_and_non_http_scope() -> None:
     runtime.shutdown()
 
 
+def test_fastapi_raised_exception_takes_precedence_over_recorded_error() -> (
+    None
+):
+    runtime, output = make_runtime()
+    app = FastAPI()
+
+    @app.get("/fail")
+    async def fail():
+        runtime.record_exception(
+            LookupError("recorded by application"), handled=True
+        )
+        raise ValueError("route failed")
+
+    instrument_fastapi(app, runtime)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/fail")
+
+    assert response.status_code == 500
+    completions = _request_completions(records(output))
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion["http.response.status_code"] == 500
+    assert completion["outcome"] == "error"
+    assert completion["error.type"] == "ValueError"
+    assert completion["error.message"] == "route failed"
+    runtime.shutdown()
+
+
+def test_fastapi_handled_exception_does_not_mark_request_failed(
+    monkeypatch,
+) -> None:
+    runtime, output = make_runtime()
+    error_metric_points = _capture_error_metric_points(monkeypatch, runtime)
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    async def load_item(item_id: str):
+        try:
+            raise LookupError(f"item {item_id} is not cached")
+        except LookupError as error:
+            runtime.record_exception(error, handled=True)
+        return {"item": item_id}
+
+    instrument_fastapi(app, runtime)
+    with TestClient(app) as client:
+        response = client.get("/items/abc")
+
+    assert response.status_code == 200
+    completions = _request_completions(records(output))
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion["outcome"] == "success"
+    assert completion["severity"] == "INFO"
+    assert _error_field_names(completion) == []
+    assert [point["operation.kind"] for point in error_metric_points] == [
+        "handled"
+    ]
+    runtime.shutdown()
+
+
+def test_fastapi_exception_handler_error_is_kept_on_request_completion() -> (
+    None
+):
+    runtime, output = make_runtime()
+    app = FastAPI()
+
+    class CalculationFailed(Exception):
+        pass
+
+    @app.exception_handler(CalculationFailed)
+    async def handle_calculation_failure(_request, error):
+        runtime.record_exception(error, handled=False, status_code=500)
+        return JSONResponse({"error": "internal"}, status_code=500)
+
+    @app.get("/fail")
+    async def fail():
+        raise CalculationFailed("calculation failed")
+
+    instrument_fastapi(app, runtime)
+    with TestClient(app) as client:
+        response = client.get("/fail")
+
+    assert response.status_code == 500
+    completions = _request_completions(records(output))
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion["outcome"] == "error"
+    assert completion["error.type"] == "CalculationFailed"
+    assert completion["error.message"] == "calculation failed"
+    runtime.shutdown()
+
+
 def test_httpx_only_instruments_supplied_sync_client() -> None:
     runtime, _output = make_runtime()
     seen: list[httpx.Request] = []
@@ -290,6 +483,32 @@ def test_httpx_client_cannot_be_rebound_to_another_runtime() -> None:
     client.close()
     first.shutdown()
     second.shutdown()
+
+
+def _capture_error_metric_points(monkeypatch, runtime) -> list[dict[str, Any]]:
+    """Record the attributes of every error-count metric point."""
+
+    error_metric_points: list[dict[str, Any]] = []
+    record_error = runtime._otel.record_error
+
+    def record_and_capture_error(attributes):
+        error_metric_points.append(dict(attributes))
+        record_error(attributes)
+
+    monkeypatch.setattr(
+        runtime._otel, "record_error", record_and_capture_error
+    )
+    return error_metric_points
+
+
+def _request_completions(emitted: list[dict]) -> list[dict]:
+    return [
+        item for item in emitted if item["event.name"] == "request.completed"
+    ]
+
+
+def _error_field_names(record: dict) -> list[str]:
+    return sorted(key for key in record if key.startswith("error."))
 
 
 def _flask_callback_snapshot(
