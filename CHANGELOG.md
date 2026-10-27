@@ -1,3 +1,10 @@
+## [3.0.5] - 2026-10-27
+
+### Fixed
+
+- Report the matched route template as `http.route` on records written while a FastAPI endpoint runs, such as those from `record_exception`, `event` and `log`. These records previously reported `<unmatched>` because the FastAPI middleware begins the request before FastAPI matches its route. Records written before routing, and requests that match no route, still report `<unmatched>`.
+
+
 ## [3.0.4] - 2026-10-27
 
 ### Fixed
