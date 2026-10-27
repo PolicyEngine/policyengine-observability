@@ -178,6 +178,25 @@ def test_request_replaces_malformed_id_and_classifies_status(runtime) -> None:
     assert records(output)[0]["outcome"] == "client_error"
 
 
+def test_failing_request_route_reader_keeps_stored_route(runtime) -> None:
+    observed, output = runtime
+
+    def fail_to_read_route() -> str | None:
+        raise RuntimeError("route lookup failed")
+
+    observed.begin_request(headers={}, method="GET", route="<unmatched>")
+    observed._set_request_route_reader(fail_to_read_route)
+    observed.event("item.loaded")
+    observed.end_request(status_code=200)
+
+    emitted = records(output)
+    assert [(item["event.name"], item["http.route"]) for item in emitted] == [
+        ("item.loaded", "<unmatched>"),
+        ("request.completed", "<unmatched>"),
+    ]
+    assert observed.diagnostics.count("failure.request.route_read") == 1
+
+
 def test_request_exception_is_error(runtime) -> None:
     observed, output = runtime
     observed.begin_request(headers={}, method="GET", route="/fail")

@@ -416,6 +416,119 @@ def test_fastapi_exception_handler_error_is_kept_on_request_completion() -> (
     runtime.shutdown()
 
 
+def test_fastapi_exception_recorded_in_endpoint_carries_matched_route() -> (
+    None
+):
+    runtime, output = make_runtime()
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    async def load_item(item_id: str):
+        try:
+            raise LookupError(f"item {item_id} is not cached")
+        except LookupError as error:
+            runtime.record_exception(error, handled=True)
+        return {"item": item_id}
+
+    instrument_fastapi(app, runtime)
+    with TestClient(app) as client:
+        response = client.get("/items/abc")
+
+    assert response.status_code == 200
+    assert _routes_by_event_name(records(output)) == {
+        "exception.recorded": ["/items/{item_id}"],
+        "request.completed": ["/items/{item_id}"],
+    }
+    runtime.shutdown()
+
+
+def test_fastapi_events_recorded_in_endpoints_carry_matched_routes() -> None:
+    runtime, output = make_runtime()
+    app = FastAPI()
+
+    @app.get("/reports/{report_id}")
+    async def build_report(report_id: str):
+        runtime.event("report.built")
+        return {"report": report_id}
+
+    @app.get("/exports/{export_id}")
+    def build_export(export_id: str):
+        # FastAPI runs synchronous endpoints in a worker thread.
+        runtime.event("export.built")
+        return {"export": export_id}
+
+    instrument_fastapi(app, runtime)
+    with TestClient(app) as client:
+        report_response = client.get("/reports/annual")
+        export_response = client.get("/exports/annual")
+
+    assert report_response.status_code == 200
+    assert export_response.status_code == 200
+    assert _routes_by_event_name(records(output)) == {
+        "report.built": ["/reports/{report_id}"],
+        "export.built": ["/exports/{export_id}"],
+        "request.completed": [
+            "/reports/{report_id}",
+            "/exports/{export_id}",
+        ],
+    }
+    runtime.shutdown()
+
+
+def test_fastapi_request_matching_no_route_keeps_unmatched_route() -> None:
+    runtime, output = make_runtime()
+    app = FastAPI()
+
+    @app.exception_handler(404)
+    async def handle_not_found(_request, error):
+        runtime.record_exception(error, handled=True, status_code=404)
+        return JSONResponse({"detail": "not found"}, status_code=404)
+
+    @app.get("/items/{item_id}")
+    async def load_item(item_id: str):
+        return {"item": item_id}
+
+    instrument_fastapi(app, runtime)
+    with TestClient(app) as client:
+        response = client.get("/missing")
+
+    assert response.status_code == 404
+    assert _routes_by_event_name(records(output)) == {
+        "exception.recorded": ["<unmatched>"],
+        "request.completed": ["<unmatched>"],
+    }
+    runtime.shutdown()
+
+
+def test_fastapi_record_written_before_routing_keeps_unmatched_route() -> None:
+    runtime, output = make_runtime()
+    app = FastAPI()
+
+    @app.get("/items/{item_id}")
+    async def load_item(item_id: str):
+        runtime.event("item.loaded")
+        return {"item": item_id}
+
+    # Middleware added before instrumentation runs inside the observability
+    # middleware, so the request is active but has not been routed yet.
+    @app.middleware("http")
+    async def record_received_request(request, call_next):
+        runtime.event("request.received")
+        return await call_next(request)
+
+    instrument_fastapi(app, runtime)
+    with TestClient(app) as client:
+        response = client.get("/items/abc")
+
+    assert response.status_code == 200
+    assert _routes_by_event_name(records(output)) == {
+        "request.received": ["<unmatched>"],
+        "item.loaded": ["/items/{item_id}"],
+        "request.completed": ["/items/{item_id}"],
+    }
+    runtime.shutdown()
+
+
 def test_httpx_only_instruments_supplied_sync_client() -> None:
     runtime, _output = make_runtime()
     seen: list[httpx.Request] = []
@@ -505,6 +618,15 @@ def _request_completions(emitted: list[dict]) -> list[dict]:
     return [
         item for item in emitted if item["event.name"] == "request.completed"
     ]
+
+
+def _routes_by_event_name(emitted: list[dict]) -> dict[str, list[str]]:
+    """Group each record's route under its event name, in emission order."""
+
+    routes: dict[str, list[str]] = {}
+    for item in emitted:
+        routes.setdefault(item["event.name"], []).append(item["http.route"])
+    return routes
 
 
 def _error_field_names(record: dict) -> list[str]:
