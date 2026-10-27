@@ -1,3 +1,10 @@
+## [3.0.4] - 2026-10-27
+
+### Fixed
+
+- Annotate `__exit__` and `__aexit__` on the context manager returned by `operation()` and `span()` as returning `Literal[False]` instead of `bool`. The context manager never suppresses exceptions, and with the `bool` annotation type checkers such as Pyright reported variables assigned inside a `with` or `async with` block as possibly unbound after it.
+
+
 ## [3.0.3] - 2026-10-20
 
 ### Fixed
