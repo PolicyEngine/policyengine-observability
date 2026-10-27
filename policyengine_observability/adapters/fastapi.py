@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from functools import partial
 from typing import Any
 
 from ..runtime import ObservabilityRuntime
@@ -47,6 +48,11 @@ class _ObservabilityMiddleware:
                 headers=_headers_from_scope(scope),
                 method=str(scope.get("method") or ""),
                 route=_route_from_scope(scope) or "<unmatched>",
+            )
+            # FastAPI matches the route after this middleware begins the
+            # request, so read the matched route when each record is written.
+            self.runtime._set_request_route_reader(
+                partial(_route_from_scope, scope)
             )
         except Exception as exc:
             self.runtime.diagnostics.report("fastapi.request_begin", exc)

@@ -7,7 +7,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -40,6 +40,7 @@ class _RequestState:
     attributes: dict[str, Any] = field(default_factory=dict)
     error: BaseException | None = None
     completed: bool = False
+    route_reader: Callable[[], str | None] | None = None
 
 
 @dataclass(slots=True)
@@ -232,6 +233,22 @@ class ObservabilityRuntime:
             return
         state.route = route
         self._otel.set_span_attributes({"http.route": route})
+
+    def _set_request_route_reader(
+        self, route_reader: Callable[[], str | None]
+    ) -> None:
+        """Read the active request's route each time a record is written.
+
+        A framework adapter can begin a request before the framework has
+        matched it to a route. The reader returns the matched route
+        template, or ``None`` while no route has been matched, in which case
+        records keep the route stored on the request.
+        """
+
+        state = self._request_state.get()
+        if state is None or state.completed:
+            return
+        state.route_reader = route_reader
 
     def update_request_status(self, status_code: int) -> None:
         state = self._request_state.get()
@@ -659,7 +676,7 @@ class ObservabilityRuntime:
                 {
                     "request.id": request.request_id,
                     "http.request.method": request.method,
-                    "http.route": request.route,
+                    "http.route": self._current_request_route(request),
                 }
             )
         if operation is not None:
@@ -673,6 +690,16 @@ class ObservabilityRuntime:
                 fields["request.id"] = operation.request_id
         fields.update(self._otel.current_correlation())
         return fields
+
+    def _current_request_route(self, request: _RequestState) -> str:
+        if request.route_reader is None:
+            return request.route
+        try:
+            matched_route = request.route_reader()
+        except Exception as exc:
+            self.diagnostics.report("request.route_read", exc)
+            return request.route
+        return matched_route or request.route
 
     def _active_dispatch_attributes(self) -> dict[str, Any]:
         attributes: dict[str, Any] = {}
