@@ -12,7 +12,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import wraps
-from typing import Any
+from typing import Any, Literal
 
 from .config import ObservabilityConfig
 from .delivery import DeliveryManager
@@ -779,7 +779,9 @@ class _ScopeManager:
             self.state = None
         return self.state
 
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+    def __exit__(
+        self, exc_type: Any, exc: Any, traceback: Any
+    ) -> Literal[False]:
         try:
             if self.scope_type == "operation":
                 self.runtime._finish_operation(self.state, exc)  # type: ignore[arg-type]
@@ -796,7 +798,9 @@ class _ScopeManager:
     async def __aenter__(self) -> Any:
         return self.__enter__()
 
-    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+    async def __aexit__(
+        self, exc_type: Any, exc: Any, traceback: Any
+    ) -> Literal[False]:
         return self.__exit__(exc_type, exc, traceback)
 
     def __call__(self, function: Any) -> Any:
