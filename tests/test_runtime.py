@@ -7,6 +7,7 @@ import select
 import signal
 import threading
 import time
+from typing import Literal, get_type_hints
 
 import pytest
 from conftest import make_config, make_runtime, records
@@ -92,6 +93,23 @@ def test_application_exception_is_same_object_when_export_fails(
         fail()
     assert caught.value is application_error
     assert observed.diagnostics.count("failure.record.emit") == 1
+
+
+@pytest.mark.parametrize("exit_method_name", ["__exit__", "__aexit__"])
+def test_scope_exit_is_annotated_as_never_suppressing_exceptions(
+    runtime, exit_method_name: str
+) -> None:
+    # Type checkers read a `bool` return annotation on an exit method as
+    # "may suppress the exception", so they report variables assigned
+    # inside a `with` or `async with` block as possibly unbound after it.
+    observed, _output = runtime
+    for scope_manager in (
+        observed.operation("annotation.operation"),
+        observed.span("annotation.span"),
+    ):
+        exit_method = getattr(type(scope_manager), exit_method_name)
+        return_annotation = get_type_hints(exit_method)["return"]
+        assert return_annotation == Literal[False]
 
 
 def test_observability_entry_failure_does_not_change_return(
