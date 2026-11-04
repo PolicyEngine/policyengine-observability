@@ -1,3 +1,10 @@
+## [3.0.6] - 2026-11-04
+
+### Fixed
+
+- Upgraded certifi in uv.lock from 2026.6.17 to 2026.10.23, which no longer trusts the compromised eMudhra root "emSign ECC Root CA - G3".
+
+
 ## [3.0.5] - 2026-10-27
 
 ### Fixed
