@@ -89,8 +89,10 @@ class _ObservabilityMiddleware:
             raise
         finally:
             if not completed:
-                # A request that ends in KeyboardInterrupt sends no error
-                # response, so the adapter adds no 500 status code to it.
+                # Nothing in the Starlette stack sends an error response for
+                # a KeyboardInterrupt, so the adapter adds no 500 status
+                # code to it. The server may still send its own (uvicorn
+                # does), which this middleware cannot see.
                 interrupted = _interrupted(error)
                 add_server_error_status = error is not None and not interrupted
                 self._update_route(scope)

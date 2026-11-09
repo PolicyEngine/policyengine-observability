@@ -195,6 +195,24 @@ def test_async_operation_ending_in_keyboard_interrupt_is_interrupted(
     assert completion["severity"] == "WARNING"
 
 
+def test_operation_ending_in_keyboard_interrupt_subclass_is_interrupted(
+    runtime,
+) -> None:
+    observed, output = runtime
+
+    class ProcessStopRequested(KeyboardInterrupt):
+        pass
+
+    with pytest.raises(ProcessStopRequested):
+        with observed.operation("simulation.run"):
+            raise ProcessStopRequested
+
+    completion = records(output)[-1]
+    assert completion["outcome"] == "interrupted"
+    assert completion["severity"] == "WARNING"
+    assert completion["error.type"] == "ProcessStopRequested"
+
+
 @pytest.mark.parametrize(
     "error",
     [RuntimeError("failed"), SystemExit(1), asyncio.CancelledError()],

@@ -244,38 +244,46 @@ class OTelRuntime:
         if handle is None:
             return
         try:
+            # Each annotation is attempted on its own, so a span that
+            # rejects its exception event still gets its status or outcome.
             if error is not None:
-                details = error_fields(error, self.config)
-                handle.span.add_event(
-                    "exception",
-                    attributes={
-                        "exception.type": details["error.type"],
-                        "exception.message": details["error.message"],
-                        "exception.stacktrace": details["error.stack"],
-                        "exception.escaped": False,
-                    },
-                )
-            if interrupted:
-                # An interrupted span did not fail, so its status stays unset.
-                handle.span.set_attribute(
-                    "policyengine.outcome", "interrupted"
-                )
-            elif error is not None or failed:
-                from opentelemetry.trace import Status, StatusCode
+                try:
+                    details = error_fields(error, self.config)
+                    handle.span.add_event(
+                        "exception",
+                        attributes={
+                            "exception.type": details["error.type"],
+                            "exception.message": details["error.message"],
+                            "exception.stacktrace": details["error.stack"],
+                            "exception.escaped": False,
+                        },
+                    )
+                except Exception as exc:
+                    self.diagnostics.report("otel.span_annotate", exc)
+            try:
+                if interrupted:
+                    # An interrupted span did not fail: its status stays
+                    # unset.
+                    handle.span.set_attribute(
+                        "policyengine.outcome", "interrupted"
+                    )
+                elif error is not None or failed:
+                    from opentelemetry.trace import Status, StatusCode
 
-                handle.span.set_status(Status(StatusCode.ERROR))
-        except Exception as exc:
-            self.diagnostics.report("otel.span_end", exc)
-        # Close the span and restore the previous context even when
-        # annotating the span failed.
-        try:
-            handle.manager.__exit__(
-                type(error) if error is not None else None,
-                error,
-                error.__traceback__ if error is not None else None,
-            )
-        except Exception as exc:
-            self.diagnostics.report("otel.span_end", exc)
+                    handle.span.set_status(Status(StatusCode.ERROR))
+            except Exception as exc:
+                self.diagnostics.report("otel.span_annotate", exc)
+        finally:
+            # Close the span and restore the previous context whatever
+            # happened while annotating it.
+            try:
+                handle.manager.__exit__(
+                    type(error) if error is not None else None,
+                    error,
+                    error.__traceback__ if error is not None else None,
+                )
+            except Exception as exc:
+                self.diagnostics.report("otel.span_end", exc)
 
     def set_span_attributes(self, values: Mapping[str, Any]) -> None:
         try:

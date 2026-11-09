@@ -62,8 +62,9 @@ def instrument_flask(
         return response
 
     def _close_observed_request(error: BaseException | None) -> None:
-        # Flask sends no response for a request that ends in
+        # Flask builds no error response for a request that ends in
         # KeyboardInterrupt, so the adapter adds no 500 status code to it.
+        # The server may still send its own, which the adapter cannot see.
         add_server_error_status = error is not None and not _interrupted(error)
         try:
             runtime.end_request(
