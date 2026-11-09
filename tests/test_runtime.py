@@ -146,6 +146,75 @@ def test_process_control_exception_from_instrumentation_is_not_caught(
     observed.shutdown()
 
 
+def test_operation_ending_in_keyboard_interrupt_is_recorded_as_interrupted(
+    runtime, monkeypatch
+) -> None:
+    # Modal delivers a preemption to the running function as a
+    # KeyboardInterrupt and then runs the same input again.
+    observed, output = runtime
+    operation_metrics = _capture_metric_attributes(
+        monkeypatch, observed, "record_operation"
+    )
+    error_metrics = _capture_metric_attributes(
+        monkeypatch, observed, "record_error"
+    )
+    interruption = KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with observed.operation("simulation.run"):
+            raise interruption
+
+    assert caught.value is interruption
+    completion = records(output)[-1]
+    assert completion["event.name"] == "operation.completed"
+    assert completion["outcome"] == "interrupted"
+    assert completion["severity"] == "WARNING"
+    assert completion["error.type"] == "KeyboardInterrupt"
+    assert [metric["outcome"] for metric in operation_metrics] == [
+        "interrupted"
+    ]
+    assert error_metrics == []
+
+
+def test_async_operation_ending_in_keyboard_interrupt_is_interrupted(
+    runtime,
+) -> None:
+    observed, output = runtime
+
+    @observed.operation("async.run")
+    async def run() -> None:
+        await asyncio.sleep(0)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(run())
+
+    completion = records(output)[-1]
+    assert completion["event.name"] == "operation.completed"
+    assert completion["outcome"] == "interrupted"
+    assert completion["severity"] == "WARNING"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("failed"), SystemExit(1), asyncio.CancelledError()],
+    ids=["runtime-error", "system-exit", "cancelled-error"],
+)
+def test_operation_ending_in_other_exception_is_recorded_as_error(
+    runtime, error: BaseException
+) -> None:
+    observed, output = runtime
+
+    with pytest.raises(type(error)) as caught:
+        with observed.operation("work"):
+            raise error
+
+    assert caught.value is error
+    completion = records(output)[-1]
+    assert completion["outcome"] == "error"
+    assert completion["severity"] == "ERROR"
+
+
 def test_request_accepts_valid_id_and_emits_once(runtime) -> None:
     observed, output = runtime
     request_id = observed.begin_request(
@@ -243,6 +312,30 @@ def test_explicit_request_error_takes_precedence_over_recorded_exception(
     assert completion["outcome"] == "error"
     assert completion["error.type"] == "RuntimeError"
     assert completion["error.message"] == "raised to the framework"
+
+
+@pytest.mark.parametrize("status_code", [None, 500])
+def test_request_ending_in_keyboard_interrupt_is_recorded_as_interrupted(
+    runtime, monkeypatch, status_code: int | None
+) -> None:
+    observed, output = runtime
+    request_metrics = _capture_metric_attributes(
+        monkeypatch, observed, "record_request"
+    )
+    error_metrics = _capture_metric_attributes(
+        monkeypatch, observed, "record_error"
+    )
+    observed.begin_request(headers={}, method="POST", route="/simulate")
+
+    observed.end_request(status_code=status_code, error=KeyboardInterrupt())
+
+    completion = records(output)[-1]
+    assert completion["event.name"] == "request.completed"
+    assert completion["outcome"] == "interrupted"
+    assert completion["severity"] == "WARNING"
+    assert completion["error.type"] == "KeyboardInterrupt"
+    assert [metric["outcome"] for metric in request_metrics] == ["interrupted"]
+    assert error_metrics == []
 
 
 def test_set_context_and_capture_context_are_allowlisted(runtime) -> None:
@@ -696,3 +789,19 @@ def test_local_drop_and_export_diagnostics_increment_otel_metrics() -> None:
         ("failure", "logs.export_failure", 1),
     ]
     observed.shutdown()
+
+
+def _capture_metric_attributes(
+    monkeypatch, observed, method_name: str
+) -> list[dict]:
+    """Record the attributes passed to one OTel runtime metric method."""
+
+    captured_attributes: list[dict] = []
+    record_metric = getattr(observed._otel, method_name)
+
+    def record_and_capture(*arguments):
+        captured_attributes.append(dict(arguments[-1]))
+        record_metric(*arguments)
+
+    monkeypatch.setattr(observed._otel, method_name, record_and_capture)
+    return captured_attributes

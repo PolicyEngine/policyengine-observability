@@ -4,6 +4,7 @@ import asyncio
 import io
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from conftest import make_config, records
 from opentelemetry.sdk.trace.export import (
     SimpleSpanProcessor,
@@ -710,4 +711,59 @@ def test_concurrent_requests_keep_trace_and_span_context_separate() -> None:
     for request_id in ("one", "two"):
         child = child_spans[f"child.{request_id}"]
         assert format(child.context.trace_id, "032x") == traces[request_id]
+    runtime.shutdown()
+
+
+def test_keyboard_interrupt_leaves_operation_and_span_status_unset() -> None:
+    from opentelemetry.trace import StatusCode
+
+    runtime, exporter = _runtime_with_spans()
+
+    with pytest.raises(KeyboardInterrupt):
+        with runtime.operation("simulation.run"):
+            with runtime.span("simulation.calculate"):
+                raise KeyboardInterrupt
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    for span_name in ("simulation.run", "simulation.calculate"):
+        span = spans[span_name]
+        assert span.status.status_code is StatusCode.UNSET
+        assert span.attributes["policyengine.outcome"] == "interrupted"
+        assert [event.name for event in span.events] == ["exception"]
+        assert (
+            span.events[0].attributes["exception.type"] == "KeyboardInterrupt"
+        )
+    runtime.shutdown()
+
+
+def test_keyboard_interrupt_leaves_request_span_status_unset() -> None:
+    from opentelemetry.trace import StatusCode
+
+    runtime, exporter = _runtime_with_spans()
+    runtime.begin_request(headers={}, method="POST", route="/simulate")
+
+    runtime.end_request(status_code=None, error=KeyboardInterrupt())
+
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.UNSET
+    assert span.attributes["policyengine.outcome"] == "interrupted"
+    assert [event.name for event in span.events] == ["exception"]
+    runtime.shutdown()
+
+
+def test_other_exception_still_sets_operation_and_span_error_status() -> None:
+    from opentelemetry.trace import StatusCode
+
+    runtime, exporter = _runtime_with_spans()
+
+    with pytest.raises(RuntimeError):
+        with runtime.operation("simulation.run"):
+            with runtime.span("simulation.calculate"):
+                raise RuntimeError("calculation failed")
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    for span_name in ("simulation.run", "simulation.calculate"):
+        span = spans[span_name]
+        assert span.status.status_code is StatusCode.ERROR
+        assert "policyengine.outcome" not in span.attributes
     runtime.shutdown()
