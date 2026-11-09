@@ -529,6 +529,88 @@ def test_fastapi_record_written_before_routing_keeps_unmatched_route() -> None:
     runtime.shutdown()
 
 
+def test_flask_keyboard_interrupt_is_recorded_as_interrupted_request(
+    monkeypatch,
+) -> None:
+    runtime, output = make_runtime(otel=OTelConfig(enabled=True))
+    exporter = InMemorySpanExporter()
+    runtime._otel._tracer_provider.add_span_processor(
+        SimpleSpanProcessor(exporter)
+    )
+    error_metric_points = _capture_error_metric_points(monkeypatch, runtime)
+    app = Flask(__name__)
+    interruption = KeyboardInterrupt()
+
+    @app.post("/simulate")
+    def simulate():
+        raise interruption
+
+    instrument_flask(app, runtime)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        app.test_client().post("/simulate")
+
+    assert caught.value is interruption
+    completions = _request_completions(records(output))
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion["http.route"] == "/simulate"
+    assert completion["outcome"] == "interrupted"
+    assert completion["severity"] == "WARNING"
+    assert completion["error.type"] == "KeyboardInterrupt"
+    # No response was sent, so the record carries no status code.
+    assert "http.response.status_code" not in completion
+    assert error_metric_points == []
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.UNSET
+    runtime.shutdown()
+
+
+def test_fastapi_keyboard_interrupt_is_recorded_as_interrupted_request(
+    monkeypatch,
+) -> None:
+    runtime, output = make_runtime(otel=OTelConfig(enabled=True))
+    exporter = InMemorySpanExporter()
+    runtime._otel._tracer_provider.add_span_processor(
+        SimpleSpanProcessor(exporter)
+    )
+    error_metric_points = _capture_error_metric_points(monkeypatch, runtime)
+    app = FastAPI()
+    interruption = KeyboardInterrupt()
+
+    @app.post("/simulate")
+    async def simulate():
+        raise interruption
+
+    instrument_fastapi(app, runtime)
+    # FastAPI's TestClient reports a KeyboardInterrupt raised in an endpoint
+    # as a CancelledError, so call the application directly.
+    sent_messages: list[dict[str, Any]] = []
+    with pytest.raises(KeyboardInterrupt) as caught:
+        asyncio.run(
+            _call_asgi_application(
+                app,
+                method="POST",
+                path="/simulate",
+                sent_messages=sent_messages,
+            )
+        )
+
+    assert caught.value is interruption
+    assert sent_messages == []
+    completions = _request_completions(records(output))
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion["http.route"] == "/simulate"
+    assert completion["outcome"] == "interrupted"
+    assert completion["severity"] == "WARNING"
+    assert completion["error.type"] == "KeyboardInterrupt"
+    assert "http.response.status_code" not in completion
+    assert error_metric_points == []
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code is StatusCode.UNSET
+    runtime.shutdown()
+
+
 def test_httpx_only_instruments_supplied_sync_client() -> None:
     runtime, _output = make_runtime()
     seen: list[httpx.Request] = []
@@ -647,3 +729,36 @@ def _flask_callback_snapshot(
             "teardown_request_funcs",
         )
     }
+
+
+async def _call_asgi_application(
+    application: Any,
+    *,
+    method: str,
+    path: str,
+    sent_messages: list[dict[str, Any]],
+) -> None:
+    """Send one HTTP request with no body; append each message sent back."""
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [],
+        "server": ("testserver", 80),
+        "client": ("testclient", 50000),
+    }
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent_messages.append(message)
+
+    await application(scope, receive, send)

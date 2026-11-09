@@ -320,7 +320,7 @@ class ObservabilityRuntime:
             **self._otel.current_correlation(),
         }
         self._emit_record(
-            severity="ERROR" if outcome == "error" else "INFO",
+            severity=_severity(outcome),
             event_name="request.completed",
             context=context,
             attributes=state.attributes,
@@ -333,6 +333,7 @@ class ObservabilityRuntime:
             state.span,
             error,
             failed=outcome == "error",
+            interrupted=outcome == "interrupted",
         )
         self._reset_request(state)
 
@@ -607,7 +608,7 @@ class ObservabilityRuntime:
         state.completed = True
         state.error = error or state.error
         duration = max(0.0, time.perf_counter() - state.start_time)
-        outcome = "error" if state.error is not None else "success"
+        outcome = _outcome(None, state.error)
         context = {
             "operation.name": state.name,
             "operation.kind": state.kind,
@@ -617,7 +618,7 @@ class ObservabilityRuntime:
             **self._otel.current_correlation(),
         }
         self._emit_record(
-            severity="ERROR" if state.error is not None else "INFO",
+            severity=_severity(outcome),
             event_name="operation.completed",
             context=context,
             attributes=state.attributes,
@@ -630,9 +631,13 @@ class ObservabilityRuntime:
             "outcome": outcome,
         }
         self._otel.record_operation(duration, metrics)
-        if state.error is not None:
+        if outcome == "error":
             self._otel.record_error(metrics)
-        self._otel.end_span(state.span, state.error)
+        self._otel.end_span(
+            state.span,
+            state.error,
+            interrupted=outcome == "interrupted",
+        )
         if state.token is not None:
             try:
                 self._operation_state.reset(state.token)
@@ -665,7 +670,11 @@ class ObservabilityRuntime:
     ) -> None:
         if state is None:
             return
-        self._otel.end_span(state.span, error)
+        self._otel.end_span(
+            state.span,
+            error,
+            interrupted=_interrupted(error),
+        )
 
     def _active_context_fields(self) -> dict[str, Any]:
         fields: dict[str, Any] = {}
@@ -932,12 +941,33 @@ def _status_class(status_code: int | None) -> str:
     return f"{status_code // 100}xx"
 
 
+def _interrupted(error: BaseException | None) -> bool:
+    """Return True when the error is a KeyboardInterrupt or a subclass of it.
+
+    Python raises ``KeyboardInterrupt`` in the main thread on SIGINT. On
+    Modal, for example, a preemption reaches a running function as one, and
+    Modal then runs the same input again in a new container.
+    """
+
+    return isinstance(error, KeyboardInterrupt)
+
+
 def _outcome(status_code: int | None, error: BaseException | None) -> str:
+    if _interrupted(error):
+        return "interrupted"
     if error is not None or (status_code is not None and status_code >= 500):
         return "error"
     if status_code is not None and status_code >= 400:
         return "client_error"
     return "success"
+
+
+def _severity(outcome: str) -> str:
+    if outcome == "error":
+        return "ERROR"
+    if outcome == "interrupted":
+        return "WARNING"
+    return "INFO"
 
 
 def _span_kind(name: str) -> Any:

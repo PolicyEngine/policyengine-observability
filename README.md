@@ -267,6 +267,34 @@ async def calculate(simulation):
     return await simulation.calculate()
 ```
 
+An operation that raises writes its completion record with the outcome
+`error` at ERROR and is counted in the error count metric, and its span, like
+any span that raises, gets an error status. A request is recorded the same way
+when its exception reaches `end_request`. The Flask adapter passes the
+exception Flask gives its teardown callbacks: one that no error handler
+registered for its exception class handled. Flask still passes it when a
+handler registered for 500 or `InternalServerError` built the response. The FastAPI adapter passes an `Exception` or
+`KeyboardInterrupt` that leaves the application; a request that ends in any
+other exception, such as `asyncio.CancelledError`, is recorded from its status
+code alone.
+
+An operation or request that ends in `KeyboardInterrupt`, or a subclass of it,
+is recorded with the outcome `interrupted` at WARNING instead and is left out
+of the error count metric. Its span, like any span that ends in
+`KeyboardInterrupt`, keeps an unset status and gets the attribute
+`policyengine.outcome` set to `interrupted`; other operation and child spans do
+not carry that attribute. The adapters add no 500 status code to an
+interrupted request, so its record carries only a status code that was set or
+sent before the interrupt reached the adapter. A server can still send its own
+500 afterwards (uvicorn does), which the adapters cannot see. Records and span
+events keep the exception's type, message and stack, and the exception
+propagates unchanged. On Modal, for example, a preemption reaches a running
+function as `KeyboardInterrupt`, and Modal then runs the same input again.
+When `asyncio.run` runs in the main thread with Python's default SIGINT
+handler installed, the first SIGINT reaches the coroutine as
+`asyncio.CancelledError` instead, so an operation it ends is recorded as
+`error`.
+
 Function arguments and return values are never captured. The runtime accepts
 only application-configured attribute keys and scalar values.
 

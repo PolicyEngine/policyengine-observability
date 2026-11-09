@@ -239,14 +239,15 @@ class OTelRuntime:
         error: BaseException | None = None,
         *,
         failed: bool = False,
+        interrupted: bool = False,
     ) -> None:
         if handle is None:
             return
         try:
-            if error is not None or failed:
-                from opentelemetry.trace import Status, StatusCode
-
-                if error is not None:
+            # Each annotation is attempted on its own, so a span that
+            # rejects its exception event still gets its status or outcome.
+            if error is not None:
+                try:
                     details = error_fields(error, self.config)
                     handle.span.add_event(
                         "exception",
@@ -257,14 +258,32 @@ class OTelRuntime:
                             "exception.escaped": False,
                         },
                     )
-                handle.span.set_status(Status(StatusCode.ERROR))
-            handle.manager.__exit__(
-                type(error) if error is not None else None,
-                error,
-                error.__traceback__ if error is not None else None,
-            )
-        except Exception as exc:
-            self.diagnostics.report("otel.span_end", exc)
+                except Exception as exc:
+                    self.diagnostics.report("otel.span_annotate", exc)
+            try:
+                if interrupted:
+                    # An interrupted span did not fail: its status stays
+                    # unset.
+                    handle.span.set_attribute(
+                        "policyengine.outcome", "interrupted"
+                    )
+                elif error is not None or failed:
+                    from opentelemetry.trace import Status, StatusCode
+
+                    handle.span.set_status(Status(StatusCode.ERROR))
+            except Exception as exc:
+                self.diagnostics.report("otel.span_annotate", exc)
+        finally:
+            # Close the span and restore the previous context whatever
+            # happened while annotating it.
+            try:
+                handle.manager.__exit__(
+                    type(error) if error is not None else None,
+                    error,
+                    error.__traceback__ if error is not None else None,
+                )
+            except Exception as exc:
+                self.diagnostics.report("otel.span_end", exc)
 
     def set_span_attributes(self, values: Mapping[str, Any]) -> None:
         try:
