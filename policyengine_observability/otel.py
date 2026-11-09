@@ -239,24 +239,30 @@ class OTelRuntime:
         error: BaseException | None = None,
         *,
         failed: bool = False,
+        interrupted: bool = False,
     ) -> None:
         if handle is None:
             return
         try:
-            if error is not None or failed:
+            if error is not None:
+                details = error_fields(error, self.config)
+                handle.span.add_event(
+                    "exception",
+                    attributes={
+                        "exception.type": details["error.type"],
+                        "exception.message": details["error.message"],
+                        "exception.stacktrace": details["error.stack"],
+                        "exception.escaped": False,
+                    },
+                )
+            if interrupted:
+                # An interrupted span did not fail, so its status stays unset.
+                handle.span.set_attribute(
+                    "policyengine.outcome", "interrupted"
+                )
+            elif error is not None or failed:
                 from opentelemetry.trace import Status, StatusCode
 
-                if error is not None:
-                    details = error_fields(error, self.config)
-                    handle.span.add_event(
-                        "exception",
-                        attributes={
-                            "exception.type": details["error.type"],
-                            "exception.message": details["error.message"],
-                            "exception.stacktrace": details["error.stack"],
-                            "exception.escaped": False,
-                        },
-                    )
                 handle.span.set_status(Status(StatusCode.ERROR))
             handle.manager.__exit__(
                 type(error) if error is not None else None,

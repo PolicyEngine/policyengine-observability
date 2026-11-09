@@ -267,6 +267,16 @@ async def calculate(simulation):
     return await simulation.calculate()
 ```
 
+An operation or request that raises writes its completion record with the
+outcome `error` at ERROR, and its span gets an error status. One that ends in
+`KeyboardInterrupt` is recorded with the outcome `interrupted` at WARNING
+instead and is left out of the error count metric; its span, like any span that
+ends in `KeyboardInterrupt`, keeps an unset status and gets the attribute
+`policyengine.outcome` set to `interrupted`. Records and span events keep the
+exception's type, message and stack in both cases, and the exception always
+propagates unchanged. On Modal, for example, a preemption reaches the running
+function as `KeyboardInterrupt`, and Modal then runs the same input again.
+
 Function arguments and return values are never captured. The runtime accepts
 only application-configured attribute keys and scalar values.
 

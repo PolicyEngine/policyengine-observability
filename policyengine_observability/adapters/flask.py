@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..runtime import ObservabilityRuntime
+from ..runtime import ObservabilityRuntime, _interrupted
 
 _EXTENSION_KEY = "policyengine_observability"
 _CALLBACK_REGISTRIES = (
@@ -62,9 +62,12 @@ def instrument_flask(
         return response
 
     def _close_observed_request(error: BaseException | None) -> None:
+        # Flask sends no response for a request that ends in
+        # KeyboardInterrupt, so its record carries no 500 status code.
+        failed = error is not None and not _interrupted(error)
         try:
             runtime.end_request(
-                status_code=500 if error is not None else None,
+                status_code=500 if failed else None,
                 error=error,
             )
         except Exception as exc:

@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any
 
-from ..runtime import ObservabilityRuntime
+from ..runtime import ObservabilityRuntime, _interrupted
 
 _STATE_KEY = "policyengine_observability"
 
@@ -41,7 +41,7 @@ class _ObservabilityMiddleware:
             return
 
         status_code: int | None = None
-        error: Exception | None = None
+        error: BaseException | None = None
         completed = False
         try:
             self.runtime.begin_request(
@@ -84,14 +84,17 @@ class _ObservabilityMiddleware:
 
         try:
             await self.app(scope, receive, send_observed)
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             error = exc
             raise
         finally:
             if not completed:
+                # A request that ends in KeyboardInterrupt sends no error
+                # response, so it records only a status already sent.
+                failed = error is not None and not _interrupted(error)
                 self._update_route(scope)
                 self._end(
-                    status_code=status_code or (500 if error else None),
+                    status_code=status_code or (500 if failed else None),
                     error=error,
                 )
 
