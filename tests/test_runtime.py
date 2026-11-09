@@ -201,9 +201,12 @@ def test_async_operation_ending_in_keyboard_interrupt_is_interrupted(
     ids=["runtime-error", "system-exit", "cancelled-error"],
 )
 def test_operation_ending_in_other_exception_is_recorded_as_error(
-    runtime, error: BaseException
+    runtime, monkeypatch, error: BaseException
 ) -> None:
     observed, output = runtime
+    error_metrics = _capture_metric_attributes(
+        monkeypatch, observed, "record_error"
+    )
 
     with pytest.raises(type(error)) as caught:
         with observed.operation("work"):
@@ -213,6 +216,20 @@ def test_operation_ending_in_other_exception_is_recorded_as_error(
     completion = records(output)[-1]
     assert completion["outcome"] == "error"
     assert completion["severity"] == "ERROR"
+    assert [metric["outcome"] for metric in error_metrics] == ["error"]
+
+
+def test_interrupted_request_keeps_a_status_already_set(runtime) -> None:
+    observed, output = runtime
+    observed.begin_request(headers={}, method="GET", route="/stream")
+    observed.update_request_status(200)
+
+    observed.end_request(status_code=None, error=KeyboardInterrupt())
+
+    completion = records(output)[-1]
+    assert completion["http.response.status_code"] == 200
+    assert completion["outcome"] == "interrupted"
+    assert completion["severity"] == "WARNING"
 
 
 def test_request_accepts_valid_id_and_emits_once(runtime) -> None:

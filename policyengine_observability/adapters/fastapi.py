@@ -90,11 +90,13 @@ class _ObservabilityMiddleware:
         finally:
             if not completed:
                 # A request that ends in KeyboardInterrupt sends no error
-                # response, so it records only a status already sent.
-                failed = error is not None and not _interrupted(error)
+                # response, so the adapter adds no 500 status code to it.
+                interrupted = _interrupted(error)
+                add_server_error_status = error is not None and not interrupted
                 self._update_route(scope)
                 self._end(
-                    status_code=status_code or (500 if failed else None),
+                    status_code=status_code
+                    or (500 if add_server_error_status else None),
                     error=error,
                 )
 

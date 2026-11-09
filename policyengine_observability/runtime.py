@@ -942,10 +942,10 @@ def _status_class(status_code: int | None) -> str:
 
 
 def _interrupted(error: BaseException | None) -> bool:
-    """Report whether the exception stopped the process, not the work.
+    """Return True when the error is a KeyboardInterrupt or a subclass of it.
 
-    A ``KeyboardInterrupt`` reaches the running code when the process is
-    told to stop. On Modal, for example, a preemption arrives as one, and
+    Python raises ``KeyboardInterrupt`` in the main thread on SIGINT. On
+    Modal, for example, a preemption reaches a running function as one, and
     Modal then runs the same input again in a new container.
     """
 

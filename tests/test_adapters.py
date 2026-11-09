@@ -584,12 +584,19 @@ def test_fastapi_keyboard_interrupt_is_recorded_as_interrupted_request(
     instrument_fastapi(app, runtime)
     # FastAPI's TestClient reports a KeyboardInterrupt raised in an endpoint
     # as a CancelledError, so call the application directly.
+    sent_messages: list[dict[str, Any]] = []
     with pytest.raises(KeyboardInterrupt) as caught:
         asyncio.run(
-            _call_asgi_application(app, method="POST", path="/simulate")
+            _call_asgi_application(
+                app,
+                method="POST",
+                path="/simulate",
+                sent_messages=sent_messages,
+            )
         )
 
     assert caught.value is interruption
+    assert sent_messages == []
     completions = _request_completions(records(output))
     assert len(completions) == 1
     completion = completions[0]
@@ -725,9 +732,13 @@ def _flask_callback_snapshot(
 
 
 async def _call_asgi_application(
-    application: Any, *, method: str, path: str
-) -> list[dict[str, Any]]:
-    """Send one HTTP request with no body and return the messages sent."""
+    application: Any,
+    *,
+    method: str,
+    path: str,
+    sent_messages: list[dict[str, Any]],
+) -> None:
+    """Send one HTTP request with no body; append each message sent back."""
 
     scope = {
         "type": "http",
@@ -743,7 +754,6 @@ async def _call_asgi_application(
         "server": ("testserver", 80),
         "client": ("testclient", 50000),
     }
-    sent_messages: list[dict[str, Any]] = []
 
     async def receive() -> dict[str, Any]:
         return {"type": "http.request", "body": b"", "more_body": False}
@@ -752,4 +762,3 @@ async def _call_asgi_application(
         sent_messages.append(message)
 
     await application(scope, receive, send)
-    return sent_messages

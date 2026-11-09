@@ -63,11 +63,11 @@ def instrument_flask(
 
     def _close_observed_request(error: BaseException | None) -> None:
         # Flask sends no response for a request that ends in
-        # KeyboardInterrupt, so its record carries no 500 status code.
-        failed = error is not None and not _interrupted(error)
+        # KeyboardInterrupt, so the adapter adds no 500 status code to it.
+        add_server_error_status = error is not None and not _interrupted(error)
         try:
             runtime.end_request(
-                status_code=500 if failed else None,
+                status_code=500 if add_server_error_status else None,
                 error=error,
             )
         except Exception as exc:

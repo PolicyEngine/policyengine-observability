@@ -267,15 +267,25 @@ async def calculate(simulation):
     return await simulation.calculate()
 ```
 
-An operation or request that raises writes its completion record with the
-outcome `error` at ERROR, and its span gets an error status. One that ends in
-`KeyboardInterrupt` is recorded with the outcome `interrupted` at WARNING
-instead and is left out of the error count metric; its span, like any span that
-ends in `KeyboardInterrupt`, keeps an unset status and gets the attribute
-`policyengine.outcome` set to `interrupted`. Records and span events keep the
-exception's type, message and stack in both cases, and the exception always
-propagates unchanged. On Modal, for example, a preemption reaches the running
-function as `KeyboardInterrupt`, and Modal then runs the same input again.
+An operation that raises writes its completion record with the outcome
+`error` at ERROR and is counted in the error count metric, and its span, like
+any span that raises, gets an error status. A request is recorded the same way
+when its exception reaches `end_request`: the Flask adapter passes every
+exception, and the FastAPI adapter passes `Exception` and `KeyboardInterrupt`.
+
+An operation or request that ends in `KeyboardInterrupt`, or a subclass of it,
+is recorded with the outcome `interrupted` at WARNING instead and is left out
+of the error count metric. Its span, like any span that ends in
+`KeyboardInterrupt`, keeps an unset status and gets the attribute
+`policyengine.outcome` set to `interrupted`; other operation and child spans do
+not carry that attribute. The adapters add no 500 status code to an
+interrupted request, so its record carries a status code only if one was
+already set or sent. Records and span events keep the exception's type,
+message and stack, and the exception always propagates unchanged. On Modal,
+for example, a preemption reaches a running function as `KeyboardInterrupt`,
+and Modal then runs the same input again. Under `asyncio.run`, the first SIGINT
+reaches the coroutine as `asyncio.CancelledError` instead, which is recorded as
+`error`.
 
 Function arguments and return values are never captured. The runtime accepts
 only application-configured attribute keys and scalar values.

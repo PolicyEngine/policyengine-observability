@@ -264,6 +264,11 @@ class OTelRuntime:
                 from opentelemetry.trace import Status, StatusCode
 
                 handle.span.set_status(Status(StatusCode.ERROR))
+        except Exception as exc:
+            self.diagnostics.report("otel.span_end", exc)
+        # Close the span and restore the previous context even when
+        # annotating the span failed.
+        try:
             handle.manager.__exit__(
                 type(error) if error is not None else None,
                 error,
