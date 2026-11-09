@@ -718,12 +718,16 @@ def test_keyboard_interrupt_leaves_operation_and_span_status_unset() -> None:
     from opentelemetry.trace import StatusCode
 
     runtime, exporter = _runtime_with_spans()
+    interruption = KeyboardInterrupt()
 
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(KeyboardInterrupt) as caught:
         with runtime.operation("simulation.run"):
             with runtime.span("simulation.calculate"):
-                raise KeyboardInterrupt
+                raise interruption
 
+    assert caught.value is interruption
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
     spans = {span.name: span for span in exporter.get_finished_spans()}
     for span_name in ("simulation.run", "simulation.calculate"):
         span = spans[span_name]
