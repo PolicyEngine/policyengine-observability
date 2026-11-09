@@ -751,15 +751,26 @@ def test_keyboard_interrupt_leaves_request_span_status_unset() -> None:
     runtime.shutdown()
 
 
-def test_other_exception_still_sets_operation_and_span_error_status() -> None:
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("calculation failed"),
+        SystemExit(1),
+        asyncio.CancelledError(),
+    ],
+    ids=["runtime-error", "system-exit", "cancelled-error"],
+)
+def test_other_exception_still_sets_operation_and_span_error_status(
+    error: BaseException,
+) -> None:
     from opentelemetry.trace import StatusCode
 
     runtime, exporter = _runtime_with_spans()
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(type(error)):
         with runtime.operation("simulation.run"):
             with runtime.span("simulation.calculate"):
-                raise RuntimeError("calculation failed")
+                raise error
 
     spans = {span.name: span for span in exporter.get_finished_spans()}
     for span_name in ("simulation.run", "simulation.calculate"):
@@ -767,3 +778,37 @@ def test_other_exception_still_sets_operation_and_span_error_status() -> None:
         assert span.status.status_code is StatusCode.ERROR
         assert "policyengine.outcome" not in span.attributes
     runtime.shutdown()
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_end_span_closes_the_span_when_annotating_it_fails(
+    interrupted: bool,
+) -> None:
+    diagnostics = Diagnostics()
+    otel = OTelRuntime(
+        make_config(otel=OTelConfig(enabled=False)), diagnostics
+    )
+
+    class RejectingSpan:
+        def add_event(self, name, attributes):
+            raise RuntimeError("span rejected the event")
+
+    class Manager:
+        def __init__(self):
+            self.exit_arguments = None
+
+        def __exit__(self, *arguments):
+            self.exit_arguments = arguments
+
+    manager = Manager()
+    error = KeyboardInterrupt() if interrupted else ValueError("application")
+
+    otel.end_span(
+        SpanHandle(manager=manager, span=RejectingSpan()),
+        error,
+        interrupted=interrupted,
+    )
+
+    assert manager.exit_arguments is not None
+    assert manager.exit_arguments[1] is error
+    assert diagnostics.count("failure.otel.span_end") == 1
